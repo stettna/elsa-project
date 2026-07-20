@@ -1,0 +1,176 @@
+diff --git a/lib/matplotlib/figure.py b/lib/matplotlib/figure.py
+index c55864243a..ade0d078a2 100644
+--- a/lib/matplotlib/figure.py
++++ b/lib/matplotlib/figure.py
+@@ -3044,6 +3044,9 @@ class Figure(FigureBase):
+         self.__dict__ = state
+ 
+         # re-initialise some of the unstored state information
++        if hasattr(self, "_original_dpi"):
++            self._dpi = self._original_dpi
++            self.dpi_scale_trans.clear().scale(self._dpi)
+         FigureCanvasBase(self)  # Set self.canvas.
+ 
+         if restore_to_pylab:
+diff --git a/patch_figure.py b/patch_figure.py
+new file mode 100644
+index 0000000000..815012a362
+--- /dev/null
++++ b/patch_figure.py
+@@ -0,0 +1,21 @@
++import sys
++
++with open('lib/matplotlib/figure.py', 'r') as f:
++    lines = f.readlines()
++
++for i, line in enumerate(lines):
++    if 'def __setstate__(self, state):' in line:
++        start_idx = i
++        break
++
++for i in range(start_idx, len(lines)):
++    if 'FigureCanvasBase(self)  # Set self.canvas.' in lines[i]:
++        target_idx = i
++        break
++
++lines.insert(target_idx, '        if hasattr(self, "_original_dpi"):\n')
++lines.insert(target_idx + 1, '            self._dpi = self._original_dpi\n')
++lines.insert(target_idx + 2, '            self.dpi_scale_trans.clear().scale(self._dpi)\n')
++
++with open('lib/matplotlib/figure.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/reproduce.py b/reproduce.py
+new file mode 100644
+index 0000000000..dd27c8a7ca
+--- /dev/null
++++ b/reproduce.py
+@@ -0,0 +1,32 @@
++import numpy as np
++import matplotlib
++import matplotlib.pyplot as plt
++import pickle
++import platform
++
++print(matplotlib.get_backend())
++print('Matplotlib ver:', matplotlib.__version__)
++print('Platform:', platform.platform())
++print('System:', platform.system())
++print('Release:', platform.release())
++print('Python ver:', platform.python_version())
++
++def dump_load_get_dpi(fig):
++    with open('sinus.pickle','wb') as file:
++        pickle.dump(fig, file)
++
++    with open('sinus.pickle', 'rb') as blob:
++        fig2 = pickle.load(blob)
++    return fig2, fig2.dpi
++
++def run():
++    fig = plt.figure()
++    x = np.linspace(0,2*np.pi)
++    y = np.sin(x)
++
++    for i in range(5):
++        print(f'{i}: {fig.dpi}')
++        fig, dpi = dump_load_get_dpi(fig)
++
++if __name__ == '__main__':
++    run()
+diff --git a/sinus.pickle b/sinus.pickle
+new file mode 100644
+index 0000000000..aa6852c752
+Binary files /dev/null and b/sinus.pickle differ
+diff --git a/test_bbox.py b/test_bbox.py
+new file mode 100644
+index 0000000000..a9d1920b6d
+--- /dev/null
++++ b/test_bbox.py
+@@ -0,0 +1,12 @@
++import pickle
++import matplotlib.pyplot as plt
++
++fig = plt.figure(figsize=(6, 4))
++fig.canvas._set_device_pixel_ratio(2)
++
++print(f'Before: dpi={fig.dpi}, bbox={fig.bbox}')
++
++data = pickle.dumps(fig)
++fig2 = pickle.loads(data)
++
++print(f'After: dpi={fig2.dpi}, bbox={fig2.bbox}')
+diff --git a/test_mock_linux.py b/test_mock_linux.py
+new file mode 100644
+index 0000000000..429334eaf4
+--- /dev/null
++++ b/test_mock_linux.py
+@@ -0,0 +1,19 @@
++import pickle
++import matplotlib.pyplot as plt
++
++def run():
++    # Simulate saving on Mac
++    fig = plt.figure()
++    fig.canvas._set_device_pixel_ratio(2)
++    with open('sinus.pickle', 'wb') as file:
++        pickle.dump(fig, file)
++
++    # Simulate loading on Linux (Agg)
++    with open('sinus.pickle', 'rb') as blob:
++        fig2 = pickle.load(blob)
++    
++    print(f'Unpickled DPI: {fig2.dpi} (original: {getattr(fig2, "_original_dpi", None)})')
++    print(f'Canvas device_pixel_ratio: {fig2.canvas._device_pixel_ratio}')
++
++if __name__ == '__main__':
++    run()
+diff --git a/test_mock_mac.py b/test_mock_mac.py
+new file mode 100644
+index 0000000000..6f70538fc1
+--- /dev/null
++++ b/test_mock_mac.py
+@@ -0,0 +1,25 @@
++import pickle
++import matplotlib.pyplot as plt
++import matplotlib.backend_bases as backend_bases
++
++def dump_load_get_dpi(fig):
++    with open('sinus.pickle','wb') as file:
++        pickle.dump(fig, file)
++
++    with open('sinus.pickle', 'rb') as blob:
++        fig2 = pickle.load(blob)
++    return fig2, fig2.dpi
++
++def run():
++    fig = plt.figure()
++    fig.canvas._set_device_pixel_ratio(2)
++
++    for i in range(5):
++        print(f'{i}: {fig.dpi} (original: {getattr(fig, "_original_dpi", None)})')
++        fig, dpi = dump_load_get_dpi(fig)
++        # Simulate macOS backend setting device pixel ratio upon unpickling
++        if hasattr(fig, 'canvas') and fig.canvas is not None:
++            fig.canvas._set_device_pixel_ratio(2)
++
++if __name__ == '__main__':
++    run()
+diff --git a/test_pickle_dpi.py b/test_pickle_dpi.py
+new file mode 100644
+index 0000000000..8ff030586b
+--- /dev/null
++++ b/test_pickle_dpi.py
+@@ -0,0 +1,13 @@
++import pickle
++import matplotlib.pyplot as plt
++from matplotlib.backend_bases import FigureCanvasBase
++
++fig = plt.figure()
++fig.dpi = 200
++fig._original_dpi = 100
++
++data = pickle.dumps(fig)
++fig2 = pickle.loads(data)
++
++print("Pickled original_dpi:", getattr(fig2, '_original_dpi', None))
++print("Pickled dpi:", fig2.dpi)
