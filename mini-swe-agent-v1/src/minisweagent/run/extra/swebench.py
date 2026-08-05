@@ -139,6 +139,7 @@ def process_instance(
 
     agent = None
     extra_info = None
+    prompt_evo_info = None
 
     try:
         env = get_sb_environment(config, instance)
