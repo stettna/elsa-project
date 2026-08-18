@@ -93,7 +93,7 @@ def main():
         total_reflection_prompt_edits += int(stats.get("n_reflection_prompt_edits",0))
 
 
-    output_csv = root / "aggregated_model_stats.csv"
+    output_csv = root / "../aggregated_model_stats.csv"
     write_csv(output_csv, rows)
 
     count = len(rows)
