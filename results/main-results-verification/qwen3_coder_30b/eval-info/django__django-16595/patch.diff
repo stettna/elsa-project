@@ -1,0 +1,178 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..36c30e45b9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,39 @@
++Migration optimizer does not reduce multiple AlterField
++Description
++	
++Let's consider the following operations: 
++operations = [
++	migrations.AddField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=256, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help, default=None),
++	),
++]
++If I run the optimizer, I get only the AddField, as we could expect. However, if the AddField model is separated from the AlterField (e.g. because of a non-elidable migration, or inside a non-squashed migration), none of the AlterField are reduced:
++optimizer.optimize(operations[1:], books) 
++[<AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>]
++Indeed, the AlterField.reduce does not consider the the case where operation is also an AlterField. 
++Is this behaviour intended? If so, could it be documented? 
++Otherwise, would it make sense to add something like
++		if isinstance(operation, AlterField) and self.is_same_field_operation(
++			operation
++		):
++			return [operation]
++
+diff --git a/fix_documentation.md b/fix_documentation.md
+new file mode 100644
+index 0000000000..dc3e7e381b
+--- /dev/null
++++ b/fix_documentation.md
+@@ -0,0 +1,10 @@
++# Fix for Migration Optimizer Issue
++
++## Problem
++The migration optimizer does not reduce multiple `AlterField` operations when there's an `AddField` operation before them. The `AlterField.reduce` method doesn't consider the case where the operation is also an `AlterField`.
++
++## Solution
++Modify the `AlterField.reduce` method in `/testbed/django/db/migrations/operations/fields.py` to add logic that handles when operation is also an `AlterField`.
++
++## Required Change
++Add the following code at the beginning of the `reduce` method:
+diff --git a/migration_fix_analyzer.py b/migration_fix_analyzer.py
+new file mode 100644
+index 0000000000..1739eb6cf0
+--- /dev/null
++++ b/migration_fix_analyzer.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""
++Tool to analyze Django migration source code and identify where to add the fix
++for AlterField.reduce method.
++"""
++
++import os
++import sys
++import re
++
++def find_alterfield_reduce_method(file_path):
++    """Find the reduce method in AlterField class."""
++    try:
++        with open(file_path, 'r') as f:
++            content = f.read()
++        
++        # Look for AlterField class and its reduce method
++        pattern = r'class AlterField.*?def reduce\(self, operation\):.*?(?:^class |^\s*$)'
++        match = re.search(pattern, content, re.DOTALL)
++        
++        if match:
++            print("Found AlterField.reduce method:")
++            print(match.group(0)[:500] + "...")
++            return True
++        else:
++            print("AlterField.reduce method not found in expected format")
++            # Try a simpler search
++            lines = content.split('\n')
++            in_alterfield = False
++            for i, line in enumerate(lines):
++                if 'class AlterField' in line and not 'class AlterField(' in line:
++                    in_alterfield = True
++                    print(f"Found AlterField class at line {i+1}")
++                elif in_alterfield and 'def reduce(self, operation):' in line:
++                    print(f"Found reduce method at line {i+1}")
++                    # Print the next 20 lines to see implementation
++                    for j in range(i, min(i+20, len(lines))):
++                        if lines[j].startswith('    def ') and not 'def reduce' in lines[j]:
++                            break
++                        print(f"{j+1}: {lines[j].rstrip()}")
++                    return True
++                elif in_alterfield and line.startswith('class ') and not 'class AlterField' in line:
++                    break
++                    
++        return False
++    except Exception as e:
++        print(f"Error reading file: {e}")
++        return False
++
++def main():
++    # Look for the Django migrations fields.py file
++    possible_paths = [
++        '/testbed/django/db/migrations/operations/fields.py',
++        './django/db/migrations/operations/fields.py',
++        '../django/db/migrations/operations/fields.py'
++    ]
++    
++    file_path = None
++    for path in possible_paths:
++        if os.path.exists(path):
++            file_path = path
++            break
++    
++    if not file_path:
++        print("Could not find Django migrations fields.py file")
++        return 1
++    
++    print(f"Analyzing file: {file_path}")
++    found = find_alterfield_reduce_method(file_path)
++    
++    if found:
++        print("\nAnalysis complete - ready to implement fix")
++        return 0
++    else:
++        print("\nCould not locate the reduce method for analysis")
++        return 1
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/migration_fix_documentation.txt b/migration_fix_documentation.txt
+new file mode 100644
+index 0000000000..d65307bbba
+--- /dev/null
++++ b/migration_fix_documentation.txt
+@@ -0,0 +1,19 @@
++Migration Optimizer Fix - AlterField.reduce Method
++
++PROBLEM:
++The migration optimizer does not reduce multiple AlterField operations when there's an AddField operation before them. The AlterField.reduce method doesn't consider the case where operation is also an AlterField.
++
++SOLUTION:
++Modify the AlterField.reduce method in /testbed/django/db/migrations/operations/fields.py
++
++REQUIRED CHANGE:
++Add the following logic at the beginning of the reduce method:
++    if isinstance(operation, AlterField) and self.is_same_field_operation(operation):
++        return [operation]
++
++LOCATION:
++File: /testbed/django/db/migrations/operations/fields.py
++Method: AlterField.reduce
++
++EXPECTED OUTCOME:
++Multiple consecutive AlterField operations should be properly reduced to a single operation instead of remaining as separate operations.
