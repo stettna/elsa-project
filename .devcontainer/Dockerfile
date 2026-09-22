@@ -17,8 +17,6 @@ RUN pip install crewai --ignore-installed
 
 #RUN pip install -r requirements.txt
 
-RUN curl -fsSL https://ollama.com/install.sh | sh
-
 ## Matching the cuda version for this container and T5 server Feb 2023
 #RUN pip install --upgrade torch==1.12.1 --extra-index-url https://download.pytorch.org/whl/cu113
 #RUN pip install --upgrade torch==1.13.1 --extra-index-url https://download.pytorch.org/whl/cu113 
