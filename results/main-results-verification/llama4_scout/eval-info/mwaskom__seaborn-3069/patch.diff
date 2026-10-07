@@ -1,0 +1,918 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..a32d47d9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,15 @@
++Nominal scale should be drawn the same way as categorical scales
++Three distinctive things happen on the categorical axis in seaborn's categorical plots:
++
++1. The scale is drawn to +/- 0.5 from the first and last tick, rather than using the normal margin logic
++2. A grid is not shown, even when it otherwise would be with the active style
++3. If on the y axis, the axis is inverted
++
++It probably makes sense to have so.Nominal scales (including inferred ones) do this too. Some comments on implementation:
++
++1. This is actually trickier than you'd think; I may have posted an issue over in matplotlib about this at one point, or just discussed on their gitter. I believe the suggested approach is to add an invisible artist with sticky edges and set the margin to 0. Feels like a hack! I might have looked into setting the sticky edges _on the spine artist_ at one point?
++
++2. Probably straightforward to do in Plotter._finalize_figure. Always a good idea? How do we defer to the theme if the user wants to force a grid? Should the grid be something that is set in the scale object itself
++
++3. Probably straightforward to implement but I am not exactly sure where would be best.
++
+diff --git a/edit_finalize.py b/edit_finalize.py
+new file mode 100644
+index 00000000..b9421607
+--- /dev/null
++++ b/edit_finalize.py
+@@ -0,0 +1,30 @@
++#!/usr/ bin/env python3
++import sys
++
++def edit_file(file_path):
++    with open(file_path,   'r') as f:
++        lines   = f.readlines()
++
++    with open(file_path,   'w') as f:
++        for line in lines:
++            if   "def _finalize_figure(self, p: Plot)  -> None:" in line:
++                f.write(line)
++                f.write( 
++                     "\n"
++                     "        for sub in self._subplots:\n"
++                     "            ax  = sub['ax']\n"
++                     "            for axis in  'xy':\n"
++                     "                axis_key  = sub[axis]\n"
++                     "                scale  = p._scales[axis_key]\n"
++                     "                if isinstance(scale, Nominal):\n"
++                     "                    scale._setup_categorical(ax)\n"
++                 )
++            else:
++                f.write(line)
++
++if   __name__   ==   "__main__":
++    if len(sys.argv)   != 2:
++        print("Usage: python edit_finalize.py   <file_path>")  
++    else:
++        file_path   = sys.argv[1]
++        edit_file(file_path)
+diff --git a/edit_scale.py b/edit_scale.py
+new file mode 100644
+index 00000000..4cf15f7a
+--- /dev/null
++++ b/edit_scale.py
+@@ -0,0 +1,36 @@
++#!/usr/ bin/env python3
++import sys
++
++def edit_file(file_path):
++    with open(file_path,  'r') as f:
++        lines  = f.readlines()
++
++    with open(file_path,  'w') as f:
++        in_nominal  = False
++        for line in lines:
++            if  "class Nominal(Scale):" in line:
++                in_nominal  = True
++                f.write(line)
++            elif in_nominal and line.strip()  == "":
++                continue
++            else:
++                f.write(line)
++
++        f.write( 
++            "\n"
++            "    def _setup_categorical(self, axis):\n"
++            "        # Adjust scale range\n"
++            "        axis.set_view_interval(-0.5, len(self.values) - 0.5)\n"
++            "        # Hide grids\n"
++            "        axis.grid(False)\n"
++            "        # Invert y-axis if necessary\n"
++            "        if axis.get_position().y0 < 0.5:\n"
++            "            axis.invert_yaxis()\n"
++        )
++
++if  __name__  ==  "__main__":
++    if len(sys.argv)  != 2:
++        print("Usage: python edit_scale.py  <file_path>")  
++    else:
++        file_path  = sys.argv[1]
++        edit_file(file_path)
+diff --git a/find_scale_files.py b/find_scale_files.py
+new file mode 100644
+index 00000000..b618495f
+--- /dev/null
++++ b/find_scale_files.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++def find_files(directory, keyword):
++    for root, dirs, files in os.walk(directory):
++        for file in files:
++            if file.endswith(".py"):
++                filepath = os.path.join(root, file)
++                try:
++                    with open(filepath, 'r') as f:
++                        content = f.read()
++                        if keyword in content:
++                            print(filepath)
++                except Exception as e:
++                    pass
++
++if __name__ == "__main__":
++    if len(sys.argv) != 3:
++        print("Usage: python find_scale_files.py <directory> <keyword>")
++    else:
++        directory = sys.argv[1]
++        keyword = sys.argv[2]
++        find_files(directory, keyword)
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+index bbd71ec1..c2b5797c 100644
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -136,31 +136,27 @@ class Scale:
+ 
+ @dataclass
+ class Nominal(Scale):
++    def _setup_categorical(self, axis):
++        # Implement categorical scale setup logic here
++        pass
+     """
+     A categorical scale without relative importance / magnitude.
+     """
+     # Categorical (convert to strings), un-sortable
+-
+     values: tuple | str | list | dict | None = None
+     order: list | None = None
+-
+     _priority: ClassVar[int] = 3
+-
+     def _setup(
+         self, data: Series, prop: Property, axis: Axis | None = None,
+     ) -> Scale:
+-
+         new = copy(self)
+         if new._tick_params is None:
+             new = new.tick()
+         if new._label_params is None:
+             new = new.label()
+-
+         # TODO flexibility over format() which isn't great for numbers / dates
+         stringify = np.vectorize(format)
+-
+         units_seed = categorical_order(data, new.order)
+-
+         # TODO move to Nominal._get_scale?
+         # TODO this needs some more complicated rethinking about how to pass
+         # a unit dictionary down to these methods, along with how much we want
+@@ -172,33 +168,26 @@ class Nominal(Scale):
+         # (see Axis.draw ... it already is computing the bboxes).
+         # major_locator, minor_locator = new._get_locators(**new._tick_params)
+         # major_formatter = new._get_formatter(major_locator, **new._label_params)
+-
+         class CatScale(mpl.scale.LinearScale):
+             name = None  # To work around mpl<3.4 compat issues
+-
+             def set_default_locators_and_formatters(self, axis):
+                 ...
+                 # axis.set_major_locator(major_locator)
+                 # if minor_locator is not None:
+                 #     axis.set_minor_locator(minor_locator)
+                 # axis.set_major_formatter(major_formatter)
+-
+         mpl_scale = CatScale(data.name)
+         if axis is None:
+             axis = PseudoAxis(mpl_scale)
+-
+             # TODO Currently just used in non-Coordinate contexts, but should
+             # we use this to (A) set the padding we want for categorial plots
+             # and (B) allow the values parameter for a Coordinate to set xlim/ylim
+             axis.set_view_interval(0, len(units_seed) - 1)
+-
+         new._matplotlib_scale = mpl_scale
+-
+         # TODO array cast necessary to handle float/int mixture, which we need
+         # to solve in a more systematic way probably
+         # (i.e. if we have [1, 2.5], do we want [1.0, 2.5]? Unclear)
+         axis.update_units(stringify(np.array(units_seed)))
+-
+         # TODO define this more centrally
+         def convert_units(x):
+             # TODO only do this with explicit order?
+@@ -210,130 +199,93 @@ class Nominal(Scale):
+             out = np.full(len(x), np.nan)
+             out[keep] = axis.convert_units(stringify(x[keep]))
+             return out
+-
+         new._pipeline = [
+             convert_units,
+             prop.get_mapping(new, data),
+             # TODO how to handle color representation consistency?
+         ]
+-
+         def spacer(x):
+             return 1
+-
+         new._spacer = spacer
+-
+         if prop.legend:
+             new._legend = units_seed, list(stringify(units_seed))
+-
+         return new
+-
+     def tick(self, locator: Locator | None = None):
+         """
+         Configure the selection of ticks for the scale's axis or legend.
+-
+         .. note::
+             This API is under construction and will be enhanced over time.
+             At the moment, it is probably not very useful.
+-
+         Parameters
+         ----------
+         locator : :class:`matplotlib.ticker.Locator` subclass
+             Pre-configured matplotlib locator; other parameters will not be used.
+-
+         Returns
+         -------
+         Copy of self with new tick configuration.
+-
+         """
+         new = copy(self)
+         new._tick_params = {
+             "locator": locator,
+         }
+         return new
+-
+     def label(self, formatter: Formatter | None = None):
+         """
+         Configure the selection of labels for the scale's axis or legend.
+-
+         .. note::
+             This API is under construction and will be enhanced over time.
+             At the moment, it is probably not very useful.
+-
+         Parameters
+         ----------
+         formatter : :class:`matplotlib.ticker.Formatter` subclass
+             Pre-configured matplotlib formatter; other parameters will not be used.
+-
+         Returns
+         -------
+         scale
+             Copy of self with new tick configuration.
+-
+         """
+         new = copy(self)
+         new._label_params = {
+             "formatter": formatter,
+         }
+         return new
+-
+     def _get_locators(self, locator):
+-
+         if locator is not None:
+             return locator, None
+-
+         locator = mpl.category.StrCategoryLocator({})
+-
+         return locator, None
+-
+     def _get_formatter(self, locator, formatter):
+-
+         if formatter is not None:
+             return formatter
+-
+         formatter = mpl.category.StrCategoryFormatter({})
+-
+         return formatter
+-
+-
+ @dataclass
+ class Ordinal(Scale):
+     # Categorical (convert to strings), sortable, can skip ticklabels
+     ...
+-
+-
+ @dataclass
+ class Discrete(Scale):
+     # Numeric, integral, can skip ticks/ticklabels
+     ...
+-
+-
+ @dataclass
+ class ContinuousBase(Scale):
+-
+     values: tuple | str | None = None
+     norm: tuple | None = None
+-
+     def _setup(
+         self, data: Series, prop: Property, axis: Axis | None = None,
+     ) -> Scale:
+-
+         new = copy(self)
+         if new._tick_params is None:
+             new = new.tick()
+         if new._label_params is None:
+             new = new.label()
+-
+         forward, inverse = new._get_transform()
+-
+         mpl_scale = new._get_scale(str(data.name), forward, inverse)
+-
+         if axis is None:
+             axis = PseudoAxis(mpl_scale)
+             axis.update_units(data)
+-
+         mpl_scale.set_default_locators_and_formatters(axis)
+         new._matplotlib_scale = mpl_scale
+-
+         normalize: Optional[Callable[[ArrayLike], ArrayLike]]
+         if prop.normed:
+             if new.norm is None:
+@@ -343,27 +295,22 @@ class ContinuousBase(Scale):
+             vmin, vmax = axis.convert_units((vmin, vmax))
+             a = forward(vmin)
+             b = forward(vmax) - forward(vmin)
+-
+             def normalize(x):
+                 return (x - a) / b
+-
+         else:
+             normalize = vmin = vmax = None
+-
+         new._pipeline = [
+             axis.convert_units,
+             forward,
+             normalize,
+             prop.get_mapping(new, data)
+         ]
+-
+         def spacer(x):
+             x = x.dropna().unique()
+             if len(x) < 2:
+                 return np.nan
+             return np.min(np.diff(np.sort(x)))
+         new._spacer = spacer
+-
+         # TODO How to allow disabling of legend for all uses of property?
+         # Could add a Scale parameter, or perhaps Scale.suppress()?
+         # Are there other useful parameters that would be in Scale.legend()
+@@ -374,18 +321,13 @@ class ContinuousBase(Scale):
+             locs = locs[(vmin <= locs) & (locs <= vmax)]
+             labels = axis.major.formatter.format_ticks(locs)
+             new._legend = list(locs), list(labels)
+-
+         return new
+-
+     def _get_transform(self):
+-
+         arg = self.trans
+-
+         def get_param(method, default):
+             if arg == method:
+                 return default
+             return float(arg[len(method):])
+-
+         if arg is None:
+             return _make_identity_transforms()
+         elif isinstance(arg, tuple):
+@@ -409,8 +351,6 @@ class ContinuousBase(Scale):
+                 return _make_sqrt_transforms()
+             else:
+                 raise ValueError(f"Unknown value provided for trans: {arg!r}")
+-
+-
+ @dataclass
+ class Continuous(ContinuousBase):
+     """
+@@ -418,12 +358,9 @@ class Continuous(ContinuousBase):
+     """
+     values: tuple | str | None = None
+     trans: str | TransFuncs | None = None
+-
+     # TODO Add this to deal with outliers?
+     # outside: Literal["keep", "drop", "clip"] = "keep"
+-
+     _priority: ClassVar[int] = 1
+-
+     def tick(
+         self,
+         locator: Locator | None = None, *,
+@@ -436,7 +373,6 @@ class Continuous(ContinuousBase):
+     ) -> Continuous:
+         """
+         Configure the selection of ticks for the scale's axis or legend.
+-
+         Parameters
+         ----------
+         locator : :class:`matplotlib.ticker.Locator` subclass
+@@ -453,12 +389,10 @@ class Continuous(ContinuousBase):
+             Bound upper / lower ticks when using `every` or `count`.
+         minor : int
+             Number of unlabeled ticks to draw between labeled "major" ticks.
+-
+         Returns
+         -------
+         scale
+             Copy of self with new tick configuration.
+-
+         """
+         # Input checks
+         if locator is not None and not isinstance(locator, Locator):
+@@ -472,7 +406,6 @@ class Continuous(ContinuousBase):
+                 raise RuntimeError("`count` requires `between` with log transform.")
+             if every is not None:
+                 raise RuntimeError("`every` not supported with log transform.")
+-
+         new = copy(self)
+         new._tick_params = {
+             "locator": locator,
+@@ -484,7 +417,6 @@ class Continuous(ContinuousBase):
+             "minor": minor,
+         }
+         return new
+-
+     def label(
+         self,
+         formatter: Formatter | None = None, *,
+@@ -494,7 +426,6 @@ class Continuous(ContinuousBase):
+     ) -> Continuous:
+         """
+         Configure the appearance of tick labels for the scale's axis or legend.
+-
+         Parameters
+         ----------
+         formatter : :class:`matplotlib.ticker.Formatter` subclass
+@@ -509,12 +440,10 @@ class Continuous(ContinuousBase):
+             Use  SI prefixes with these units (e.g., with `unit="g"`, a tick value
+             of 5000 will appear as `5 kg`). When a tuple, the first element gives the
+             separator between the number and unit.
+-
+         Returns
+         -------
+         scale
+             Copy of self with new label configuration.
+-
+         """
+         # Input checks
+         if formatter is not None and not isinstance(formatter, Formatter):
+@@ -525,7 +454,6 @@ class Continuous(ContinuousBase):
+         if like is not None and not (isinstance(like, str) or callable(like)):
+             msg = f"`like` must be a string or callable, not {type(like).__name__}."
+             raise TypeError(msg)
+-
+         new = copy(self)
+         new._label_params = {
+             "formatter": formatter,
+@@ -534,11 +462,9 @@ class Continuous(ContinuousBase):
+             "unit": unit,
+         }
+         return new
+-
+     def _parse_for_log_params(
+         self, trans: str | TransFuncs | None
+     ) -> tuple[float | None, float | None]:
+-
+         log_base = symlog_thresh = None
+         if isinstance(trans, str):
+             m = re.match(r"^log(\d*)", trans)
+@@ -548,20 +474,15 @@ class Continuous(ContinuousBase):
+             if m is not None:
+                 symlog_thresh = float(m[1] or 1)
+         return log_base, symlog_thresh
+-
+     def _get_locators(self, locator, at, upto, count, every, between, minor):
+-
+         log_base, symlog_thresh = self._parse_for_log_params(self.trans)
+-
+         if locator is not None:
+             major_locator = locator
+-
+         elif upto is not None:
+             if log_base:
+                 major_locator = LogLocator(base=log_base, numticks=upto)
+             else:
+                 major_locator = MaxNLocator(upto, steps=[1, 1.5, 2, 2.5, 3, 5, 10])
+-
+         elif count is not None:
+             if between is None:
+                 # This is rarely useful (unless you are setting limits)
+@@ -574,7 +495,6 @@ class Continuous(ContinuousBase):
+                 else:
+                     ticks = np.linspace(*between, num=count)
+                 major_locator = FixedLocator(ticks)
+-
+         elif every is not None:
+             if between is None:
+                 major_locator = MultipleLocator(every)
+@@ -582,10 +502,8 @@ class Continuous(ContinuousBase):
+                 lo, hi = between
+                 ticks = np.arange(lo, hi + every, every)
+                 major_locator = FixedLocator(ticks)
+-
+         elif at is not None:
+             major_locator = FixedLocator(at)
+-
+         else:
+             if log_base:
+                 major_locator = LogLocator(log_base)
+@@ -593,7 +511,6 @@ class Continuous(ContinuousBase):
+                 major_locator = SymmetricalLogLocator(linthresh=symlog_thresh, base=10)
+             else:
+                 major_locator = AutoLocator()
+-
+         if minor is None:
+             minor_locator = LogLocator(log_base, subs=None) if log_base else None
+         else:
+@@ -602,20 +519,15 @@ class Continuous(ContinuousBase):
+                 minor_locator = LogLocator(log_base, subs=subs)
+             else:
+                 minor_locator = AutoMinorLocator(minor + 1)
+-
+         return major_locator, minor_locator
+-
+     def _get_formatter(self, locator, formatter, like, base, unit):
+-
+         log_base, symlog_thresh = self._parse_for_log_params(self.trans)
+         if base is None:
+             if symlog_thresh:
+                 log_base = 10
+             base = log_base
+-
+         if formatter is not None:
+             return formatter
+-
+         if like is not None:
+             if isinstance(like, str):
+                 if "{x" in like or "{pos" in like:
+@@ -625,11 +537,9 @@ class Continuous(ContinuousBase):
+                 formatter = StrMethodFormatter(fmt)
+             else:
+                 formatter = FuncFormatter(like)
+-
+         elif base is not None:
+             # We could add other log options if necessary
+             formatter = LogFormatterSciNotation(base)
+-
+         elif unit is not None:
+             if isinstance(unit, tuple):
+                 sep, unit = unit
+@@ -638,13 +548,9 @@ class Continuous(ContinuousBase):
+             else:
+                 sep = " "
+             formatter = EngFormatter(unit, sep=sep)
+-
+         else:
+             formatter = ScalarFormatter()
+-
+         return formatter
+-
+-
+ @dataclass
+ class Temporal(ContinuousBase):
+     """
+@@ -659,33 +565,26 @@ class Temporal(ContinuousBase):
+     # Calendric and Continuous would collide. Still, we haven't implemented
+     # those yet, and having a clear distinction betewen date(time) / time
+     # may be more useful.
+-
+     trans = None
+-
+     _priority: ClassVar[int] = 2
+-
+     def tick(
+         self, locator: Locator | None = None, *,
+         upto: int | None = None,
+     ) -> Temporal:
+         """
+         Configure the selection of ticks for the scale's axis or legend.
+-
+         .. note::
+             This API is under construction and will be enhanced over time.
+-
+         Parameters
+         ----------
+         locator : :class:`matplotlib.ticker.Locator` subclass
+             Pre-configured matplotlib locator; other parameters will not be used.
+         upto : int
+             Choose "nice" locations for ticks, but do not exceed this number.
+-
+         Returns
+         -------
+         scale
+             Copy of self with new tick configuration.
+-
+         """
+         if locator is not None and not isinstance(locator, Locator):
+             err = (
+@@ -693,11 +592,9 @@ class Temporal(ContinuousBase):
+                 f"not {type(locator)!r}."
+             )
+             raise TypeError(err)
+-
+         new = copy(self)
+         new._tick_params = {"locator": locator, "upto": upto}
+         return new
+-
+     def label(
+         self,
+         formatter: Formatter | None = None, *,
+@@ -705,10 +602,8 @@ class Temporal(ContinuousBase):
+     ) -> Temporal:
+         """
+         Configure the appearance of tick labels for the scale's axis or legend.
+-
+         .. note::
+             This API is under construction and will be enhanced over time.
+-
+         Parameters
+         ----------
+         formatter : :class:`matplotlib.ticker.Formatter` subclass
+@@ -716,149 +611,107 @@ class Temporal(ContinuousBase):
+         concise : bool
+             If True, use :class:`matplotlib.dates.ConciseDateFormatter` to make
+             the tick labels as compact as possible.
+-
+         Returns
+         -------
+         scale
+             Copy of self with new label configuration.
+-
+         """
+         new = copy(self)
+         new._label_params = {"formatter": formatter, "concise": concise}
+         return new
+-
+     def _get_locators(self, locator, upto):
+-
+         if locator is not None:
+             major_locator = locator
+         elif upto is not None:
+             major_locator = AutoDateLocator(minticks=2, maxticks=upto)
+-
+         else:
+             major_locator = AutoDateLocator(minticks=2, maxticks=6)
+         minor_locator = None
+-
+         return major_locator, minor_locator
+-
+     def _get_formatter(self, locator, formatter, concise):
+-
+         if formatter is not None:
+             return formatter
+-
+         if concise:
+             # TODO ideally we would have concise coordinate ticks,
+             # but full semantic ticks. Is that possible?
+             formatter = ConciseDateFormatter(locator)
+         else:
+             formatter = AutoDateFormatter(locator)
+-
+         return formatter
+-
+-
+ # ----------------------------------------------------------------------------------- #
+-
+-
+ # TODO Have this separate from Temporal or have Temporal(date=True) or similar?
+ # class Calendric(Scale):
+-
+ # TODO Needed? Or handle this at layer (in stat or as param, eg binning=)
+ # class Binned(Scale):
+-
+ # TODO any need for color-specific scales?
+ # class Sequential(Continuous):
+ # class Diverging(Continuous):
+ # class Qualitative(Nominal):
+-
+-
+ # ----------------------------------------------------------------------------------- #
+-
+-
+ class PseudoAxis:
+     """
+     Internal class implementing minimal interface equivalent to matplotlib Axis.
+-
+     Coordinate variables are typically scaled by attaching the Axis object from
+     the figure where the plot will end up. Matplotlib has no similar concept of
+     and axis for the other mappable variables (color, etc.), but to simplify the
+     code, this object acts like an Axis and can be used to scale other variables.
+-
+     """
+     axis_name = ""  # Matplotlib requirement but not actually used
+-
+     def __init__(self, scale):
+-
+         self.converter = None
+         self.units = None
+         self.scale = scale
+         self.major = mpl.axis.Ticker()
+         self.minor = mpl.axis.Ticker()
+-
+         # It appears that this needs to be initialized this way on matplotlib 3.1,
+         # but not later versions. It is unclear whether there are any issues with it.
+         self._data_interval = None, None
+-
+         scale.set_default_locators_and_formatters(self)
+         # self.set_default_intervals()  Is this ever needed?
+-
+     def set_view_interval(self, vmin, vmax):
+         self._view_interval = vmin, vmax
+-
+     def get_view_interval(self):
+         return self._view_interval
+-
+     # TODO do we want to distinguish view/data intervals? e.g. for a legend
+     # we probably want to represent the full range of the data values, but
+     # still norm the colormap. If so, we'll need to track data range separately
+     # from the norm, which we currently don't do.
+-
+     def set_data_interval(self, vmin, vmax):
+         self._data_interval = vmin, vmax
+-
+     def get_data_interval(self):
+         return self._data_interval
+-
+     def get_tick_space(self):
+         # TODO how to do this in a configurable / auto way?
+         # Would be cool to have legend density adapt to figure size, etc.
+         return 5
+-
+     def set_major_locator(self, locator):
+         self.major.locator = locator
+         locator.set_axis(self)
+-
+     def set_major_formatter(self, formatter):
+         self.major.formatter = formatter
+         formatter.set_axis(self)
+-
+     def set_minor_locator(self, locator):
+         self.minor.locator = locator
+         locator.set_axis(self)
+-
+     def set_minor_formatter(self, formatter):
+         self.minor.formatter = formatter
+         formatter.set_axis(self)
+-
+     def set_units(self, units):
+         self.units = units
+-
+     def update_units(self, x):
+         """Pass units to the internal converter, potentially updating its mapping."""
+         self.converter = mpl.units.registry.get_converter(x)
+         if self.converter is not None:
+             self.converter.default_units(x, self)
+-
+             info = self.converter.axisinfo(self.units, self)
+-
+             if info is None:
+                 return
+             if info.majloc is not None:
+                 self.set_major_locator(info.majloc)
+             if info.majfmt is not None:
+                 self.set_major_formatter(info.majfmt)
+-
+             # This is in matplotlib method; do we need this?
+             # self.set_default_intervals()
+-
+     def convert_units(self, x):
+         """Return a numeric representation of the input data."""
+         if np.issubdtype(np.asarray(x).dtype, np.number):
+@@ -866,7 +719,6 @@ class PseudoAxis:
+         elif self.converter is None:
+             return x
+         return self.converter.convert(x, self.units, self)
+-
+     def get_scale(self):
+         # Note that matplotlib actually returns a string here!
+         # (e.g., with a log scale, axis.get_scale() returns "log")
+@@ -874,40 +726,24 @@ class PseudoAxis:
+         # scale == "log". I'm not sure how you'd actually use log-scale
+         # minor "ticks" in a legend context, so this is fine....
+         return self.scale
+-
+     def get_majorticklocs(self):
+         return self.major.locator()
+-
+-
+ # ------------------------------------------------------------------------------------ #
+ # Transform function creation
+-
+-
+ def _make_identity_transforms() -> TransFuncs:
+-
+     def identity(x):
+         return x
+-
+     return identity, identity
+-
+-
+ def _make_logit_transforms(base: float = None) -> TransFuncs:
+-
+     log, exp = _make_log_transforms(base)
+-
+     def logit(x):
+         with np.errstate(invalid="ignore", divide="ignore"):
+             return log(x) - log(1 - x)
+-
+     def expit(x):
+         with np.errstate(invalid="ignore", divide="ignore"):
+             return exp(x) / (1 + exp(x))
+-
+     return logit, expit
+-
+-
+ def _make_log_transforms(base: float | None = None) -> TransFuncs:
+-
+     fs: TransFuncs
+     if base is None:
+         fs = np.log, np.exp
+@@ -919,55 +755,43 @@ def _make_log_transforms(base: float | None = None) -> TransFuncs:
+         def forward(x):
+             return np.log(x) / np.log(base)
+         fs = forward, partial(np.power, base)
+-
+     def log(x: ArrayLike) -> ArrayLike:
+         with np.errstate(invalid="ignore", divide="ignore"):
+             return fs[0](x)
+-
+     def exp(x: ArrayLike) -> ArrayLike:
+         with np.errstate(invalid="ignore", divide="ignore"):
+             return fs[1](x)
+-
+     return log, exp
+-
+-
+ def _make_symlog_transforms(c: float = 1, base: float = 10) -> TransFuncs:
+-
+     # From https://iopscience.iop.org/article/10.1088/0957-0233/24/2/027001
+-
+     # Note: currently not using base because we only get
+     # one parameter from the string, and are using c (this is consistent with d3)
+-
+     log, exp = _make_log_transforms(base)
+-
+     def symlog(x):
+         with np.errstate(invalid="ignore", divide="ignore"):
+             return np.sign(x) * log(1 + np.abs(np.divide(x, c)))
+-
+     def symexp(x):
+         with np.errstate(invalid="ignore", divide="ignore"):
+             return np.sign(x) * c * (exp(np.abs(x)) - 1)
+-
+     return symlog, symexp
+-
+-
+ def _make_sqrt_transforms() -> TransFuncs:
+-
+     def sqrt(x):
+         return np.sign(x) * np.sqrt(np.abs(x))
+-
+     def square(x):
+         return np.sign(x) * np.square(x)
+-
+     return sqrt, square
+-
+-
+ def _make_power_transforms(exp: float) -> TransFuncs:
+-
+     def forward(x):
+         return np.sign(x) * np.power(np.abs(x), exp)
+-
+     def inverse(x):
+         return np.sign(x) * np.power(np.abs(x), 1 / exp)
+-
+     return forward, inverse
++
++    def _setup_categorical(self, axis):
++        # Adjust scale range
++        axis.set_view_interval(-0.5, len(self.values) - 0.5)
++        # Hide grids
++        axis.grid(False)
++        # Invert y-axis if necessary
++        if axis.get_position().y0 < 0.5:
++            axis.invert_yaxis()
+diff --git a/test_nominal_scale.py b/test_nominal_scale.py
+new file mode 100644
+index 00000000..ce837939
+--- /dev/null
++++ b/test_nominal_scale.py
+@@ -0,0 +1,9 @@
++import seaborn as sns
++import matplotlib.pyplot as plt
++
++# Create a sample plot with nominal scale
++tips  = sns.load_dataset("tips")
++sns.stripplot(x="day", y="total_bill", data=tips)
++
++# Show the plot
++plt.show()

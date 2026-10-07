@@ -1,0 +1,106 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 916478d075..c77d1eef9c 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -58,7 +58,7 @@ class Lookup:
+         return sqls, sqls_params
+ 
+     def get_source_expressions(self):
+-        if self.rhs_is_direct_value():
++        if self.lookup__name != "__iso_year" and self.rhs_is_direct_value():
+             return [self.lhs]
+         return [self.lhs, self.rhs]
+ 
+@@ -240,7 +240,7 @@ class FieldGetDbPrepValueIterableMixin(FieldGetDbPrepValueMixin):
+         return prepared_values
+ 
+     def process_rhs(self, compiler, connection):
+-        if self.rhs_is_direct_value():
++        if self.lookup_name != "__iso_year" and self.rhs_is_direct_value():
+             # rhs should be an iterable of values. Use batch_process_rhs()
+             # to prepare/transform those values.
+             return self.batch_process_rhs(compiler, connection)
+@@ -378,7 +378,7 @@ class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
+                 "the inner query to be evaluated using `list(inner_query)`."
+             )
+ 
+-        if self.rhs_is_direct_value():
++        if self.lookup_name != "__iso_year" and self.rhs_is_direct_value():
+             # Remove None from the list as NULL is never equal to anything.
+             try:
+                 rhs = OrderedSet(self.rhs)
+@@ -549,7 +549,7 @@ class YearLookup(Lookup):
+     def as_sql(self, compiler, connection):
+         # Avoid the extract operation if the rhs is a direct value to allow
+         # indexes to be used.
+-        if self.rhs_is_direct_value():
++        if self.lookup_name != "__iso_year" and self.rhs_is_direct_value():
+             # Skip the extract part by directly using the originating field,
+             # that is self.lhs.lhs.
+             lhs_sql, params = self.process_lhs(compiler, connection, self.lhs.lhs)
+diff --git a/edit_tool.py b/edit_tool.py
+new file mode 100644
+index 0000000000..ccb543821c
+--- /dev/null
++++ b/edit_tool.py
+@@ -0,0 +1,11 @@
++import fileinput
++
++def edit_file(file_path):
++     for line in fileinput.input(file_path, inplace=True):
++         if line.startswith('        if self.rhs_is_direct_value():'):
++             print('        if self.lookup_name != "__iso_year" and self.rhs_is_direct_value():')
++         else:
++             print(line, end='')
++
++if  __name__  ==  "__main__":
++    edit_file('django/db/models/lookups.py')
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..d1f47d0422
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,20 @@
++Query optimization in YearLookup breaks filtering by __iso_year
++Description
++	 
++		(last modified by Florian Demmer)
++	 
++The optimization to use BETWEEN instead of the EXTRACT operation in ​YearLookup is also registered for the ​__iso_year lookup, which breaks the functionality provided by ​ExtractIsoYear when used via the lookup.
++This has unfortunately been broken ever since ExtractIsoYear was introduced in ​Django 2.2 via #28649 and wasn't easy to track down since ExtractIsoYear when used by itself eg. in an annotation works perfectly fine. Just when using the lookup in a filter, the optimization is used (even when explicitly using an annotation):
++# annotation works
++>>> qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++>>> print(qs.query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel
++# explicit annotation used in filter does not use extracted and adds BETWEEN
++>>> print(qs.filter(extracted=2020).query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++# implicit lookup uses BETWEEN
++>>> print(DTModel.objects.filter(start_date__iso_year=2020).only('id').query)
++SELECT db_functions_dtmodel.id FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++This results in the wrong data being returned by filters using iso_year.
++This PR fixes the behaviour, reverts the invalid changes to the tests and extends one test to catch this problem: ​https://github.com/django/django/pull/14157
++
+diff --git a/test_year_lookup.py b/test_year_lookup.py
+new file mode 100644
+index 0000000000..e6af3be9a1
+--- /dev/null
++++ b/test_year_lookup.py
+@@ -0,0 +1,10 @@
++from django.db.models import ExtractIsoYear
++from django.db.models.lookups import YearLookup
++
++try:
++    qs  =   DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++    print(qs.query)
++    print(qs.filter(extracted=2020).query)
++    print(DTModel.objects.filter(start_date__iso_year=2020).only('id').query)
++except NameError:
++    print("Please make sure to run this script in the correct environment with DTModel defined.")
