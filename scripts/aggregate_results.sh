@@ -29,7 +29,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TOOL_STATS_SCRIPT="${TOOL_STATS_SCRIPT:-$SCRIPT_DIR/find_agent_tools.py}"
-MODEL_STATS_SCRIPT="${MODEL_STATS_SCRIPT:-$SCRIPT_DIR/get_model_stats_revised.py}"
+MODEL_STATS_SCRIPT="${MODEL_STATS_SCRIPT:-$SCRIPT_DIR/get_stats.py}"
 
 if [[ ! -f "$TOOL_STATS_SCRIPT" ]]; then
     echo "Error: tool stats script not found at '$TOOL_STATS_SCRIPT'." >&2

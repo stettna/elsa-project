@@ -41,37 +41,35 @@ CONFIG_NUM_OF_EVOL_TASKS = {
     "standard_lsa": 1, #tool
 }
 
+PATH_TO_AG_CSV = "../results/aggregated_results.csv"   #Assumes script is run from within the scripts directory
+PATH_TO_IN_CSV = "../results/per_instance_results.csv" #Assumes script is run from within the scripts directory
+
+AG_MODE = 'w'  # Start with write mode for the aggregated CSV
+IN_MODE = 'w'  # Start with write mode for the per-instance CSV
+
 def find_traj_files(root: Path):
     """Recursively find all files matching *.traj.json under root."""
     return root.rglob("*.traj.json")
 
-def get_resolve_rate(eval_path):
-    #parse eval_path to get the number of tasks that were resolved
+def get_resolved_ids(eval_path):
+    #Parse eval_path to get the number of tasks that were resolved
     eval_path = Path(eval_path)
     if not eval_path.is_file():
         print(f"Error: '{eval_path}' is not a valid file.")
         return 0    
 
-    resolved = 0.0
-    instances = 0.0
+    resolved_ids = []
 
-    #parse json file to get the number of tasks that were resolved
+    #Parse json file to get the number of tasks that were resolved
     with eval_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
         if "resolved_instances" in data:
-            resolved =  float(data["resolved_instances"])
+            resolved_ids =  data["resolved_ids"]
         else:
-            print(f"Error: 'resolved_instances' not found in '{eval_path}'.")
-            return 0
-        
-        if "submitted_instances" in data:
-            instances =  float(data["submitted_instances"])
-        else:
-            print(f"Error: 'submitted_instances' not found in '{eval_path}'.")
+            print(f"Error: 'resolved_ids' not found in '{eval_path}'.")
             return 0
 
-    return resolved / instances if instances > 0 else 0
-    
+    return resolved_ids
 
 
 def corresponding_tools_json_candidates(traj_path: Path) -> List[Path]:
@@ -150,15 +148,6 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
         # "Tools created" counts every tool definition/version record.
         n_tools_created = len(tool_records)
 
-        # "Unique tools created" collapses multiple versions/overwrites of the
-        # same tool file path into a single tool.
-        unique_tool_paths = {
-            record.get("path")
-            for record in tool_records
-            if isinstance(record.get("path"), str) and record.get("path")
-        }
-        n_unique_tools_created = len(unique_tool_paths)
-
         n_custom_tool_uses = 0
 
         for record in tool_records:
@@ -183,7 +172,6 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
 
         return {
             "n_tools_created": n_tools_created,
-            "n_unique_tools_created": n_unique_tools_created,
             "n_custom_tool_uses": n_custom_tool_uses,
         }
 
@@ -194,7 +182,6 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
         )
         return {
             "n_tools_created": 0,
-            "n_unique_tools_created": 0,
             "n_custom_tool_uses": 0,
         }
 
@@ -219,8 +206,8 @@ def extract_stats(file_path: Path):
         prompt_evo_info = data["info"].get("prompt_evo_info", None)
 
         res = {
-            "name": file_path.name[:-len(".traj.json")],
-            "instance_cost": model_stats["instance_cost"],
+            "instance": file_path.name[:-len(".traj.json")],
+            "instance_cost": round(float(model_stats["instance_cost"]), 2),
             "api_calls": model_stats["api_calls"],
         }
 
@@ -238,27 +225,155 @@ def extract_stats(file_path: Path):
         return None
 
 
-def write_csv(output_path: Path, rows):
+def write_to_ag_csv(rows):
     """Write aggregated rows to CSV."""
-    with output_path.open("w", newline="", encoding="utf-8") as f:
+    with open(PATH_TO_AG_CSV, AG_MODE, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "name",
+                "configuration",
+                "n_evo_tasks",
+                "model", 
+                "model_size", 
+                "total_cost",
+                "total_api_calls",
+                "total_task_description_edits",
+                "total_reflection_prompt_edits",
+                "total_tools_created",
+                "total_custom_tool_uses", 
+                "avg_cost", 
+                "avg_api_calls", 
+                "avg_task_edits",
+                "avg_reflection_edits", 
+                "avg_tools_created", 
+                "avg_tools_used",
+                "resolve_rate"
+            ],
+        )
+        if AG_MODE == 'w':
+            writer.writeheader()
+        writer.writerows(rows)
+
+def write_to_in_csv(rows):
+    """Write aggregated rows to CSV."""
+    with open(PATH_TO_IN_CSV, IN_MODE, newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "instance",
+                "configuration",
+                "n_evo_tasks",
+                "model", 
+                "model_size", 
                 "instance_cost",
                 "api_calls",
                 "n_task_description_edits",
                 "n_reflection_prompt_edits",
                 "n_tools_created",
-                "n_unique_tools_created",
-                "n_custom_tool_uses",
+                "n_custom_tool_uses", 
+                "resolved"
             ],
         )
-        writer.writeheader()
-        writer.writerows(rows)
+        if IN_MODE == 'w':
+            writer.writeheader()
+        writer.writerows(rows)      
+
+def process_config_directory(config_dir: Path):
+    """Process a single configuration directory."""
+
+    config = str(config_dir).split("/")[-1]
+    n_evo_tasks = CONFIG_NUM_OF_EVOL_TASKS[config]
+
+    for model_dir   in config_dir.iterdir():
+
+        #Ensure path is dir
+        if not model_dir.is_dir():
+            print(f"Warning: '{model_dir}' is not a directory; skipping.")
+            continue
+
+        resolved_ids = get_resolved_ids(str(model_dir) + "/eval-results.json")
+        model = str(model_dir).split("/")[-1]
+        model_size = MODEL_SIZES_B[model]
+
+        total_cost = 0.0
+        total_api_calls = 0
+        total_task_description_edits = 0
+        total_reflection_prompt_edits = 0
+        total_tools_created = 0
+        total_unique_tools_created = 0
+        total_custom_tool_uses = 0
+        total_resolved = 0
+        count = 0
+
+        #Process each model dir in config dir
+        model = model_dir.name
+        model_size = MODEL_SIZES_B[model]
+
+        for file_path in find_traj_files(model_dir):
+            stats = extract_stats(file_path)
+
+            if stats is None:
+                continue
+
+            resolved = int(stats["instance"] in resolved_ids)
+            stats.update({
+                            "resolved": resolved,
+                            "model" : model,
+                            "model_size" : model_size,
+                            "configuration": config,
+                            "n_evo_tasks" : n_evo_tasks
+                        })
+
+            write_to_in_csv([stats])
+            global IN_MODE
+            IN_MODE = 'a'  # Switch to append mode after the first write
+
+            total_cost += float(stats["instance_cost"])
+            total_api_calls += int(stats["api_calls"])
+            total_task_description_edits += int(stats.get("n_task_description_edits", 0))
+            total_reflection_prompt_edits += int(stats.get("n_reflection_prompt_edits", 0))
+            total_tools_created += int(stats.get("n_tools_created", 0))
+            total_unique_tools_created += int(stats.get("n_unique_tools_created", 0))
+            total_custom_tool_uses += int(stats.get("n_custom_tool_uses", 0))
+            total_resolved += resolved
+            count += 1
+
+        avg_cost = round(total_cost / count, 2) if count else 0.0
+        avg_api_calls = round(total_api_calls / count, 2) if count else 0.0
+        avg_task_description_edits = round(total_task_description_edits / count, 2) if count else 0.0
+        avg_reflection_prompt_edits = round(total_reflection_prompt_edits / count, 2) if count else 0.0
+        avg_tools_created = round(total_tools_created / count, 2) if count else 0.0
+        avg_custom_tool_uses = round(total_custom_tool_uses / count, 2) if count else 0.0
+        resolve_rate = round(total_resolved / count, 2) if count else 0.0
+
+        cummulative_stats = {
+            "model" :  model,
+            "configuration" : config,
+            "n_evo_tasks" : n_evo_tasks,
+            "model_size" : model_size,
+            "total_cost" : round(total_cost, 2),
+            "total_api_calls" : total_api_calls,
+            "total_task_description_edits" : total_task_description_edits,
+            "total_reflection_prompt_edits" : total_reflection_prompt_edits,
+            "total_tools_created" : total_tools_created,
+            "total_custom_tool_uses" : total_custom_tool_uses,
+            "avg_cost" : avg_cost,
+            "avg_api_calls" : avg_api_calls,
+            "avg_task_edits" : avg_task_description_edits,
+            "avg_reflection_edits" : avg_reflection_prompt_edits,
+            "avg_tools_created" : avg_tools_created,
+            "avg_tools_used" : avg_custom_tool_uses,
+            "resolve_rate" : resolve_rate
+        }
+
+        write_to_ag_csv([cummulative_stats])
+
+        global AG_MODE
+        AG_MODE = 'a'  # Switch to append mode after the first write
 
 
 def main():
+
     parser = argparse.ArgumentParser(
         description="Aggregate model_stats from *.traj.json files into a CSV."
     )
@@ -274,70 +389,12 @@ def main():
         print(f"Error: '{root}' is not a valid directory.")
         return 1
 
-    config = args.directory.split("/")[-3]
-    model = args.directory.split("/")[-2]
-    model_size = MODEL_SIZES_B[model]
-    eval_path = "/".join(args.directory.split("/")[:-1])
-
-    resolve_rate = get_resolve_rate(eval_path + "/eval-results.json")
-
-    rows = []
-    total_cost = 0.0
-    total_api_calls = 0
-    total_task_description_edits = 0
-    total_reflection_prompt_edits = 0
-    total_tools_created = 0
-    total_unique_tools_created = 0
-    total_custom_tool_uses = 0
-
-    for file_path in find_traj_files(root):
-        stats = extract_stats(file_path)
-        if stats is None:
+    config_paths = list(root.iterdir())
+    for path in config_paths:
+        if not path.is_dir():
+            print(f"Warning: '{path}' is not a directory; skipping.")
             continue
-
-        rows.append(stats)
-        total_cost += float(stats["instance_cost"])
-        total_api_calls += int(stats["api_calls"])
-        total_task_description_edits += int(stats.get("n_task_description_edits", 0))
-        total_reflection_prompt_edits += int(stats.get("n_reflection_prompt_edits", 0))
-        total_tools_created += int(stats.get("n_tools_created", 0))
-        total_unique_tools_created += int(stats.get("n_unique_tools_created", 0))
-        total_custom_tool_uses += int(stats.get("n_custom_tool_uses", 0))
-
-    output_csv = root / "../aggregated_model_stats.csv"
-    write_csv(output_csv, rows)
-
-    count = len(rows)
-    avg_cost = total_cost / count if count else 0.0
-    avg_api_calls = total_api_calls / count if count else 0.0
-    avg_task_description_edits = total_task_description_edits / count if count else 0.0
-    avg_reflection_prompt_edits = total_reflection_prompt_edits / count if count else 0.0
-    avg_tools_created = total_tools_created / count if count else 0.0
-    avg_unique_tools_created = total_unique_tools_created / count if count else 0.0
-    avg_custom_tool_uses = total_custom_tool_uses / count if count else 0.0
-
-    print(f"Processed {count} file(s)")
-    print(f"CSV written to: {output_csv}")
-    print(f"Total cost: {total_cost}")
-    print(f"Total api calls: {total_api_calls}")
-    print(f"Total task_description_edits: {total_task_description_edits}")
-    print(f"Total reflection_prompt_edits: {total_reflection_prompt_edits}")
-    print(f"Total tools created: {total_tools_created}")
-    print(f"Total unique tools created: {total_unique_tools_created}")
-    print(f"Total custom tool uses: {total_custom_tool_uses}")
-    print(f"Average cost: {avg_cost}")
-    print(f"Average api_calls: {avg_api_calls}")
-    print(f"Average task_description_edits: {avg_task_description_edits}")
-    print(f"Average reflection_prompt_edits: {avg_reflection_prompt_edits}")
-    print(f"Average tools created: {avg_tools_created}")
-    print(f"Average unique tools created: {avg_unique_tools_created}")
-    print(f"Average custom tool uses: {avg_custom_tool_uses}")
-    print(f"Resolve rate: {resolve_rate}")
-
-    #Appends the summary to CSV file
-    with open("../results/aggregated_results.csv", "a") as file:
-        #file.write("Configuration, Total # of Evol. Tasks, Model, Model Size, Total Cost, Total API Calls, Total # of Task Edits, Total # of Reflection Edits, Total # of Tools Created, Total # of Tool Uses, Mean Cost, Mean # of API Calls, Mean # of Task Edits, Mean # of Reflection Edits, Mean # of Tools Created, Mean # of Tools Used, Resolve Rate\n")
-        file.write( str(config) + ", " + str(CONFIG_NUM_OF_EVOL_TASKS[config]) + ", " + str(model) + ", " + str(model_size) + ", " + str(total_cost) + ", " + str(total_api_calls) + ", " + str(total_task_description_edits) + ", " + str(total_reflection_prompt_edits) + ", " + str(total_tools_created) + ", " + str(total_custom_tool_uses) + ", " + str(avg_cost) + ", " + str(avg_api_calls) + ", " + str(avg_task_description_edits) + ", " +  str(avg_reflection_prompt_edits)   + ", " + str(avg_tools_created)  + ", " + str(avg_custom_tool_uses) + ", " + str(resolve_rate) + "\n")
+        process_config_directory(path)
 
     return 0
 
