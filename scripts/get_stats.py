@@ -31,14 +31,18 @@ MODEL_SIZES_B = {
     "gpt-5": "large",                 # Not publicly disclosed
     "Gemini-3.1-Pro": "large",        # Not publicly disclosed
     "llama4-scout": "small",          # 109B total parameters (17B active)
-    "qwen3-coder-30b": "small",         # 30B-class model
+    "qwen3-coder-30b": "small",       # 30B-class model
 }
 
 CONFIG_NUM_OF_EVOL_TASKS = {
-    "task_only": 2, #tool + task
-    "reflection_only": 2, #tool + reflection
-    "task_and_reflection": 3, #tool + task + reflection
-    "standard_lsa": 1, #tool
+    "task_and_reflection_and_tool": 3, #tool + task + reflection
+    "task_tool": 2,                    #tool + task
+    "reflection_tool": 2,              #tool + reflection
+    "task_reflection": 2,              #reflection + task
+    "task_only": 1,                    #task
+    "reflection_only": 1,              #reflection
+    "tool_only": 1,                    #tool
+    "no_evo" : 0,                      #none
 }
 
 PATH_TO_AG_CSV = "../results/aggregated_results.csv"   #Assumes script is run from within the scripts directory
