@@ -1,5 +1,5 @@
-# Masters Project: Causal Analysis of Self-evolving LLM Agents 
-This repository contains all artifacts generated as a result of the this Masters work. Its contents are broken down as follows:
+# Replication and Extension Self-evolving LLM Agents 
+This repository contains all artifacts generated as a result of the paper "SPEAR: An Empirical Study of Self-Prompt Evolution in SWE Agents". Its contents are broken down as follows:
 
 - custom_configs - Contains the custom configuration files we created to replicate the ablation study and to enable prompt evolution for the enhancement.
 

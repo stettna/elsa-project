@@ -27,13 +27,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-MODEL_SIZES_B = {
-    "gpt-5": "large",                 # Not publicly disclosed
-    "Gemini-3.1-Pro": "large",        # Not publicly disclosed
-    "llama4-scout": "small",          # 109B total parameters (17B active)
-    "qwen3-coder-30b": "small",       # 30B-class model
-}
-
 CONFIG_NUM_OF_EVOL_TASKS = {
     "task_and_reflection_and_tool": 3, #tool + task + reflection
     "task_tool": 2,                    #tool + task
@@ -152,6 +145,15 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
         # "Tools created" counts every tool definition/version record.
         n_tools_created = len(tool_records)
 
+        # "Unique tools created" collapses multiple versions/overwrites of the
+        # same tool file path into a single tool.
+        unique_tool_paths = {
+            record.get("path")
+            for record in tool_records
+            if isinstance(record.get("path"), str) and record.get("path")
+        }
+        n_unique_tools_created = len(unique_tool_paths)
+
         n_custom_tool_uses = 0
 
         for record in tool_records:
@@ -176,6 +178,7 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
 
         return {
             "n_tools_created": n_tools_created,
+            "n_unique_tools_created" : n_unique_tools_created,
             "n_custom_tool_uses": n_custom_tool_uses,
         }
 
@@ -186,6 +189,7 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
         )
         return {
             "n_tools_created": 0,
+            "n_unique_tools_created" : 0,
             "n_custom_tool_uses": 0,
         }
 
@@ -238,18 +242,19 @@ def write_to_ag_csv(rows):
                 "configuration",
                 "n_evo_tasks",
                 "model", 
-                "model_size", 
                 "total_cost",
                 "total_api_calls",
                 "total_task_description_edits",
                 "total_reflection_prompt_edits",
                 "total_tools_created",
+                "total_unique_tools_created",
                 "total_custom_tool_uses", 
                 "avg_cost", 
                 "avg_api_calls", 
                 "avg_task_edits",
                 "avg_reflection_edits", 
-                "avg_tools_created", 
+                "avg_tools_created",
+                "avg_unique_tools_created", 
                 "avg_tools_used",
                 "resolve_rate"
             ],
@@ -268,12 +273,12 @@ def write_to_in_csv(rows):
                 "configuration",
                 "n_evo_tasks",
                 "model", 
-                "model_size", 
                 "instance_cost",
                 "api_calls",
                 "n_task_description_edits",
                 "n_reflection_prompt_edits",
                 "n_tools_created",
+                "n_unique_tools_created",
                 "n_custom_tool_uses", 
                 "resolved"
             ],
@@ -297,7 +302,6 @@ def process_config_directory(config_dir: Path):
 
         resolved_ids = get_resolved_ids(str(model_dir) + "/eval-results.json")
         model = str(model_dir).split("/")[-1]
-        model_size = MODEL_SIZES_B[model]
 
         total_cost = 0.0
         total_api_calls = 0
@@ -311,7 +315,6 @@ def process_config_directory(config_dir: Path):
 
         #Process each model dir in config dir
         model = model_dir.name
-        model_size = MODEL_SIZES_B[model]
 
         for file_path in find_traj_files(model_dir):
             stats = extract_stats(file_path)
@@ -323,7 +326,6 @@ def process_config_directory(config_dir: Path):
             stats.update({
                             "resolved": resolved,
                             "model" : model,
-                            "model_size" : model_size,
                             "configuration": config,
                             "n_evo_tasks" : n_evo_tasks
                         })
@@ -347,6 +349,7 @@ def process_config_directory(config_dir: Path):
         avg_task_description_edits = round(total_task_description_edits / count, 2) if count else 0.0
         avg_reflection_prompt_edits = round(total_reflection_prompt_edits / count, 2) if count else 0.0
         avg_tools_created = round(total_tools_created / count, 2) if count else 0.0
+        avg_unique_tools_created = total_unique_tools_created / count if count else 0.0
         avg_custom_tool_uses = round(total_custom_tool_uses / count, 2) if count else 0.0
         resolve_rate = round(total_resolved / count, 2) if count else 0.0
 
@@ -354,18 +357,19 @@ def process_config_directory(config_dir: Path):
             "model" :  model,
             "configuration" : config,
             "n_evo_tasks" : n_evo_tasks,
-            "model_size" : model_size,
             "total_cost" : round(total_cost, 2),
             "total_api_calls" : total_api_calls,
             "total_task_description_edits" : total_task_description_edits,
             "total_reflection_prompt_edits" : total_reflection_prompt_edits,
             "total_tools_created" : total_tools_created,
+            "total_unique_tools_created" : total_unique_tools_created,
             "total_custom_tool_uses" : total_custom_tool_uses,
             "avg_cost" : avg_cost,
             "avg_api_calls" : avg_api_calls,
             "avg_task_edits" : avg_task_description_edits,
             "avg_reflection_edits" : avg_reflection_prompt_edits,
             "avg_tools_created" : avg_tools_created,
+            "avg_unique_tools_created" : avg_unique_tools_created,
             "avg_tools_used" : avg_custom_tool_uses,
             "resolve_rate" : resolve_rate
         }
