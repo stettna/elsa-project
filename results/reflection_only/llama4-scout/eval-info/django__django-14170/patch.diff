@@ -1,0 +1,71 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..d1f47d0422
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,20 @@
++Query optimization in YearLookup breaks filtering by __iso_year
++Description
++	 
++		(last modified by Florian Demmer)
++	 
++The optimization to use BETWEEN instead of the EXTRACT operation in ​YearLookup is also registered for the ​__iso_year lookup, which breaks the functionality provided by ​ExtractIsoYear when used via the lookup.
++This has unfortunately been broken ever since ExtractIsoYear was introduced in ​Django 2.2 via #28649 and wasn't easy to track down since ExtractIsoYear when used by itself eg. in an annotation works perfectly fine. Just when using the lookup in a filter, the optimization is used (even when explicitly using an annotation):
++# annotation works
++>>> qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++>>> print(qs.query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel
++# explicit annotation used in filter does not use extracted and adds BETWEEN
++>>> print(qs.filter(extracted=2020).query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++# implicit lookup uses BETWEEN
++>>> print(DTModel.objects.filter(start_date__iso_year=2020).only('id').query)
++SELECT db_functions_dtmodel.id FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++This results in the wrong data being returned by filters using iso_year.
++This PR fixes the behaviour, reverts the invalid changes to the tests and extends one test to catch this problem: ​https://github.com/django/django/pull/14157
++
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 916478d075..180d4d80c4 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -538,7 +538,7 @@ class IRegex(Regex):
+ 
+ 
+ class YearLookup(Lookup):
+-    def year_lookup_bounds(self, connection, year):
++    def year_lookup_bounds(self, connection, year, lookup_name=None):
+         output_field = self.lhs.lhs.output_field
+         if isinstance(output_field, DateTimeField):
+             bounds = connection.ops.year_lookup_bounds_for_datetime_field(year)
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1 @@
++
+diff --git a/test_script.py b/test_script.py
+new file mode 100644
+index 0000000000..046a599433
+--- /dev/null
++++ b/test_script.py
+@@ -0,0 +1,19 @@
++import django; django.setup()
++import django
++from django.db.models.functions import ExtractIsoYear
++from django.db.models.functions import Extract
++from django.db import models
++
++class DTModel(models.Model):
++    start_date  =  models.DateTimeField()
++
++try:
++    qs  =  DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++    print(qs.query)
++    print(qs.filter(extracted=2020).query)
++
++    print(DTModel.objects.filter(start_date__iso_year=2020).only('id').query)
++
++except Exception as e:
++    print(e)
++

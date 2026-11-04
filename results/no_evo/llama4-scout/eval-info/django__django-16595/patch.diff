@@ -1,0 +1,137 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..36c30e45b9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,39 @@
++Migration optimizer does not reduce multiple AlterField
++Description
++	
++Let's consider the following operations: 
++operations = [
++	migrations.AddField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=256, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help, default=None),
++	),
++]
++If I run the optimizer, I get only the AddField, as we could expect. However, if the AddField model is separated from the AlterField (e.g. because of a non-elidable migration, or inside a non-squashed migration), none of the AlterField are reduced:
++optimizer.optimize(operations[1:], books) 
++[<AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>]
++Indeed, the AlterField.reduce does not consider the the case where operation is also an AlterField. 
++Is this behaviour intended? If so, could it be documented? 
++Otherwise, would it make sense to add something like
++		if isinstance(operation, AlterField) and self.is_same_field_operation(
++			operation
++		):
++			return [operation]
++
+diff --git a/django/db/migrations/operations/fields.py b/django/db/migrations/operations/fields.py
+index cd3aab43ad..2702ffcb0d 100755
+--- a/django/db/migrations/operations/fields.py
++++ b/django/db/migrations/operations/fields.py
+@@ -67,7 +67,7 @@ class FieldOperation(Operation):
+         )
+ 
+     def reduce(self, operation, app_label):
+-        return super().reduce(operation, app_label) or not operation.references_field(
++        return super().reduce(operation, app_label) or (isinstance(operation, AlterField) and self.is_same_field_operation(operation)) or not operation.references_field(
+             self.model_name, self.name, app_label
+         )
+ 
+@@ -148,7 +148,7 @@ class AddField(FieldOperation):
+                         field=self.field,
+                     ),
+                 ]
+-        return super().reduce(operation, app_label)
++        return super().reduce(operation, app_label) or (isinstance(operation, AlterField) and self.is_same_field_operation(operation))
+ 
+ 
+ class RemoveField(FieldOperation):
+@@ -192,7 +192,7 @@ class RemoveField(FieldOperation):
+             and operation.name_lower == self.model_name_lower
+         ):
+             return [operation]
+-        return super().reduce(operation, app_label)
++        return super().reduce(operation, app_label) or (isinstance(operation, AlterField) and self.is_same_field_operation(operation))
+ 
+ 
+ class AlterField(FieldOperation):
+@@ -264,7 +264,7 @@ class AlterField(FieldOperation):
+                     field=self.field,
+                 ),
+             ]
+-        return super().reduce(operation, app_label)
++        return super().reduce(operation, app_label) or (isinstance(operation, AlterField) and self.is_same_field_operation(operation))
+ 
+ 
+ class RenameField(FieldOperation):
+diff --git a/test_optimizer.py b/test_optimizer.py
+new file mode 100644
+index 0000000000..06367ddbff
+--- /dev/null
++++ b/test_optimizer.py
+@@ -0,0 +1,39 @@
++from django.db import migrations, models
++
++operations = [
++    migrations.AddField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=256, null=True),
++    ),
++    migrations.AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True),
++    ),
++    migrations.AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True, help_text="help"),
++    ),
++    migrations.AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True, help_text="help", default=None),
++    ),
++]
++
++class MigrationOptimizer:
++    def optimize(self, operations, app_label):
++        # Simplified optimization logic for demonstration
++        result = []
++        for operation in operations:
++            if isinstance(operation, migrations.AlterField) and result and isinstance(result[-1], migrations.AlterField) and operation.model_name == result[-1].model_name and operation.name == result[-1].name:
++                result[-1] = operation
++            else:
++                result.append(operation)
++        return result
++
++optimizer = MigrationOptimizer()
++optimized_operations = optimizer.optimize(operations, "books")
++print(optimized_operations)
