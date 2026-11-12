@@ -1,0 +1,109 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..a32d47d9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,15 @@
++Nominal scale should be drawn the same way as categorical scales
++Three distinctive things happen on the categorical axis in seaborn's categorical plots:
++
++1. The scale is drawn to +/- 0.5 from the first and last tick, rather than using the normal margin logic
++2. A grid is not shown, even when it otherwise would be with the active style
++3. If on the y axis, the axis is inverted
++
++It probably makes sense to have so.Nominal scales (including inferred ones) do this too. Some comments on implementation:
++
++1. This is actually trickier than you'd think; I may have posted an issue over in matplotlib about this at one point, or just discussed on their gitter. I believe the suggested approach is to add an invisible artist with sticky edges and set the margin to 0. Feels like a hack! I might have looked into setting the sticky edges _on the spine artist_ at one point?
++
++2. Probably straightforward to do in Plotter._finalize_figure. Always a good idea? How do we defer to the theme if the user wants to force a grid? Should the grid be something that is set in the scale object itself
++
++3. Probably straightforward to implement but I am not exactly sure where would be best.
++
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..6920bc5d 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -7,6 +7,7 @@ import re
+ import sys
+ import inspect
+ import itertools
++import contextlib
+ import textwrap
+ from contextlib import contextmanager
+ from collections import abc
+@@ -1475,7 +1476,17 @@ class Plotter:
+ 
+                 axes_df = self._filter_subplot_data(df, view)
+ 
+-                with pd.option_context("mode.use_inf_as_null", True):
++                import contextlib
++                try:
++                    pd.get_option("mode.use_inf_as_null")
++                    ctx = pd.option_context("mode.use_inf_as_null", True)
++                except Exception:
++                    try:
++                        pd.get_option("mode.use_inf_as_na")
++                        ctx = pd.option_context("mode.use_inf_as_na", True)
++                    except Exception:
++                        ctx = contextlib.nullcontext()
++                with ctx:
+                     if keep_na:
+                         # The simpler thing to do would be x.dropna().reindex(x.index).
+                         # But that doesn't work with the way that the subset iteration
+@@ -1627,6 +1638,8 @@ class Plotter:
+ 
+     def _finalize_figure(self, p: Plot) -> None:
+ 
++        from seaborn._core.scales import Nominal
++
+         for sub in self._subplots:
+             ax = sub["ax"]
+             for axis in "xy":
+@@ -1643,6 +1656,24 @@ class Plotter:
+                     if isinstance(b, str):
+                         hi = cast(float, hi) + 0.5
+                     ax.set(**{f"{axis}lim": (lo, hi)})
++                else:
++                    # Apply nominal-axis defaults when no explicit limits are set
++                    scale = self._scales.get(axis_key)
++                    if isinstance(scale, Nominal):
++                        cats = getattr(scale, "_categories", None)
++                        if cats is not None and len(cats) > 0:
++                            n = len(cats)
++                            lo, hi = -0.5, n - 0.5
++                            ax.set(**{f"{axis}lim": (lo, hi)})
++                # Suppress grid and invert y for nominal axes
++                scale = self._scales.get(axis_key)
++                if isinstance(scale, Nominal):
++                    try:
++                        ax.grid(False, which="both", axis=axis)
++                    except Exception:
++                        ax.grid(False, axis=axis)
++                    if axis == "y":
++                        ax.invert_yaxis()
+ 
+         engine_default = None if p._target is not None else "tight"
+         layout_engine = p._layout_spec.get("engine", engine_default)
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+index bbd71ec1..5303bac9 100644
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -160,6 +160,11 @@ class Nominal(Scale):
+         stringify = np.vectorize(format)
+ 
+         units_seed = categorical_order(data, new.order)
++        # Store categories list to inform axis finalization (limits/grid/inversion)
++        try:
++            new._categories = list(units_seed)  # type: ignore[attr-defined]
++        except Exception:
++            pass
+ 
+         # TODO move to Nominal._get_scale?
+         # TODO this needs some more complicated rethinking about how to pass
