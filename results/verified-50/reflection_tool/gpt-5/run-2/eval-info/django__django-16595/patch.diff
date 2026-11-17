@@ -1,0 +1,169 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..36c30e45b9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,39 @@
++Migration optimizer does not reduce multiple AlterField
++Description
++	
++Let's consider the following operations: 
++operations = [
++	migrations.AddField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=256, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help, default=None),
++	),
++]
++If I run the optimizer, I get only the AddField, as we could expect. However, if the AddField model is separated from the AlterField (e.g. because of a non-elidable migration, or inside a non-squashed migration), none of the AlterField are reduced:
++optimizer.optimize(operations[1:], books) 
++[<AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>]
++Indeed, the AlterField.reduce does not consider the the case where operation is also an AlterField. 
++Is this behaviour intended? If so, could it be documented? 
++Otherwise, would it make sense to add something like
++		if isinstance(operation, AlterField) and self.is_same_field_operation(
++			operation
++		):
++			return [operation]
++
+diff --git a/django/db/migrations/operations/fields.py b/django/db/migrations/operations/fields.py
+index cd3aab43ad..0b73723fd1 100755
+--- a/django/db/migrations/operations/fields.py
++++ b/django/db/migrations/operations/fields.py
+@@ -247,6 +247,10 @@ class AlterField(FieldOperation):
+         return "alter_%s_%s" % (self.model_name_lower, self.name_lower)
+ 
+     def reduce(self, operation, app_label):
++        if isinstance(operation, AlterField) and self.is_same_field_operation(
++            operation
++        ):
++            return [operation]
+         if isinstance(operation, RemoveField) and self.is_same_field_operation(
+             operation
+         ):
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..78b4e3134d
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,14 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++- Implement optimizer reduction for consecutive AlterField on the same field:
++  - In AlterField.reduce(), if operation is AlterField and is_same_field_operation(operation) is True, return [operation] to collapse earlier AlterField into the later one.
++- Validate interactions:
++  - Ensure existing Reduce cases for RemoveField and RenameField (with db_column None) remain intact and ordered correctly relative to the new AlterField-to-AlterField case.
++  - Respect preserve_default and db_column semantics when altering fields.
++- Create a small reproduction script to run MigrationOptimizer.optimize() on sequences like:
++  - [AddField, AlterField, AlterField, ...] should collapse to single AddField with final field definition.
++  - [AlterField, AlterField, AlterField] should collapse to the final AlterField when AddField is not present (e.g., across non-elidable boundaries).
++- Run targeted tests for migrations optimizer to catch regressions, especially interactions with RenameField and in-between operations that don't reference the field.
++- Confirm optimizer stability: optimization must be idempotent after convergence across multiple iterations.
+diff --git a/tools/editor_tool.py b/tools/editor_tool.py
+new file mode 100644
+index 0000000000..557bcc1090
+--- /dev/null
++++ b/tools/editor_tool.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from pathlib import Path
++
++def replace_regex(content, pattern, replacement, count=0, flags=0):
++    try:
++        return re.sub(pattern, replacement, content, count=count, flags=flags)
++    except re.error as e:
++        sys.stderr.write(f"Regex error: {e}\n")
++        sys.exit(2)
++
++def insert_before_regex(content, pattern, text, flags=0):
++    m = re.search(pattern, content, flags)
++    if not m:
++        sys.stderr.write("Anchor pattern not found for insert_before.\n")
++        sys.exit(3)
++    start = m.start()
++    return content[:start] + text + content[start:]
++
++def insert_after_regex(content, pattern, text, flags=0):
++    m = re.search(pattern, content, flags)
++    if not m:
++        sys.stderr.write("Anchor pattern not found for insert_after.\n")
++        sys.exit(3)
++    end = m.end()
++    return content[:end] + text + content[end:]
++
++def main():
++    ap = argparse.ArgumentParser(description="Simple editor tool for file modifications.")
++    ap.add_argument("file", help="Path to file to edit.")
++    sub = ap.add_subparsers(dest="cmd", required=True)
++
++    rp = sub.add_parser("replace-regex", help="Regex replace.")
++    rp.add_argument("pattern")
++    rp.add_argument("replacement")
++    rp.add_argument("--count", type=int, default=0)
++    rp.add_argument("--flags", default="", help="Regex flags, e.g., 'MULTILINE|DOTALL'")
++
++    ib = sub.add_parser("insert-before", help="Insert text before first regex match.")
++    ib.add_argument("pattern")
++    ib.add_argument("--text", required=True)
++    ib.add_argument("--flags", default="")
++
++    ia = sub.add_parser("insert-after", help="Insert text after first regex match.")
++    ia.add_argument("pattern")
++    ia.add_argument("--text", required=True)
++    ia.add_argument("--flags", default="")
++
++    args = ap.parse_args()
++    p = Path(args.file)
++    if not p.exists():
++        sys.stderr.write(f"File not found: {args.file}\n")
++        sys.exit(1)
++    content = p.read_text(encoding="utf-8")
++
++    flag_value = 0
++    if getattr(args, "flags", ""):
++        flag_names = [f.strip() for f in args.flags.split("|") if f.strip()]
++        for name in flag_names:
++            if not hasattr(re, name):
++                sys.stderr.write(f"Unknown regex flag: {name}\n")
++                sys.exit(2)
++            flag_value |= getattr(re, name)
++
++    if args.cmd == "replace-regex":
++        new_content = replace_regex(content, args.pattern, args.replacement, count=args.count, flags=flag_value)
++    elif args.cmd == "insert-before":
++        new_content = insert_before_regex(content, args.pattern, args.text, flags=flag_value)
++    elif args.cmd == "insert-after":
++        new_content = insert_after_regex(content, args.pattern, args.text, flags=flag_value)
++    else:
++        sys.stderr.write("Unknown command.\n")
++        sys.exit(2)
++
++    if new_content == content:
++        print("No changes made (content identical after operation).")
++    p.write_text(new_content, encoding="utf-8")
++    print(f"Edited {args.file} successfully.")
++
++if __name__ == "__main__":
++    main()

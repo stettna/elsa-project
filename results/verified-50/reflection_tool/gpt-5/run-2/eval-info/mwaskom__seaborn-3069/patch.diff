@@ -1,0 +1,107 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..a32d47d9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,15 @@
++Nominal scale should be drawn the same way as categorical scales
++Three distinctive things happen on the categorical axis in seaborn's categorical plots:
++
++1. The scale is drawn to +/- 0.5 from the first and last tick, rather than using the normal margin logic
++2. A grid is not shown, even when it otherwise would be with the active style
++3. If on the y axis, the axis is inverted
++
++It probably makes sense to have so.Nominal scales (including inferred ones) do this too. Some comments on implementation:
++
++1. This is actually trickier than you'd think; I may have posted an issue over in matplotlib about this at one point, or just discussed on their gitter. I believe the suggested approach is to add an invisible artist with sticky edges and set the margin to 0. Feels like a hack! I might have looked into setting the sticky edges _on the spine artist_ at one point?
++
++2. Probably straightforward to do in Plotter._finalize_figure. Always a good idea? How do we defer to the theme if the user wants to force a grid? Should the grid be something that is set in the scale object itself
++
++3. Probably straightforward to implement but I am not exactly sure where would be best.
++
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 00000000..bbf900fd
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++- When implementing axis-specific behavior (margins, grid, inversion) for Nominal scales:
++  - Determine how to detect Nominal scales per coordinate in _finalize_figure. Use sub['x']/sub['y'] to get var and check isinstance(plotter._scales[var], Nominal).
++  - If per-view scale distinctions matter, consider storing a flag on each view during _setup_scales` (e.g., view[f"{axis}_is_nominal"]).
++  - To compute +/-0.5 extents, get tick locations after scale attachment: use ax.get_{axis}ticks or the axis major locator. Then set limits to floor(min)-0.5, ceil(max)+0.5.
++  - Disable grid on nominal axes: ax.grid(False, axis=...) unless user explicitly enabled via theme override; consider checking theme or a scale parameter to defer.
++  - Invert y when y nominal: ax.invert_yaxis().
++- Create a small Python edit tool if repetitive edits across files are needed.
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..1bc257c3 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -1643,7 +1643,62 @@ class Plotter:
+                     if isinstance(b, str):
+                         hi = cast(float, hi) + 0.5
+                     ax.set(**{f"{axis}lim": (lo, hi)})
++        # Apply nominal axis defaults: +/-0.5 margins, disable grid on that axis,
++        # and invert y-axis when it is nominal. Only set limits when not explicitly
++        # specified in p._limits.
++        try:
++            from seaborn._core.scales import Nominal as _SbNominalScale
++        except Exception:
++            _SbNominalScale = None
++        for _sub in self._subplots:
++            _ax = _sub["ax"]
++            for _axis in "xy":
++                _axis_key = _sub[_axis]
++                _axis_obj = getattr(_ax, f"{_axis}axis")
++                _is_nom = False
++                _scale = self._scales.get(_axis_key)
++                if _SbNominalScale is not None and isinstance(_scale, _SbNominalScale):
++                    _is_nom = True
++                if not _is_nom:
++                    try:
++                        import matplotlib.category as _mcat
++                        _is_nom = isinstance(getattr(_axis_obj, "converter", None), _mcat.StrCategoryConverter)
++                    except Exception:
++                        pass
++                if not _is_nom:
++                    continue
++                # Disable gridlines along the nominal axis
++                try:
++                    _ax.grid(False, axis=_axis)
++                except TypeError:
++                    _ax.grid(False)
++                # Set +/- 0.5 margins around first/last tick if no explicit limits
++                if _axis_key not in p._limits:
++                    _locs = []
++                    try:
++                        _locs = _axis_obj.major.locator()
++                    except Exception:
++                        try:
++                            _locs = getattr(_ax, f"get_{_axis}ticks")()
++                        except Exception:
++                            _locs = []
++                    _locs_f = []
++                    for _x in _locs:
++                        try:
++                            _locs_f.append(float(_x))
++                        except Exception:
++                            pass
++                    if _locs_f:
++                        _lo = min(_locs_f) - 0.5
++                        _hi = max(_locs_f) + 0.5
++                        getattr(_ax, f"set_{_axis}lim")((_lo, _hi))
++                # Invert y-axis when it is nominal
++                if _axis == "y":
++                    try:
++                        _ax.invert_yaxis()
++                    except Exception:
++                        pass
+ 
+         engine_default = None if p._target is not None else "tight"
+         layout_engine = p._layout_spec.get("engine", engine_default)
+-        set_layout_engine(self._figure, layout_engine)
++        set_layout_engine(self._figure, layout_engine)
+\ No newline at end of file

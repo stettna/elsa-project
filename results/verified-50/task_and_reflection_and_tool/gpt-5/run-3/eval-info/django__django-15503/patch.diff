@@ -1,0 +1,143 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..e59a0f3696 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -126,7 +126,7 @@ class JSONField(CheckFieldDefaultMixin, Field):
+         )
+ 
+ 
+-def compile_json_path(key_transforms, include_root=True):
++def compile_json_path(key_transforms, include_root=True, force_string_keys=False):
+     path = ["$"] if include_root else []
+     for key_transform in key_transforms:
+         try:
+@@ -135,7 +135,11 @@ def compile_json_path(key_transforms, include_root=True):
+             path.append(".")
+             path.append(json.dumps(key_transform))
+         else:
+-            path.append("[%s]" % num)
++            if force_string_keys:
++                path.append(".")
++                path.append(json.dumps(str(key_transform)))
++            else:
++                path.append("[%s]" % num)
+     return "".join(path)
+ 
+ 
+@@ -193,13 +197,9 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+             else:
+                 rhs_key_transforms = [key]
+-            rhs_params.append(
+-                "%s%s"
+-                % (
+-                    lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
+-                )
+-            )
++            partial_path = compile_json_path(rhs_key_transforms[:-1], include_root=False)
++            final_segment = compile_json_path([rhs_key_transforms[-1]], include_root=False, force_string_keys=True)
++            rhs_params.append("%s%s%s" % (lhs_json_path, partial_path, final_segment))
+         # Add condition for each key.
+         if self.logical_operator:
+             sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..3ab6aa8593
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,5 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..494917c4ad
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,83 @@
++has_key, has_keys, and has_any_keys JSONField() lookups don't handle numeric keys on SQLite, MySQL, and Oracle.
++Description
++	 
++		(last modified by TheTerrasque)
++	 
++Problem
++When using models.​JSONField() ​has_key lookup with numerical keys on SQLite database it fails to find the keys.
++Versions:
++Django: 4.0.3
++Python: 3.9.6 (tags/v3.9.6:db3ff76, Jun 28 2021, 15:26:21) [MSC v.1929 64 bit (AMD64)] on win32
++sqlite3.version: '2.6.0'
++sqlite3.sqlite_version: '3.35.5'
++Example:
++Database
++DATABASES = {
++	'default': {
++		'ENGINE': 'django.db.backends.sqlite3',
++		'NAME': 'db.sqlite3',
++	}
++}
++Model
++class JsonFieldHasKeyTest(models.Model):
++	data = models.JSONField()
++Test
++from django.test import TestCase
++from .models import JsonFieldHasKeyTest
++class JsonFieldHasKeyTestCase(TestCase):
++	def setUp(self) -> None:
++		test = JsonFieldHasKeyTest(data={'foo': 'bar'})
++		test2 = JsonFieldHasKeyTest(data={'1111': 'bar'})
++		test.save()
++		test2.save()
++	def test_json_field_has_key(self):
++		c1 = JsonFieldHasKeyTest.objects.filter(data__has_key='foo').count()
++		c2 = JsonFieldHasKeyTest.objects.filter(data__has_key='1111').count()
++		self.assertEqual(c1, 1, Should have found 1 entry with key foo)
++		self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++Result
++FAIL: test_json_field_has_key (markers.tests.JsonFieldHasKeyTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++ File H:FilesProjectsElectacoWebserviceelecservemarkerstests.py, line 16, in test_json_field_has_key	 
++	self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++AssertionError: 0 != 1 : Should have found 1 entry with key '1111'
++Additional info
++This has been tested on SQLite and Postgresql backend, it works on postgresql but fails on sqlite.
++
++---
++Additional insight discovered during analysis:
++- In django/db/models/fields/json.py, compile_json_path() currently converts any numeric-looking key (e.g., "1111") into an array index (e.g., [1111]).
++- HasKey/HasKeys/HasAnyKeys on SQLite/MySQL/Oracle build RHS JSON paths using compile_json_path(), causing numeric string object keys to be misinterpreted as array indices. This leads to false negatives for lookups like data__has_key='1111'.
++- PostgreSQL uses different operators and is unaffected.
++Planned fix direction:
++- Make sure RHS keys in HasKey/HasKeys/HasAnyKeys are always treated as object member names (quoted) even when they look numeric on SQLite/MySQL/Oracle. This can be achieved by adding a flag to compile_json_path() (e.g., force_string_keys for RHS) or by adjusting HasKeyLookup.as_sql() to quote RHS numeric keys appropriately.
++- Ensure LHS KeyTransform behavior remains unchanged so that genuine array indexing still works.
++Affected code points:
++- compile_json_path() at django/db/models/fields/json.py:129
++- HasKeyLookup.as_sql() and backend-specific variants (MySQL/SQLite/Oracle) around lines ~172-233
++---
++Additional insight discovered during analysis:
++- In django/db/models/fields/json.py, compile_json_path() currently converts any numeric-looking key (e.g., "1111") into an array index segment ([1111]).
++- HasKey/HasKeys/HasAnyKeys on SQLite/MySQL/Oracle build RHS JSON paths using compile_json_path(), causing numeric string object keys to be misinterpreted as array indices. This yields false negatives for lookups like data__has_key='1111'.
++- PostgreSQL uses different operators for these lookups and isn’t affected.
++
++Planned fix direction:
++- Ensure RHS keys for HasKey/HasKeys/HasAnyKeys are always treated as object member names (quoted) even when they look numeric on SQLite/MySQL/Oracle. This can be done by adding a flag to compile_json_path() to force string keys for RHS paths or by quoting RHS numeric keys in HasKeyLookup.as_sql().
++- Keep LHS KeyTransform behavior unchanged so array indexing continues to work elsewhere.
++
++Affected code points:
++- compile_json_path() at django/db/models/fields/json.py:129
++- HasKeyLookup.as_sql() and backend-specific variants around lines ~172–233
++Refined insight:
++- For RHS KeyTransform chains used in has_key/has_keys/has_any_keys, only the final segment (the key being checked) must be treated as a string member even if numeric-looking. Preceding segments must retain default semantics so array indices still work (e.g., value[1].b).
++Planned code adjustment:
++- In HasKeyLookup.as_sql(), build RHS path as:
++  lhs_json_path + compile_json_path(rhs_key_transforms[:-1], include_root=False) + compile_json_path([rhs_key_transforms[-1]], include_root=False, force_string_keys=True)
++This preserves array indexing for intermediate segments and quotes only the terminal key.
++Refined insight update:
++- For RHS KeyTransform chains used in has_key/has_keys/has_any_keys, only the final segment (the key whose existence is being checked) should be forced to a string member even if it looks numeric (e.g., "1111"). Intermediate segments must preserve normal semantics (numeric segments as array indices) so expressions like value[1].b continue to work.
++Planned code adjustment:
++- In HasKeyLookup.as_sql(), build RHS paths as:
++  lhs_json_path + compile_json_path(rhs_key_transforms[:-1], include_root=False) + compile_json_path([rhs_key_transforms[-1]], include_root=False, force_string_keys=True)
++This quotes only the terminal key and keeps prior segments unchanged.

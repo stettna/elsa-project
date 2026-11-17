@@ -1,0 +1,77 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..b3c057abd9 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -403,6 +403,7 @@ class Query(BaseExpression):
+         # Store annotation mask prior to temporarily adding aggregations for
+         # resolving purpose to facilitate their subsequent removal.
+         refs_subquery = False
++        refs_window = False
+         replacements = {}
+         annotation_select_mask = self.annotation_select_mask
+         for alias, aggregate_expr in aggregate_exprs.items():
+@@ -419,6 +420,10 @@ class Query(BaseExpression):
+                 getattr(self.annotations[ref], "subquery", False)
+                 for ref in aggregate.get_refs()
+             )
++            refs_window |= any(
++                getattr(self.annotations[ref], "contains_over_clause", False)
++                for ref in aggregate.get_refs()
++            )
+             aggregate = aggregate.replace_expressions(replacements)
+             self.annotations[alias] = aggregate
+             replacements[Ref(alias, aggregate)] = aggregate
+@@ -451,6 +456,7 @@ class Query(BaseExpression):
+             or self.is_sliced
+             or has_existing_aggregation
+             or refs_subquery
++            or refs_window
+             or qualify
+             or self.distinct
+             or self.combinator
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..2a009b4018
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,33 @@
++Cannot use aggregate over window functions since 4.2
++Description
++	 
++		(last modified by younes-chaoui)
++	 
++After upgrading to Django 4.2, I encountered an exception when executing ORM queries that involve aggregates over Window functions. The specific error was psycopg2.errors.GroupingError: aggregate function calls cannot contain window function calls
++Dependencies :
++psycopg2 version: 2.9.3
++django version: 4.2.3
++PostgreSQL version: 13.4
++Example Code:
++queryset = queryset.annotate(
++	cumul_DJR=Coalesce(Window(Sum(DJR), order_by=F(date).asc()), 0.0)
++)
++aggregate = queryset.aggregate(
++	DJR_total=Sum(DJR),
++	cumul_DJR_total=Sum(cumul_DJR)
++)
++
++Insights added:
++- In django/db/models/sql/query.py:get_aggregation(), a subquery is used only when certain conditions are met (group_by tuple, sliced, has_existing_aggregation, refs_subquery, qualify from WHERE-splitting, distinct, or combinator). Otherwise aggregates are inlined into the same query.
++- When aggregating over an annotation that is a Window(...) expression, there may be no existing aggregation or qualify flag, so Django takes the else path and inlines aggregates over window expressions, generating SQL like SUM(Window(...)) which PostgreSQL disallows with GroupingError.
++- WhereNode.split_having_qualify() only flags qualify for window functions in filtering predicates; it does not cover the case where window functions appear only in annotations referenced by aggregate().
++Planned fix implemented:
++- Modify Query.get_aggregation() to detect when aggregates reference annotations containing window expressions (contains_over_clause) and force an outer AggregateQuery subquery in that case (refs_window flag). This prevents generating SQL with aggregate functions applied directly over window functions, which PostgreSQL disallows.
++New insight:
++- A prior sed edit introduced duplicated refs_subquery/refs_window checks and broken indentation in Query.get_aggregation() around lines ~417-470. This must be cleaned so refs_window is computed once alongside refs_subquery, and indentation restored. Also ensure the subquery condition includes `or refs_window`.
++New insight:
++- A prior automated edit corrupted Query.get_aggregation(): duplicated refs_subquery/refs_window checks and removed self.append_annotation_mask([alias]). This causes syntax/logic issues. We'll restore the block, add refs_window initialization and include it in the subquery decision to ensure aggregates over window annotations are pushed to an outer query.
++New insight:
++- A previous automated edit corrupted django/db/models/sql/query.py:get_aggregation() by duplicating refs_subquery/refs_window checks and breaking indentation around lines ~417-470, and also removed the crucial self.append_annotation_mask([alias]) call. This must be cleaned so refs_window is computed once alongside refs_subquery, indentation is restored, and the subquery decision includes `or refs_window`.
++Verification insight:
++- get_aggregation() now cleanly initializes refs_window, restores self.append_annotation_mask([alias]), computes refs_subquery/refs_window once, and includes `or refs_window` in the subquery decision. This should route aggregates over window annotations through an outer AggregateQuery.

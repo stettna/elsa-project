@@ -1,0 +1,246 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..36c30e45b9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,39 @@
++Migration optimizer does not reduce multiple AlterField
++Description
++	
++Let's consider the following operations: 
++operations = [
++	migrations.AddField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=256, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help, default=None),
++	),
++]
++If I run the optimizer, I get only the AddField, as we could expect. However, if the AddField model is separated from the AlterField (e.g. because of a non-elidable migration, or inside a non-squashed migration), none of the AlterField are reduced:
++optimizer.optimize(operations[1:], books) 
++[<AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>]
++Indeed, the AlterField.reduce does not consider the the case where operation is also an AlterField. 
++Is this behaviour intended? If so, could it be documented? 
++Otherwise, would it make sense to add something like
++		if isinstance(operation, AlterField) and self.is_same_field_operation(
++			operation
++		):
++			return [operation]
++
+diff --git a/django/db/migrations/operations/fields.py b/django/db/migrations/operations/fields.py
+index cd3aab43ad..02530ab482 100755
+--- a/django/db/migrations/operations/fields.py
++++ b/django/db/migrations/operations/fields.py
+@@ -247,6 +247,10 @@ class AlterField(FieldOperation):
+         return "alter_%s_%s" % (self.model_name_lower, self.name_lower)
+ 
+     def reduce(self, operation, app_label):
++        # Collapse consecutive AlterField operations on the same field by keeping the latter.
++        if isinstance(operation, AlterField) and self.is_same_field_operation(operation):
++            return [operation]
++
+         if isinstance(operation, RemoveField) and self.is_same_field_operation(
+             operation
+         ):
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..f37c00d465
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,25 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++[Appendix - Plan for AlterField reduction optimization]
++- Use scripts/pyedit.py for deterministic file edits (regex/insertions) to avoid manual mistakes.
++- Create a minimal reproduction script that:
++  - Imports django.db.migrations.optimizer.Optimizer and django.db.migrations.operations.fields.AlterField/AddField.
++  - Builds a list like [AlterField(...), AlterField(...), AlterField(...)] targeting the same model/field (no AddField in the same list).
++  - Calls optimizer.optimize(ops, "app_label") and prints the length and types to confirm current non-reduction.
++- Explore code:
++  - Open django/db/migrations/operations/fields.py and inspect AlterField.reduce(), is_same_field_operation(), and any flags like preserve_default/db_default.
++  - Open django/db/migrations/optimizer.py to understand how reduce() is invoked and how it expects operations to signal elision.
++- Implementation guidance:
++  - Allow AlterField.reduce() to collapse consecutive AlterField operations on the same model/field by returning the later operation (i.e., keep only the last AlterField).
++  - Ensure safety: confirm no side-effect flags or attributes require intermediate application (e.g., preserve_default semantics, constraints/indexes that could be affected by state transitions).
++  - Maintain deconstruction consistency; the resulting single AlterField must represent the final field definition.
++  - Add clear comments/docstrings about the new behavior and any caveats where reductions are intentionally avoided.
++- Validation:
++  - Re-run the reproduction script to ensure only one AlterField remains.
++  - Run relevant test subsets (tests/migrations, tests/migrations_autodetector, tests/migrations/test_optimizer.py if present) to guard against regressions.
++- Constraints:
++  - Modify only non-test files under /testbed.
++  - If edge cases are identified where reduction is unsafe, document them and gate the reduction accordingly.
+diff --git a/scripts/pyedit.py b/scripts/pyedit.py
+new file mode 100644
+index 0000000000..4b56793398
+--- /dev/null
++++ b/scripts/pyedit.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++import sys
++import re
++from pathlib import Path
++
++USAGE = """Usage:
++  pyedit.py replace_regex <file> <pattern> <replacement> [--flags=IMSD]
++  pyedit.py insert_after <file> <anchor_pattern> <insertion>
++  pyedit.py insert_before <file> <anchor_pattern> <insertion>
++  pyedit.py ensure_line <file> <exact_line>
++Notes:
++- Patterns are Python regex. Replacement and insertion can contain \\n for newlines.
++- Flags: I=IGNORECASE, M=MULTILINE, S=DOTALL, D=DEBUG.
++Exit codes: 0 on success (including no-op for ensure_line), 1 on error, 2 if no match for insert/replace.
++"""
++
++def parse_flags(flags_str):
++    flags = 0
++    if 'I' in flags_str: flags |= re.IGNORECASE
++    if 'M' in flags_str: flags |= re.MULTILINE
++    if 'S' in flags_str: flags |= re.DOTALL
++    if 'D' in flags_str: flags |= re.DEBUG
++    return flags
++
++def unescape_newlines(s: str) -> str:
++    return s.replace("\\n", "\n")
++
++def replace_regex(path, pattern, replacement, flags_str="MS"):
++    p = Path(path)
++    if not p.exists():
++        print(f"ERROR: File not found: {path}", file=sys.stderr)
++        return 1
++    text = p.read_text(encoding="utf-8")
++    flags = parse_flags(flags_str)
++    repl = unescape_newlines(replacement)
++    try:
++        new_text, n = re.subn(pattern, repl, text, flags=flags)
++    except re.error as e:
++        print(f"ERROR: Invalid regex: {e}", file=sys.stderr)
++        return 1
++    if n == 0:
++        print(f"WARN: No matches for pattern in {path}", file=sys.stderr)
++        return 2
++    p.write_text(new_text, encoding="utf-8")
++    print(f"OK: Replaced {n} occurrence(s) in {path}")
++    return 0
++
++def insert_relative(path, anchor_pattern, insertion, before=False):
++    p = Path(path)
++    if not p.exists():
++        print(f"ERROR: File not found: {path}", file=sys.stderr)
++        return 1
++    text = p.read_text(encoding="utf-8")
++    ins = unescape_newlines(insertion)
++    try:
++        m = re.search(anchor_pattern, text, flags=re.MULTILINE|re.DOTALL)
++    except re.error as e:
++        print(f"ERROR: Invalid regex: {e}", file=sys.stderr)
++        return 1
++    if not m:
++        print(f"WARN: Anchor not found in {path}", file=sys.stderr)
++        return 2
++    start, end = m.span()
++    new_text = text[:start] + ins + text[start:] if before else text[:end] + ins + text[end:]
++    p.write_text(new_text, encoding="utf-8")
++    print(f"OK: Inserted {'before' if before else 'after'} anchor in {path}")
++    return 0
++
++def ensure_line(path, line):
++    p = Path(path)
++    if not p.exists():
++        print(f"ERROR: File not found: {path}", file=sys.stderr)
++        return 1
++    line = unescape_newlines(line)
++    text = p.read_text(encoding="utf-8")
++    lines = text.splitlines(True)
++    target = line if line.endswith("\n") else line + "\n"
++    if target in lines:
++        print("OK: Line already present")
++        return 0
++    with p.open("a", encoding="utf-8") as f:
++        if not text.endswith("\n"):
++            f.write("\n")
++        f.write(target)
++    print("OK: Line appended")
++    return 0
++
++def main(argv):
++    if len(argv) < 2:
++        print(USAGE, file=sys.stderr)
++        return 1
++    cmd = argv[1]
++    if cmd == "replace_regex":
++        if len(argv) == 5:
++            return replace_regex(argv[2], argv[3], argv[4])
++        if len(argv) == 6 and argv[5].startswith("--flags="):
++            return replace_regex(argv[2], argv[3], argv[4], argv[5].split("=",1)[1])
++        print(USAGE, file=sys.stderr)
++        return 1
++    if cmd == "insert_after" and len(argv) == 5:
++        return insert_relative(argv[2], argv[3], argv[4], before=False)
++    if cmd == "insert_before" and len(argv) == 5:
++        return insert_relative(argv[2], argv[3], argv[4], before=True)
++    if cmd == "ensure_line" and len(argv) == 4:
++        return ensure_line(argv[2], argv[3])
++    print(USAGE, file=sys.stderr)
++    return 1
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+diff --git a/scripts/repro_opt.py b/scripts/repro_opt.py
+new file mode 100644
+index 0000000000..c0a652bea2
+--- /dev/null
++++ b/scripts/repro_opt.py
+@@ -0,0 +1,33 @@
++from django.db.migrations.optimizer import MigrationOptimizer as Optimizer
++from django.db.migrations.operations.fields import AddField, AlterField
++from django.db import models
++
++ops = [
++    AddField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=256, null=True),
++    ),
++    AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True),
++    ),
++    AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True, help_text="help"),
++    ),
++    AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True, help_text="help", default=None),
++    ),
++]
++
++opt = Optimizer()
++res_all = opt.optimize(ops, "books")
++print("All ops optimized types:", [type(o).__name__ for o in res_all])
++
++res_slice = opt.optimize(ops[1:], "books")
++print("Slice ops optimized types:", [type(o).__name__ for o in res_slice])

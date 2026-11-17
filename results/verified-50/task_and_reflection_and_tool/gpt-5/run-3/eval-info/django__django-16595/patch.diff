@@ -1,0 +1,187 @@
+diff --git a/django/db/migrations/operations/fields.py b/django/db/migrations/operations/fields.py
+index cd3aab43ad..fcbfb91874 100755
+--- a/django/db/migrations/operations/fields.py
++++ b/django/db/migrations/operations/fields.py
+@@ -264,6 +264,11 @@ class AlterField(FieldOperation):
+                     field=self.field,
+                 ),
+             ]
++        
++        # Consecutive AlterField operations on the same field can be collapsed
++        # to the latter operation since only the final state matters.
++        elif isinstance(operation, AlterField) and self.is_same_field_operation(operation):
++            return [operation]
+         return super().reduce(operation, app_label)
+ 
+ 
+diff --git a/patch_alterfield_reduce.py b/patch_alterfield_reduce.py
+new file mode 100644
+index 0000000000..faeab8354c
+--- /dev/null
++++ b/patch_alterfield_reduce.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++import io, sys
++
++path = "django/db/migrations/operations/fields.py"
++with io.open(path, "r", encoding="utf-8") as f:
++    src = f.read()
++
++marker_class = "class AlterField(FieldOperation):"
++idx_class = src.find(marker_class)
++if idx_class == -1:
++    print("AlterField class not found; aborting.", file=sys.stderr)
++    sys.exit(1)
++
++reduce_sig = "def reduce(self, operation, app_label):"
++idx_reduce = src.find(reduce_sig, idx_class)
++if idx_reduce == -1:
++    print("AlterField.reduce not found; aborting.", file=sys.stderr)
++    sys.exit(1)
++
++# Ensure we are within the same method block to avoid false positives.
++next_def = src.find("\n    def ", idx_reduce + 1)
++method_block = src[idx_reduce: next_def if next_def != -1 else len(src)]
++
++already = "elif isinstance(operation, AlterField) and self.is_same_field_operation(operation):" in method_block
++if already:
++    print("Patch already applied.")
++    sys.exit(0)
++
++ret_super = "return super().reduce(operation, app_label)"
++idx_return = method_block.find(ret_super)
++if idx_return == -1:
++    print("Return to super reduce not found in AlterField.reduce; aborting.", file=sys.stderr)
++    sys.exit(1)
++
++absolute_return_idx = idx_reduce + idx_return
++
++insertion = (
++    "\n"
++    "        # Consecutive AlterField operations on the same field can be collapsed\n"
++    "        # to the latter operation since only the final state matters.\n"
++    "        elif isinstance(operation, AlterField) and self.is_same_field_operation(operation):\n"
++    "            return [operation]\n"
++)
++
++new_src = src[:absolute_return_idx] + insertion + src[absolute_return_idx:]
++
++with io.open(path, "w", encoding="utf-8") as f:
++    f.write(new_src)
++
++print("Patched AlterField.reduce to collapse consecutive AlterField operations.")
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..b802d6fdad
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,9 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++[Workflow Reminder] After locating AlterField.reduce, update task_description.txt with file path and any design constraints. Ensure to create a small script to reproduce optimizer behavior before and after changes.
++
++[Workflow Reminder] Ensure indentation correctness when patching Python blocks. Always re-run the reproduction to confirm optimizer changes.
+diff --git a/reproduce_optimizer.py b/reproduce_optimizer.py
+new file mode 100644
+index 0000000000..385ac7645b
+--- /dev/null
++++ b/reproduce_optimizer.py
+@@ -0,0 +1,39 @@
++from django.db import migrations, models
++from django.db.migrations.optimizer import MigrationOptimizer
++
++def summarize(ops):
++    out = []
++    for op in ops:
++        name = getattr(op, 'name', getattr(op, 'new_name', getattr(op, 'old_name', '?')))
++        out.append(f"{op.__class__.__name__}:{getattr(op, 'model_name', '?')}.{name}")
++    return out
++
++operations = [
++    migrations.AddField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=256, null=True),
++    ),
++    migrations.AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True),
++    ),
++    migrations.AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True, help_text="help"),
++    ),
++    migrations.AlterField(
++        model_name="book",
++        name="title",
++        field=models.CharField(max_length=128, null=True, help_text="help", default=None),
++    ),
++]
++
++optimizer = MigrationOptimizer()
++full_res = optimizer.optimize(operations, "books")
++alt_only_res = optimizer.optimize(operations[1:], "books")
++
++print("Before/Fix Check - Full optimize:", summarize(full_res))
++print("Before/Fix Check - Alter-only optimize:", summarize(alt_only_res))
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..8c0cc9b9c3
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,49 @@
++Migration optimizer does not reduce multiple AlterField
++Description
++	
++Let's consider the following operations: 
++operations = [
++	migrations.AddField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=256, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help),
++	),
++	migrations.AlterField(
++		model_name=book,
++		name=title,
++		field=models.CharField(max_length=128, null=True, help_text=help, default=None),
++	),
++]
++If I run the optimizer, I get only the AddField, as we could expect. However, if the AddField model is separated from the AlterField (e.g. because of a non-elidable migration, or inside a non-squashed migration), none of the AlterField are reduced:
++optimizer.optimize(operations[1:], books) 
++[<AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
++ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>]
++Indeed, the AlterField.reduce does not consider the the case where operation is also an AlterField. 
++Is this behaviour intended? If so, could it be documented? 
++Otherwise, would it make sense to add something like
++		if isinstance(operation, AlterField) and self.is_same_field_operation(
++			operation
++		):
++			return [operation]
++
++
++[Task Update] Identified this is a Django codebase with full migrations framework present. Planning to modify AlterField.reduce to collapse consecutive AlterField operations on same field.
++
++[Task Update] Baseline reproduction before patch:
++Full optimize: ['AddField(book.title)']
++Alter-only optimize: ['AlterField(book.title)', 'AlterField(book.title)', 'AlterField(book.title)']
++
++[Task Update] After patch verification:
++Full optimize: ['AddField(book.title)']
++Alter-only optimize: ['AlterField(book.title)']

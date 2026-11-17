@@ -1,0 +1,156 @@
+diff --git a/django/forms/boundfield.py b/django/forms/boundfield.py
+index 88adadb37d..b3f46c0444 100644
+--- a/django/forms/boundfield.py
++++ b/django/forms/boundfield.py
+@@ -1,6 +1,8 @@
+ import datetime
+ import re
+ 
++
++from django.core.exceptions import ValidationError
+ from django.forms.utils import flatatt, pretty_name
+ from django.forms.widgets import Textarea, TextInput
+ from django.utils.functional import cached_property
+@@ -232,6 +234,24 @@ class BoundField:
+     def widget_type(self):
+         return re.sub(r'widget$|input$', '', self.field.widget.__class__.__name__.lower())
+ 
++    def _did_change(self):
++        """Return True if this field's submitted data differs from its initial value."""
++        data_value = self.data
++        if not self.field.show_hidden_initial:
++            # Use the BoundField's initial as this is the value passed to the widget.
++            initial_value = self.initial
++        else:
++            hidden_widget = self.field.hidden_widget()
++            try:
++                initial_value = self.field.to_python(
++                    self.form._widget_data_value(hidden_widget, self.html_initial_name)
++                )
++            except ValidationError:
++                # Always assume data has changed if validation fails.
++                return True
++        return self.field.has_changed(initial_value, data_value)
++
++
+ 
+ @html_safe
+ class BoundWidget:
+diff --git a/django/forms/forms.py b/django/forms/forms.py
+index d14037bfe9..9157d587ab 100644
+--- a/django/forms/forms.py
++++ b/django/forms/forms.py
+@@ -146,6 +146,10 @@ class BaseForm:
+     def __iter__(self):
+         for name in self.fields:
+             yield self[name]
++    def _bound_items(self):
++        for name in self.fields:
++            yield name, self[name]
++
+ 
+     def __getitem__(self, name):
+         """Return a BoundField with the given name."""
+@@ -387,14 +391,15 @@ class BaseForm:
+         self._post_clean()
+ 
+     def _clean_fields(self):
+-        for name, field in self.fields.items():
++        for name, bf in self._bound_items():
++            field = bf.field
+             if field.disabled:
+-                value = self.get_initial_for_field(field, name)
++                value = bf.initial
+             else:
+-                value = self._field_data_value(field, self.add_prefix(name))
++                value = bf.data
+             try:
+                 if isinstance(field, FileField):
+-                    initial = self.get_initial_for_field(field, name)
++                    initial = bf.initial
+                     value = field.clean(value, initial)
+                 else:
+                     value = field.clean(value)
+@@ -405,6 +410,7 @@ class BaseForm:
+             except ValidationError as e:
+                 self.add_error(name, e)
+ 
++
+     def _clean_form(self):
+         try:
+             cleaned_data = self.clean()
+@@ -436,27 +442,9 @@ class BaseForm:
+ 
+     @cached_property
+     def changed_data(self):
+-        data = []
+-        for name, field in self.fields.items():
+-            data_value = self._field_data_value(field, self.add_prefix(name))
+-            if not field.show_hidden_initial:
+-                # Use the BoundField's initial as this is the value passed to
+-                # the widget.
+-                initial_value = self[name].initial
+-            else:
+-                initial_prefixed_name = self.add_initial_prefix(name)
+-                hidden_widget = field.hidden_widget()
+-                try:
+-                    initial_value = field.to_python(
+-                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+-                    )
+-                except ValidationError:
+-                    # Always assume data has changed if validation fails.
+-                    data.append(name)
+-                    continue
+-            if field.has_changed(initial_value, data_value):
+-                data.append(name)
+-        return data
++        return [name for name, bf in self._bound_items() if bf._did_change()]
++
++
+ 
+     @property
+     def media(self):
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..7bbaa733b5
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,5 @@
++
++- Ensure all value access in BaseForm._clean_fields() and changed_data uses BoundField (bf.initial, bf.data).
++- Import ValidationError in boundfield.py for _did_change() try/except.
++- Verify FileField initial is sourced from bf.initial to match BoundField.initial semantics.
++- Keep method indentation and decorators intact; avoid breaking subsequent definitions.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..2ef83ddef6
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,27 @@
++BaseForm's _clean_fields() and changed_data should access values via BoundField
++Description
++	 
++		(last modified by Chris Jerdonek)
++	 
++While working on #32917, I noticed that ​BaseForm._clean_fields() and ​BaseForm.changed_data don't currently access their values through a BoundField object. It would be better for consistency if they did, and to reduce the number of code paths.
++One consequence of the current code is that form._clean_fields() can return a different value from form[name].initial when they should be the same. This case is almost, but not quite, covered by ​test_datetime_clean_initial_callable_disabled() (the test can be adjusted to cover this case).
++As part of this ticket and in line with accessing data through the BoundField objects, I noticed that the code would also be simpler if the per-field logic of changed_data() were moved into a method of the BoundField class. It could be called something like bf.did_change(). This would be more appropriate because whether form data changed for a field is a property of its BoundField (as it depends on the underlying form data), as opposed to the unbound field. With this change, the method could change from its current ~20 lines to something like this--
++@cached_property
++def changed_data(self):
++	return [name for name, bf in self._bound_items() if bf._did_change()]
++A similar change could be made to BaseForm._clean_fields().
++
++Insights discovered during code inspection:
++- BaseForm._clean_fields() currently reads values directly using get_initial_for_field() for disabled fields and _field_data_value() for others, not via BoundField.
++- BaseForm.changed_data currently computes per-field change logic inline, using BoundField.initial only in the non-show_hidden_initial branch and reading hidden initial via field.hidden_widget() and _widget_data_value() otherwise.
++- BoundField already exposes:
++  - data (via form._field_data_value(field, html_name)),
++  - initial (via form.get_initial_for_field + microsecond normalization),
++  - value() (using field.bound_data(...), then prepare_value()).
++Plan implemented:
++- Add BoundField._did_change() that encapsulates the per-field change detection logic currently in BaseForm.changed_data.
++- Refactor BaseForm.changed_data to iterate over BoundFields and call bf._did_change().
++- Add BaseForm._bound_items() -> yields (name, BoundField) for consistency and to simplify callers.
++- Refactor BaseForm._clean_fields() to use BoundField for accessing values:
++  - Use bf.initial for disabled fields and for FileField initial, and bf.data for normal data retrieval.
++  - Keep existing cleaning and per-field clean_<name>() calls intact.

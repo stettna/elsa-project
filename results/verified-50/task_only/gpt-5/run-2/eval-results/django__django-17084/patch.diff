@@ -1,0 +1,82 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..31cf3f0e61 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -436,6 +436,18 @@ class Query(BaseExpression):
+             )
+             or having
+         )
++        # Detect usage of window (OVER) expressions referenced by aggregates,
++        # or directly contained within aggregates, to force aggregation on a
++        # subquery and avoid backend errors like:
++        #   psycopg2.errors.GroupingError: aggregate function calls cannot contain window function calls
++        refs_window = any(
++            any(
++                getattr(self.annotations.get(ref), 'contains_over_clause', False)
++                for ref in aggregate.get_refs()
++            )
++            for aggregate in aggregates.values()
++        ) or any(getattr(aggregate, 'contains_over_clause', False) for aggregate in aggregates.values())
++
+         # Decide if we need to use a subquery.
+         #
+         # Existing aggregations would cause incorrect results as
+@@ -454,6 +466,7 @@ class Query(BaseExpression):
+             or qualify
+             or self.distinct
+             or self.combinator
++            or refs_window
+         ):
+             from django.db.models.sql.subqueries import AggregateQuery
+ 
+@@ -2675,4 +2688,4 @@ class JoinPromoter:
+             # and again we could safely demote to INNER.
+         query.promote_joins(to_promote)
+         query.demote_joins(to_demote)
+-        return to_demote
++        return to_demote
+\ No newline at end of file
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..acc81e46c1
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,31 @@
++Cannot use aggregate over window functions since 4.2
++Description
++	 
++		(last modified by younes-chaoui)
++	 
++After upgrading to Django 4.2, I encountered an exception when executing ORM queries that involve aggregates over Window functions. The specific error was psycopg2.errors.GroupingError: aggregate function calls cannot contain window function calls
++Dependencies :
++psycopg2 version: 2.9.3
++django version: 4.2.3
++PostgreSQL version: 13.4
++Example Code:
++queryset = queryset.annotate(
++	cumul_DJR=Coalesce(Window(Sum(DJR), order_by=F(date).asc()), 0.0)
++)
++aggregate = queryset.aggregate(
++	DJR_total=Sum(DJR),
++	cumul_DJR_total=Sum(cumul_DJR)
++)
++
++Additional Findings and Fix:
++- Root cause: aggregate() over annotations containing Window (OVER) expressions wasn't forcing a subquery in get_aggregation(), leading PostgreSQL to raise "aggregate function calls cannot contain window function calls".
++- Change: In django/db/models/sql/query.py:get_aggregation(), detect when aggregates either:
++  - directly contain window expressions (contains_over_clause), or
++  - reference annotations whose expressions contain OVER clauses,
++  and force the aggregation to be performed on a subquery in those cases by adding a refs_window guard to the subquery decision.
++
++Environment and Verification Notes:
++- Environment limitation: pytest is not installed; cannot run pytest-based tests.
++- Environment limitation: runtests.py not found in repository; cannot run Django's test runner.
++- Import check: Successfully imported django.db.models.sql.query (syntax OK).
++- Import check: Successfully imported django.db.models (syntax OK).

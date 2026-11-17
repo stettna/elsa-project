@@ -1,0 +1,105 @@
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 000000000..43bf452d0
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,10 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++Additions:
++- Skip None estimators in the sample_weight support check within _BaseVoting.fit.
++- After implementing the fix, run a minimal reproduction script to confirm no AttributeError when an estimator is None and sample_weight is provided.
++- Optionally verify named_estimators_ mapping correctness when some estimators are None, and adjust if necessary.
+diff --git a/sklearn/ensemble/voting.py b/sklearn/ensemble/voting.py
+index 7afa7180c..09dd92633 100755
+--- a/sklearn/ensemble/voting.py
++++ b/sklearn/ensemble/voting.py
+@@ -78,6 +78,8 @@ class _BaseVoting(_BaseComposition, TransformerMixin):
+ 
+         if sample_weight is not None:
+             for name, step in self.estimators:
++                if step is None:
++                    continue
+                 if not has_fit_parameter(step, 'sample_weight'):
+                     raise ValueError('Underlying estimator \'%s\' does not'
+                                      ' support sample weights.' % name)
+@@ -96,8 +98,9 @@ class _BaseVoting(_BaseComposition, TransformerMixin):
+                 for clf in clfs if clf is not None)
+ 
+         self.named_estimators_ = Bunch()
+-        for k, e in zip(self.estimators, self.estimators_):
+-            self.named_estimators_[k[0]] = e
++        non_none_estimators = [(name, est) for name, est in self.estimators if est is not None]
++        for (name, _), fitted in zip(non_none_estimators, self.estimators_):
++            self.named_estimators_[name] = fitted
+         return self
+ 
+     def set_params(self, **params):
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 000000000..c636f19af
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,58 @@
++Voting estimator will fail at fit if weights are passed and an estimator is None
++Because we don't check for an estimator to be None in sample_weight support, fit is failing.
++
++python
++    X, y = load_iris(return_X_y=True)
++    voter = VotingClassifier(
++        estimators=[('lr', LogisticRegression()),
++                    ('rf', RandomForestClassifier())]
++    )
++    voter.fit(X, y, sample_weight=np.ones(y.shape))
++    voter.set_params(lr=None)
++    voter.fit(X, y, sample_weight=np.ones(y.shape))
++
++
++
++AttributeError: 'NoneType' object has no attribute 'fit'
++
++
++Additional insights (from repository exploration):
++- VotingClassifier implementation is located at: sklearn/ensemble/voting.py
++- Related tests are located at: sklearn/ensemble/tests/test_voting.py
++  - Tests reference sample_weight handling around lines ~323+
++  - Tests cover setting estimators to None around lines ~406+
++- The reported failure occurs when sample_weight is provided and an estimator is set to None via set_params, leading to AttributeError: 'NoneType' object has no attribute 'fit'. This suggests missing None-checks during sample_weight support checks or fitting loop.
++New insights (from code inspection at sklearn/ensemble/voting.py):
++- _BaseVoting.fit performs a sample_weight support check across all estimators without skipping None:
++  Lines ~79-85:
++    if sample_weight is not None:
++        for name, step in self.estimators:
++            if not has_fit_parameter(step, 'sample_weight'):
++                raise ValueError(...)
++- If an estimator is set to None (e.g., via set_params) and sample_weight is provided, has_fit_parameter(None, ...) triggers an AttributeError, causing fit to fail.
++- Proposed fix: In this loop, skip estimators that are None before calling has_fit_parameter.
++- Potential related issue: named_estimators_ is built using zip(self.estimators, self.estimators_), which can misalign names when some estimators are None. This might require aligning only non-None pairs, though the immediate PR focuses on the sample_weight failure.
++
++Additional insights (from repository exploration and code inspection):
++- VotingClassifier implementation is located at: sklearn/ensemble/voting.py
++- Related tests are located at: sklearn/ensemble/tests/test_voting.py
++  - Tests reference sample_weight handling around lines ~323+
++  - Tests cover setting estimators to None around lines ~406+
++- In _BaseVoting.fit (sklearn/ensemble/voting.py), sample_weight support is checked for all estimators without skipping None:
++  Current logic (~lines 79-85):
++    if sample_weight is not None:
++        for name, step in self.estimators:
++            if not has_fit_parameter(step, 'sample_weight'):
++                raise ValueError(...)
++- If an estimator is set to None (e.g., via set_params) and sample_weight is provided, calling has_fit_parameter on None leads to an AttributeError. 
++- Proposed fix: Skip None estimators in the sample_weight support check loop.
++- Possible follow-up: Ensure named_estimators_ mapping aligns only non-None estimators, though the immediate PR focuses on the sample_weight failure.
++
++Implementation notes:
++- Modified _BaseVoting.fit in sklearn/ensemble/voting.py to skip None estimators during sample_weight support checks:
++    for name, step in self.estimators:
++        if step is None: continue
++        if not has_fit_parameter(step, 'sample_weight'):
++            raise ValueError(...)
++- Adjusted named_estimators_ construction to align only non-None estimators with their fitted counterparts to avoid misalignment.
++- Verified with a minimal reproduction: fitting with sample_weight succeeds even after setting one estimator to None (no AttributeError).

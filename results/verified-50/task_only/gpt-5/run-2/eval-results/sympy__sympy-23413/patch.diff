@@ -1,0 +1,97 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/sympy/polys/matrices/normalforms.py b/sympy/polys/matrices/normalforms.py
+index 30f5534b08..3d7aa0004b 100644
+--- a/sympy/polys/matrices/normalforms.py
++++ b/sympy/polys/matrices/normalforms.py
+@@ -218,6 +218,11 @@ def _hermite_normal_form(A):
+         k -= 1
+         # k now points to the column in which we want to put a pivot.
+         # We want zeros in all entries to the left of the pivot column.
++        if A[i][k] == 0:
++            for r in range(n - 1, k, -1):
++                if A[i][r] != 0:
++                    add_columns(A, k, r, 0, 1, 1, 0)
++                    break
+         for j in range(k - 1, -1, -1):
+             if A[i][j] != 0:
+                 # Replace cols j, k by lin combs of these cols such that, in row i,
+@@ -309,13 +314,19 @@ def add_columns_mod_R(m, R, i, j, a, b, c, d):
+     W = defaultdict(dict)
+ 
+     m, n = A.shape
++    rows = min(m, n)
+     if n < m:
+         raise DMShapeError('Matrix must have at least as many columns as rows.')
+     A = A.to_dense().rep.copy()
+     k = n
+     R = D
+-    for i in range(m - 1, -1, -1):
++    for i in range(m - 1, m - 1 - rows, -1):
+         k -= 1
++        if A[i][k] == 0:
++            for r in range(n - 1, k, -1):
++                if A[i][r] != 0:
++                    add_columns(A, k, r, 0, 1, 1, 0)
++                    break
+         for j in range(k - 1, -1, -1):
+             if A[i][j] != 0:
+                 u, v, d = _gcdex(A[i][k], A[i][j])
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..44427235ec
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,47 @@
++bug with HNF removing rows
++I expect
++np.flip (hermite_normal_form (Matrix (np.flip (np.array ([[5, 8, 12], [0, 0, 1]]))).T).T))
++to give
++[[5,  8, 0], [0,  0, 1]]
++but instead I get
++[[5,  8, 0]]
++It seems to be falsely identifying my matrix as rank-deficient and removing the row when I try to achieve a row-style HNF using flips and transposes.
++
++Additional analysis notes:
++- The implementation of HNF in sympy/polys/matrices/normalforms.py (_hermite_normal_form) intentionally returns only the pivot columns via slicing A[:, k:], reducing columns to the rank. When using transposes/flips to emulate a row-style HNF, this column reduction appears as row removal after transposition.
++- SymPy tests confirm that HNF can reduce the number of columns (e.g., a 3x2 matrix can yield a 3x0 matrix in test_hermite_normal), so shape reduction is by design for column-style HNF.
++- The reported issue indicates that for input [[5, 8, 12], [0, 0, 1]] with flips/transposes, the result is [[5, 8, 0]] (shape 1x3) rather than the expected 2x3, suggesting the algorithm wrongly detects rank 1 instead of 2 in this scenario.
++- Suspect area: in _hermite_normal_form, pivot detection around variables b and k, and gcdex-based column operations that may cause a row to appear zero from the pivot column leftward after certain flips.
++Root cause identified: _hermite_normal_form only processes the bottom min(m, n) rows, which can miss a valid pivot in a higher row when the target pivot column is zero in a lower row. This leads to underestimating rank and dropping a pivot/row after transpose/flip (reproduced with m = Matrix([[1,12],[0,8],[0,5]]) giving HNF shape (3,1) instead of (3,2)).
++Fix plan: Iterate over all rows from bottom to top (range(m-1, -1, -1)) and add a guard after decrementing k to break if k < 0. This allows discovering pivots in higher rows while still returning only pivot columns as designed.
++EOF && sed -i 's/^[[:space:]]*rows = min(m, n)//' sympy/polys/matrices/normalforms.py && sed -i 's/for i in range(m - 1, m - 1 - rows, -1):/for i in range(m - 1, -1, -1):/' sympy/polys/matrices/normalforms.py && sed -i '0,/k -= 1/s/k -= 1/k -= 1\n        if k < 0:\n            break/' sympy/polys/matrices/normalforms.py && PYTHONPATH=. python - << 'PY'
++from sympy.matrices.normalforms import hermite_normal_form
++from sympy import Matrix
++
++# Equivalent to np.flip(arr).T where arr = [[5,8,12],[0,0,1]]
++m = Matrix([[1, 12],
++            [0, 8],
++            [0, 5]])
++
++hnf = hermite_normal_form(m)
++print("Input m (3x2):")
++print(m)
++print("HNF(m):")
++print(hnf)
++print("HNF shape:", hnf.shape)
++PY
++Verification step: Running example Matrix([[1,12],[0,8],[0,5]]) after fix to confirm HNF preserves two pivot columns instead of one.
++Implementing fix: process all rows in _hermite_normal_form and stop when k==0 to avoid missing pivots in higher rows. Verifying on Matrix([[1,12],[0,8],[0,5]]) example.
++Verification: After fix, HNF on flipped/transposed input should yield expected final matrix [[5,8,0],[0,0,1]]. Running pipeline and tests.
++Verification: Running SymPy-only flip/transpose pipeline to confirm expected final matrix [[5,8,0],[0,0,1]] after fix.
++Running Hermite normal form tests to verify no regressions after fix.
++Fix: Preserve processing of only min(m,n) rows but, if A[i][k]==0, swap in a right-side nonzero column before clearing left-of-pivot to avoid missing pivots (prevents erroneous row removal after transpose/flip). Verified on Matrix([[1,12],[0,8],[0,5]]) and DM([[2,7],[0,0],[0,0]]).
++Applied fix: In _hermite_normal_form, if A[i][k]==0, swap in a right-side nonzero column before clearing left-of-pivot. This preserves processing only bottom min(m,n) rows (keeping existing tests) while avoiding missed pivots that caused erroneous row removal after transpose/flip.
++Debug: Investigating IndentationError in sympy/polys/matrices/normalforms.py by inspecting _hermite_normal_form region.
++Fix: Restored missing 'break' in invariant_factors loop to resolve IndentationError; verified HNF fix on user pipeline and zero-rows DM case.
++Fixing IndentationError in invariant_factors: insert missing 'break' after inner 'else:'; verifying HNF fix and zero-rows case.
++Fixing IndentationError in invariant_factors by inserting missing 'break' after inner 'else:'; verifying HNF fix and zero-rows case.
++Fix: Insert missing 'break' after inner 'else:' in invariant_factors to resolve IndentationError; verifying HNF fix and zero-rows DM case.
++Debugging invariant_factors IndentationError: inspecting lines 136-156 in sympy/polys/matrices/normalforms.py to correct misplaced/missing 'break' under inner else.
++Fixed invariant_factors IndentationError by correctly indenting 'break' under inner 'else:'; verified user pipeline and zero-rows DM behavior.
++Re-verification: Printing m, HNF(m), HNF(m).T, and final result after T+flip to confirm expected [[5,8,0],[0,0,1]].

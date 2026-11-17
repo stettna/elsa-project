@@ -1,0 +1,143 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..2615de8882
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,3 @@
++nthroot_mod function misses one root of x = 0 mod p.
++When in the equation x**n = a mod p , when a % p == 0. Then x = 0 mod p is also a root of this equation. But right now nthroot_mod does not check for this condition. nthroot_mod(17*17, 5 , 17) has a root 0 mod 17. But it does not return it.
++
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..2c1abccc6e
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Add and use a non-interactive edit tool (tools/edit_tool.py) for precise source modifications (regex replace/insert, show with context).
++- Before editing, locate nthroot_mod in sympy (likely sympy/ntheory/residue_ntheory.py) and review surrounding logic.
++- Bug to fix: when a % p == 0, nthroot_mod should include x = 0 mod p as a root. Implement early handling for this case without breaking other logic.
++- Reproduce with nthroot_mod(17*17, 5, 17) expecting 0 in the roots; also test typical cases to ensure no regressions.
++- Do not modify tests/config; only change non-test source files.
++- After changes, run targeted checks and edge cases (a=0, n=1, primes and prime powers if supported).
+diff --git a/sympy/ntheory/residue_ntheory.py b/sympy/ntheory/residue_ntheory.py
+index 9a3052d4c3..a77d970021 100755
+--- a/sympy/ntheory/residue_ntheory.py
++++ b/sympy/ntheory/residue_ntheory.py
+@@ -768,6 +768,7 @@ def nthroot_mod(a, n, p, all_roots=False):
+     """
+     from sympy.core.numbers import igcdex
+     a, n, p = as_int(a), as_int(n), as_int(p)
++
+     if n == 2:
+         return sqrt_mod(a, p, all_roots)
+     # see Hackman "Elementary Number Theory" (2009), page 76
+@@ -776,6 +777,10 @@ def nthroot_mod(a, n, p, all_roots=False):
+     if not isprime(p):
+         raise NotImplementedError("Not implemented for composite p")
+ 
++    # Handle the trivial case where a is divisible by p: x = 0 (mod p)
++    if a % p == 0:
++        return [0] if all_roots else 0
++
+     if (p - 1) % n == 0:
+         return _nthroot_mod1(a, n, p, all_roots)
+     # The roots of ``x**n - a = 0 (mod p)`` are roots of
+@@ -805,8 +810,6 @@ def nthroot_mod(a, n, p, all_roots=False):
+     else:
+         res = _nthroot_mod1(a, pa, p, all_roots)
+     return res
+-
+-
+ def quadratic_residues(p):
+     """
+     Returns the list of quadratic residues.
+diff --git a/tools/edit_tool.py b/tools/edit_tool.py
+new file mode 100755
+index 0000000000..ede0ff4786
+--- /dev/null
++++ b/tools/edit_tool.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++import re, sys, argparse, json
++
++def load(path):
++    with open(path,'r',encoding='utf-8') as f:
++        return f.read()
++
++def save(path, content):
++    with open(path,'w',encoding='utf-8') as f:
++        f.write(content)
++
++def cmd_show(args):
++    text = load(args.file)
++    lines = text.splitlines()
++    pat = re.compile(args.pattern)
++    found = False
++    for i, l in enumerate(lines, 1):
++        if pat.search(l):
++            start = max(1, i-args.context)
++            end = min(len(lines), i+args.context)
++            for j in range(start, end+1):
++                prefix = ">>" if j == i else "  "
++                print(f"{prefix}{j:6d}: {lines[j-1]}")
++            print("--")
++            found = True
++    if not found:
++        print("NO_MATCH")
++        return 1
++    return 0
++
++def cmd_replace(args):
++    text = load(args.file)
++    flags = re.IGNORECASE if args.ignore_case else 0
++    count = 0 if args.global_replace else 1
++    new, n = re.subn(args.pattern, args.repl, text, count=count, flags=flags)
++    if n == 0:
++        print("NO_REPLACEMENT")
++        return 1
++    save(args.file, new)
++    print(json.dumps({"replacements": n}))
++    return 0
++
++def cmd_insert(args):
++    text = load(args.file)
++    flags = re.IGNORECASE if args.ignore_case else 0
++    pat = re.compile(args.pattern, flags)
++    pos = None
++    for m in pat.finditer(text):
++        pos = m.start() if args.before else m.end()
++        break
++    if pos is None:
++        print("NO_MATCH")
++        return 1
++    insert_text = args.text
++    if not insert_text.endswith("\n"):
++        insert_text += "\n"
++    new = text[:pos] + insert_text + text[pos:]
++    save(args.file, new)
++    print("INSERTED")
++    return 0
++
++def cmd_assert(args):
++    text = load(args.file)
++    ok = re.search(args.pattern, text) is not None
++    print("FOUND" if ok else "NOT_FOUND")
++    return 0 if ok else 1
++
++def main():
++    p = argparse.ArgumentParser(description="Simple file edit tool")
++    sub = p.add_subparsers(dest="cmd", required=True)
++    ps = sub.add_parser("show"); ps.add_argument("--file", required=True); ps.add_argument("--pattern", required=True); ps.add_argument("--context", type=int, default=2); ps.set_defaults(func=cmd_show)
++    pr = sub.add_parser("replace"); pr.add_argument("--file", required=True); pr.add_argument("--pattern", required=True); pr.add_argument("--repl", required=True); pr.add_argument("--ignore-case", action="store_true"); pr.add_argument("--global-replace", action="store_true"); pr.set_defaults(func=cmd_replace)
++    pi = sub.add_parser("insert"); pi.add_argument("--file", required=True); pi.add_argument("--pattern", required=True); pi.add_argument("--text", required=True); pi.add_argument("--before", action="store_true"); pi.add_argument("--ignore-case", action="store_true"); pi.set_defaults(func=cmd_insert)
++    pa = sub.add_parser("assert"); pa.add_argument("--file", required=True); pa.add_argument("--pattern", required=True); pa.set_defaults(func=cmd_assert)
++    args = p.parse_args()
++    sys.exit(args.func(args))
++
++if __name__ == "__main__":
++    main()

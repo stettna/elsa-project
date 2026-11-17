@@ -1,0 +1,79 @@
+diff --git a/django/core/management/__init__.py b/django/core/management/__init__.py
+index 5f2e64761e..6b804aa452 100644
+--- a/django/core/management/__init__.py
++++ b/django/core/management/__init__.py
+@@ -131,10 +131,33 @@ def call_command(command_name, *args, **options):
+ 
+     parser_actions = list(get_actions(parser))
+     # Any required arguments which are passed in via **options must be passed
+-    # to parse_args().
++    # to parse_args(). Additionally, if an argument is part of a required
++    # mutually exclusive group, it must also be passed through (if provided)
++    # so that argparse can validate the group requirement correctly.
++    def iter_parsers(p):
++        # Yield parser and any nested subparsers.
++        yield p
++        for act in p._actions:
++            if isinstance(act, _SubParsersAction):
++                for sub in act.choices.values():
++                    yield from iter_parsers(sub)
++    # Build a set of dests that are part of required mutually exclusive groups.
++    required_group_dests = set()
++    for p in iter_parsers(parser):
++        for group in getattr(p, '_mutually_exclusive_groups', []):
++            if getattr(group, 'required', False):
++                for action in getattr(group, '_group_actions', []):
++                    if getattr(action, 'dest', None):
++                        required_group_dests.add(action.dest)
++    # Helper: determine if an action must be passed through.
++    def must_pass_through(opt):
++        if not opt.dest or opt.dest not in options:
++            return False
++        return bool(opt.required or opt.dest in required_group_dests)
+     parse_args += [
+         '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+-        for opt in parser_actions if opt.required and opt.dest in options
++        for opt in parser_actions
++        if opt.option_strings and must_pass_through(opt)
+     ]
+     defaults = parser.parse_args(args=parse_args)
+     defaults = dict(defaults._get_kwargs(), **arg_options)
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..fb2d2da720
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,2 @@
++
++\n- Remember to include kwargs for options that are part of required mutually exclusive groups in call_command's parse_args construction.\n- Prefer robust file edits via Python scripts when multi-line sed becomes brittle.\n- After patching, run targeted tests for management.call_command behavior.\n
+\ No newline at end of file
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..88d5e239c0
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,23 @@
++call_command fails when argument of required mutually exclusive group is passed in kwargs.
++Description
++	
++This error 
++django.core.management.base.CommandError: Error: one of the arguments --shop-id --shop is required
++is raised when I run 
++call_command('my_command', shop_id=1)
++the argument 'shop_id' is part of a required mutually exclusive group:
++shop = parser.add_mutually_exclusive_group(required=True)
++shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++However, everything is fine when I call this command in this way:
++call_command('my_command, '--shop-id=1')
++In django sources I found that only those keyword arguments of call_command are passed to the parser that are defined as required:
++# Any required arguments which are passed in via '**options' must be passed
++# to parse_args().
++parse_args += [
++	'{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
++	for opt in parser._actions if opt.required and opt.dest in options
++]
++but in this special case both of them individually are not required, they are actually part of a group that is required. And the code of call_command does nothing with groups defined in the parser.
++
++\nAdditional notes:\n- Located call_command in django/core/management/__init__.py.\n- The previous logic only forwarded individually required options.\n- Implemented detection of required mutually exclusive groups and now forward provided kwargs in those groups to parse_args.\n
+\ No newline at end of file

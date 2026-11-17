@@ -1,0 +1,190 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..b8d4107577
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,13 @@
++BaseForm's _clean_fields() and changed_data should access values via BoundField
++Description
++	 
++		(last modified by Chris Jerdonek)
++	 
++While working on #32917, I noticed that ​BaseForm._clean_fields() and ​BaseForm.changed_data don't currently access their values through a BoundField object. It would be better for consistency if they did, and to reduce the number of code paths.
++One consequence of the current code is that form._clean_fields() can return a different value from form[name].initial when they should be the same. This case is almost, but not quite, covered by ​test_datetime_clean_initial_callable_disabled() (the test can be adjusted to cover this case).
++As part of this ticket and in line with accessing data through the BoundField objects, I noticed that the code would also be simpler if the per-field logic of changed_data() were moved into a method of the BoundField class. It could be called something like bf.did_change(). This would be more appropriate because whether form data changed for a field is a property of its BoundField (as it depends on the underlying form data), as opposed to the unbound field. With this change, the method could change from its current ~20 lines to something like this--
++@cached_property
++def changed_data(self):
++	return [name for name, bf in self._bound_items() if bf._did_change()]
++A similar change could be made to BaseForm._clean_fields().
++
+diff --git a/django/forms/boundfield.py b/django/forms/boundfield.py
+index 88adadb37d..982cf95de9 100644
+--- a/django/forms/boundfield.py
++++ b/django/forms/boundfield.py
+@@ -9,8 +9,6 @@ from django.utils.safestring import mark_safe
+ from django.utils.translation import gettext_lazy as _
+ 
+ __all__ = ('BoundField',)
+-
+-
+ @html_safe
+ class BoundField:
+     "A Field plus data"
+@@ -130,6 +128,31 @@ class BoundField:
+             data = self.field.bound_data(self.data, data)
+         return self.field.prepare_value(data)
+ 
++    
++
++    def _did_change(self):
++        """
++        Internal helper returning True if this field's submitted data differs
++        from its initial value.
++        """
++        field = self.field
++        # Determine initial value: either from BoundField.initial or from the
++        # hidden initial field if show_hidden_initial is enabled.
++        if not field.show_hidden_initial:
++            initial_value = self.initial
++        else:
++            hidden_widget = field.hidden_widget()
++            # initial values for show_hidden_initial are posted under the initial- prefix.
++            initial_prefixed_name = self.form.add_initial_prefix(self.name)
++            try:
++                initial_value = field.to_python(
++                    self.form._widget_data_value(hidden_widget, initial_prefixed_name)
++                )
++            except Exception:
++                # If parsing the hidden initial fails, assume the data changed.
++                return True
++        data_value = self.form._field_data_value(field, self.html_name)
++        return field.has_changed(initial_value, data_value)
+     def label_tag(self, contents=None, attrs=None, label_suffix=None):
+         """
+         Wrap the given contents in a <label>, if the field has an ID attribute.
+@@ -211,9 +234,16 @@ class BoundField:
+ 
+     @cached_property
+     def initial(self):
+-        data = self.form.get_initial_for_field(self.field, self.name)
+-        # If this is an auto-generated default date, nix the microseconds for
+-        # standardized handling. See #22502.
++        # Prefer form-provided initial lookup if available.
++        if hasattr(self.form, 'get_initial_for_field'):
++            data = self.form.get_initial_for_field(self.field, self.name)
++        else:
++            # Fallback: use form.initial mapping or field.initial callable/value.
++            if hasattr(self.form, 'initial') and self.name in getattr(self.form, 'initial', {}):
++                data = self.form.initial[self.name]
++            else:
++                data = self.field.initial() if callable(self.field.initial) else self.field.initial
++        # If this is an auto-generated default date, nix the microseconds for standardized handling.
+         if (isinstance(data, (datetime.datetime, datetime.time)) and
+                 not self.field.widget.supports_microseconds):
+             data = data.replace(microsecond=0)
+@@ -231,8 +261,6 @@ class BoundField:
+     @property
+     def widget_type(self):
+         return re.sub(r'widget$|input$', '', self.field.widget.__class__.__name__.lower())
+-
+-
+ @html_safe
+ class BoundWidget:
+     """
+diff --git a/django/forms/forms.py b/django/forms/forms.py
+index d14037bfe9..ddeac0b3eb 100644
+--- a/django/forms/forms.py
++++ b/django/forms/forms.py
+@@ -167,6 +167,12 @@ class BaseForm:
+         self._bound_fields_cache[name] = bound_field
+         return bound_field
+ 
++
++
++    def _bound_items(self):
++        """Yield (name, BoundField) tuples for all fields in order."""
++        for name in self.fields:
++            yield name, self[name]
+     @property
+     def errors(self):
+         """Return an ErrorDict for the data provided for the form."""
+@@ -385,13 +391,13 @@ class BaseForm:
+         self._clean_fields()
+         self._clean_form()
+         self._post_clean()
+-
+     def _clean_fields(self):
+         for name, field in self.fields.items():
++            bf = self[name]
+             if field.disabled:
+                 value = self.get_initial_for_field(field, name)
+             else:
+-                value = self._field_data_value(field, self.add_prefix(name))
++                value = bf.data
+             try:
+                 if isinstance(field, FileField):
+                     initial = self.get_initial_for_field(field, name)
+@@ -404,7 +410,7 @@ class BaseForm:
+                     self.cleaned_data[name] = value
+             except ValidationError as e:
+                 self.add_error(name, e)
+-
++    
+     def _clean_form(self):
+         try:
+             cleaned_data = self.clean()
+@@ -433,31 +439,11 @@ class BaseForm:
+     def has_changed(self):
+         """Return True if data differs from initial."""
+         return bool(self.changed_data)
+-
+     @cached_property
+     def changed_data(self):
+-        data = []
+-        for name, field in self.fields.items():
+-            data_value = self._field_data_value(field, self.add_prefix(name))
+-            if not field.show_hidden_initial:
+-                # Use the BoundField's initial as this is the value passed to
+-                # the widget.
+-                initial_value = self[name].initial
+-            else:
+-                initial_prefixed_name = self.add_initial_prefix(name)
+-                hidden_widget = field.hidden_widget()
+-                try:
+-                    initial_value = field.to_python(
+-                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+-                    )
+-                except ValidationError:
+-                    # Always assume data has changed if validation fails.
+-                    data.append(name)
+-                    continue
+-            if field.has_changed(initial_value, data_value):
+-                data.append(name)
+-        return data
+-
++        return [name for name, bf in self._bound_items() if bf._did_change()]
++    
++    
+     @property
+     def media(self):
+         """Return all media required to render the widgets on this form."""
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..39280c0658
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,14 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Note: No 'testbed' directory exists; operate in repo root with 'django' and 'tests'.
++- Goal: Modify BaseForm._clean_fields() and changed_data to use BoundField access; add BoundField._did_change().
++- Create helper tools (e.g., file editor) if repetitive edits needed.
++- Prefer running targeted tests (forms) via Django's test runner to validate changes.
++
++- Reminder: No 'testbed' directory; operate in repo root ('django', 'tests').
++- Plan: Implement BoundField._did_change() and refactor BaseForm.changed_data to use BoundField instances via _bound_items(); refactor BaseForm._clean_fields to access values via BoundField for consistency.
++- Consider creating a small Python editing tool for safe, repeatable in-file modifications and a quick test runner for targeted tests.
++- After changes, run targeted forms tests to validate behavior.

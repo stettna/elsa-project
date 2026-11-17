@@ -1,0 +1,162 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..a4429f0ac6 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,6 +143,18 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        # Suppress response body for HEAD requests while preserving headers.
++        # This keeps runserver compliant with RFC 2616 where HEAD must not
++        # include a message body. Ensure headers are sent even if no body is
++        # written.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not self.headers_sent:
++                self.send_headers()
++            return
++        super().write(data)
++
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..83ae1a804b
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,15 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++— Added guidance (HEAD/runserver fix workflow) —
++- When addressing HTTP HEAD compliance in Django's runserver:
++  - Inspect: django/core/servers/basehttp.py and django/core/management/commands/runserver.py
++  - Search for HEAD handling and where the request handler/server handler writes the response body.
++  - Strategy: Suppress writing the response body for HEAD while preserving headers (including Content-Length as per RFC 2616).
++  - Prefer subclassing or wrapping the wsgi handler/write stream rather than altering app headers.
++- Reproduce with a minimal runserver and curl -iX HEAD to validate no response body is sent and no broken pipe occurs.
++- Use tools/apply_ops.py to make targeted, repeatable edits (replace/insert), avoiding manual and brittle sed/awk.
++- After changes, run relevant tests or a quick script to ensure no regressions.
++- Always keep changes minimal, well-scoped, and consistent with existing code patterns.
+diff --git a/tools/apply_ops.py b/tools/apply_ops.py
+new file mode 100755
+index 0000000000..9dfa92fd2b
+--- /dev/null
++++ b/tools/apply_ops.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++import sys, json, re, os
++
++def eprint(*a, **k):
++    print(*a, file=sys.stderr, **k)
++
++def main():
++    data = sys.stdin.read()
++    if not data.strip():
++        eprint("No JSON input provided to tools/apply_ops.py")
++        sys.exit(1)
++    try:
++        spec = json.loads(data)
++    except Exception as e:
++        eprint("Invalid JSON:", e)
++        sys.exit(2)
++
++    path = spec.get("file")
++    if not path:
++        eprint("Missing 'file' in JSON")
++        sys.exit(3)
++    if not os.path.exists(path):
++        eprint(f"File not found: {path}")
++        sys.exit(4)
++
++    with open(path, 'r', encoding='utf-8') as f:
++        content = f.read()
++    original = content
++    ops = spec.get("ops", [])
++    if not isinstance(ops, list) or not ops:
++        eprint("No operations specified under 'ops'")
++        sys.exit(6)
++
++    for i, op in enumerate(ops):
++        if not isinstance(op, dict) or "type" not in op:
++            eprint(f"op {i}: invalid op spec (must be object with 'type')")
++            sys.exit(7)
++        typ = op.get("type")
++        if typ == "replace":
++            pattern = op.get("pattern"); repl = op.get("repl", "")
++            if pattern is None:
++                eprint(f"op {i}: replace requires 'pattern'")
++                sys.exit(8)
++            flags = re.MULTILINE | re.DOTALL
++            if op.get("ignorecase"):
++                flags |= re.IGNORECASE
++            count = op.get("count", 0)
++            content, n = re.subn(pattern, repl, content, count=count, flags=flags)
++            eprint(f"op {i}: replace matched {n} times")
++            if op.get("required") and n == 0:
++                eprint(f"op {i}: required replace matched 0 times")
++                sys.exit(9)
++        elif typ in ("insert_before", "insert_after"):
++            pattern = op.get("pattern"); text = op.get("text", "")
++            if pattern is None:
++                eprint(f"op {i}: {typ} requires 'pattern'")
++                sys.exit(8)
++            flags = re.MULTILINE | re.DOTALL
++            if op.get("ignorecase"):
++                flags |= re.IGNORECASE
++            m = re.search(pattern, content, flags)
++            if not m:
++                eprint(f"op {i}: pattern not found for {typ}")
++                if op.get("required", True):
++                    sys.exit(10 + i)
++                else:
++                    continue
++            pos = m.start() if typ == "insert_before" else m.end()
++            content = content[:pos] + text + content[pos:]
++            eprint(f"op {i}: {typ} inserted {len(text)} chars")
++        elif typ == "ensure_line":
++            line = op.get("line")
++            if line is None:
++                eprint(f"op {i}: ensure_line requires 'line'")
++                sys.exit(8)
++            lines = content.splitlines(keepends=True)
++            if any(l.rstrip("\\n") == line.rstrip("\\n") for l in lines):
++                eprint(f"op {i}: line already present")
++            else:
++                if not content.endswith("\\n"):
++                    content += "\\n"
++                content += line if line.endswith("\\n") else (line + "\\n")
++                eprint(f"op {i}: ensured line added")
++        elif typ == "rewrite_between":
++            start = op.get("start"); end = op.get("end"); new = op.get("text", "")
++            if start is None or end is None:
++                eprint(f"op {i}: rewrite_between requires 'start' and 'end'")
++                sys.exit(8)
++            flags = re.MULTILINE | re.DOTALL
++            s = re.search(start, content, flags)
++            e = re.search(end, content, flags)
++            if not s or not e or e.start() < s.end():
++                eprint(f"op {i}: could not find valid region between start/end")
++                sys.exit(20 + i)
++            content = content[:s.end()] + new + content[e.start():]
++            eprint(f"op {i}: rewrote between")
++        else:
++            eprint(f"Unknown op type: {typ}")
++            sys.exit(5)
++
++    if content != original:
++        with open(path, 'w', encoding='utf-8') as f:
++            f.write(content)
++        eprint(f"Updated {path} ({len(original)} -> {len(content)} bytes)")
++    else:
++        eprint("No changes applied")
++
++if __name__ == "__main__":
++    main()

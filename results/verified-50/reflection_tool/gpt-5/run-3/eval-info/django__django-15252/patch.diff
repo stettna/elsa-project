@@ -1,0 +1,273 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..d5e1a2dd0f
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,17 @@
++MigrationRecorder does not obey db_router allow_migrate rules
++Description
++	
++Hi,
++We have a multi-db setup. We have one connection that is for the django project, and several connections that talk to other dbs for information (ie models with managed = False). Django should only create tables in the first connection, never in any of the other connections. We have a simple router that does the following: 
++class Router(object):
++	def allow_migrate(self, db, model):
++		if db == 'default':
++			return True
++		return False
++Current Behaviour
++We run our functional tests and the migrate command is called against each connection when the test databases are created (see django/test/runner.py, setup_databases, line 300-ish, which calls django/db/backends/creation.py, create_test_db, line 377-ish)
++When this migrate runs, it tries to apply our migrations, which tries to record that a migration has been applied (see django/db/migrations/executor.py, apply_migration, which has several calls to self.recorder.record_applied). 
++The first thing that record_applied does is a call to self.ensure_schema() (see django/db/migrations/recorder.py, record_applied, lien 66-ish). 
++ensure_schema checks to see if the Migration model is in the tables in the connection. If it does not find the table then it tries to create the table. 
++I believe that this is incorrect behaviour when a db_router has been provided. If using the router above, my expectation would be that the table is not created on any connection other than the 'default' connection. Looking at the other methods on the MigrationRecorder, I would expect that there will be similar issues with applied_migrations and record_unapplied.
++
+diff --git a/default.sqlite3 b/default.sqlite3
+new file mode 100644
+index 0000000000..e67d6fe418
+Binary files /dev/null and b/default.sqlite3 differ
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..765d8a66a2 100755
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -1,5 +1,6 @@
+ from django.apps.registry import Apps
+ from django.db import DatabaseError, models
++from django.db import router
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
+ 
+@@ -52,6 +53,10 @@ class MigrationRecorder:
+ 
+     def has_table(self):
+         """Return True if the django_migrations table exists."""
++        # Respect routers: if migrations for this model aren't allowed on
++        # this connection, behave as if the table doesn't exist.
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++            return False
+         with self.connection.cursor() as cursor:
+             tables = self.connection.introspection.table_names(cursor)
+         return self.Migration._meta.db_table in tables
+@@ -62,6 +67,10 @@ class MigrationRecorder:
+         # in the codebase.
+         if self.has_table():
+             return
++        # Respect database routers: do not create or write migration records
++        # on connections where migrations for this model are not allowed.
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++            return
+         # Make the table
+         try:
+             with self.connection.schema_editor() as editor:
+@@ -83,14 +92,20 @@ class MigrationRecorder:
+ 
+     def record_applied(self, app, name):
+         """Record that a migration was applied."""
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++            return
+         self.ensure_schema()
+         self.migration_qs.create(app=app, name=name)
+ 
+     def record_unapplied(self, app, name):
+         """Record that a migration was unapplied."""
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++            return
+         self.ensure_schema()
+         self.migration_qs.filter(app=app, name=name).delete()
+ 
+     def flush(self):
+         """Delete all migration records. Useful for testing migrations."""
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++            return
+         self.migration_qs.all().delete()
+diff --git a/other.sqlite3 b/other.sqlite3
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..03d0a9a747
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,15 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++# Additions for multi-DB migration router issue workflow
++- Always create a small reproduction script to simulate multi-db behavior and router rules before changing code.
++- Locate and read django/db/migrations/recorder.py and related executor code to understand when ensure_schema() is called.
++- Ensure MigrationRecorder respects the database router's allow_migrate decision:
++  - If router denies migrations for a non-default DB, do not create the migration table and avoid writes on that connection.
++  - Reading applied migrations on a denied DB should not trigger schema creation.
++- Prefer adding logic that consults django.db.utils.ConnectionRouter.allow_migrate with the correct model/hints.
++- After changes, run focused tests around migrations and multi-db to validate behavior.
++- Use scripts/edfile.py to make precise, reviewable edits (replace, insert-before/after, append) without interactive editors.
++- If deviating from the standard workflow or needing new helpers, update this prompt with the rationale and steps.
+diff --git a/scripts/edfile.py b/scripts/edfile.py
+new file mode 100755
+index 0000000000..09baa43099
+--- /dev/null
++++ b/scripts/edfile.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from typing import Optional
++
++def read_from_arg_or_stdin(value: Optional[str]) -> str:
++    if value is None:
++        return ""
++    if value == "-":
++        return sys.stdin.read()
++    return value
++
++def load_file(path: str) -> str:
++    with open(path, "r", encoding="utf-8") as f:
++        return f.read()
++
++def save_file(path: str, content: str) -> None:
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(content)
++
++def cmd_show(args):
++    content = load_file(args.file)
++    for i, line in enumerate(content.splitlines(True), 1):
++        sys.stdout.write(f"{i:6d}: {line}")
++    return 0
++
++def cmd_replace(args):
++    content = load_file(args.file)
++    pattern = args.pattern
++    repl = read_from_arg_or_stdin(args.repl)
++    count = 0 if args.count is None else args.count
++    if args.regex:
++        new_content, n = re.subn(pattern, repl, content, count=count, flags=re.MULTILINE)
++    else:
++        if count == 0:
++            n = content.count(pattern)
++            new_content = content.replace(pattern, repl)
++        else:
++            parts = content.split(pattern)
++            if len(parts) == 1:
++                n = 0
++                new_content = content
++            else:
++                n = min(count, len(parts) - 1)
++                new_content = (repl.join(parts[:n+1]) + pattern.join(parts[n+1:]))
++    if n == 0 and not args.allow_no_match:
++        sys.stderr.write("No matches found for replacement\n")
++        return 1
++    if new_content != content:
++        save_file(args.file, new_content)
++    print(f"Replacements made: {n}")
++    return 0
++
++def find_nth_match(pattern, text, nth, regex=False):
++    if nth < 1:
++        raise ValueError("occurrence must be >= 1")
++    if regex:
++        it = list(re.finditer(pattern, text, flags=re.MULTILINE))
++        if len(it) < nth:
++            return None
++        m = it[nth-1]
++        return (m.start(), m.end())
++    else:
++        start = 0
++        for _ in range(nth):
++            idx = text.find(pattern, start)
++            if idx == -1:
++                return None
++            start = idx + len(pattern)
++        return (start - len(pattern), start)
++
++def cmd_insert(args, before=False):
++    content = load_file(args.file)
++    anchor = args.anchor
++    new_text = read_from_arg_or_stdin(args.text)
++    occ = args.occurrence
++    rng = find_nth_match(anchor, content, occ, regex=args.regex)
++    if rng is None:
++        sys.stderr.write(f"Anchor not found (occurrence {occ})\n")
++        return 1 if not args.allow_no_match else 0
++    insert_pos = rng[0] if before else rng[1]
++    new_content = content[:insert_pos] + new_text + content[insert_pos:]
++    if new_content != content:
++        save_file(args.file, new_content)
++    print(f"Inserted {len(new_text)} bytes at position {insert_pos}")
++    return 0
++
++def cmd_insert_after(args):
++    return cmd_insert(args, before=False)
++
++def cmd_insert_before(args):
++    return cmd_insert(args, before=True)
++
++def cmd_append(args):
++    text = read_from_arg_or_stdin(args.text)
++    with open(args.file, "a", encoding="utf-8") as f:
++        f.write(text)
++    print(f"Appended {len(text)} bytes")
++    return 0
++
++def cmd_write(args):
++    text = read_from_arg_or_stdin(args.text)
++    save_file(args.file, text)
++    print(f"Wrote {len(text)} bytes")
++    return 0
++
++def main():
++    p = argparse.ArgumentParser(description="Lightweight file editing tool for CI-friendly, precise edits.")
++    sub = p.add_subparsers(dest="cmd", required=True)
++
++    sp = sub.add_parser("show", help="Show file with line numbers")
++    sp.add_argument("file")
++    sp.set_defaults(func=cmd_show)
++
++    sp = sub.add_parser("replace", help="Replace text (substring or regex)")
++    sp.add_argument("file")
++    sp.add_argument("pattern", help="Substring or regex to replace")
++    sp.add_argument("repl", help="Replacement text or '-' to read from stdin")
++    sp.add_argument("--regex", action="store_true", help="Treat pattern as regex")
++    sp.add_argument("--count", type=int, default=None, help="Max number of replacements (default: all)")
++    sp.add_argument("--allow-no-match", action="store_true", help="Do not error if no matches found")
++    sp.set_defaults(func=cmd_replace)
++
++    sp = sub.add_parser("insert-after", help="Insert text after the Nth occurrence of anchor")
++    sp.add_argument("file")
++    sp.add_argument("anchor", help="Substring or regex anchor")
++    sp.add_argument("text", help="Text to insert or '-' to read from stdin")
++    sp.add_argument("--occurrence", type=int, default=1, help="Nth match to target (1-based)")
++    sp.add_argument("--regex", action="store_true", help="Treat anchor as regex")
++    sp.add_argument("--allow-no-match", action="store_true", help="Do not error if no anchor found")
++    sp.set_defaults(func=cmd_insert_after)
++
++    sp = sub.add_parser("insert-before", help="Insert text before the Nth occurrence of anchor")
++    sp.add_argument("file")
++    sp.add_argument("anchor", help="Substring or regex anchor")
++    sp.add_argument("text", help="Text to insert or '-' to read from stdin")
++    sp.add_argument("--occurrence", type=int, default=1, help="Nth match to target (1-based)")
++    sp.add_argument("--regex", action="store_true", help="Treat anchor as regex")
++    sp.add_argument("--allow-no-match", action="store_true", help="Do not error if no anchor found")
++    sp.set_defaults(func=cmd_insert_before)
++
++    sp = sub.add_parser("append", help="Append text to file")
++    sp.add_argument("file")
++    sp.add_argument("text", help="Text to append or '-' to read from stdin")
++    sp.set_defaults(func=cmd_append)
++
++    sp = sub.add_parser("write", help="Overwrite file with text")
++    sp.add_argument("file")
++    sp.add_argument("text", help="Text to write or '-' to read from stdin")
++    sp.set_defaults(func=cmd_write)
++
++    args = p.parse_args()
++    try:
++        rc = args.func(args)
++    except Exception as e:
++        sys.stderr.write(f"ERROR: {e}\n")
++        rc = 2
++    sys.exit(rc)
++
++if __name__ == "__main__":
++    main()

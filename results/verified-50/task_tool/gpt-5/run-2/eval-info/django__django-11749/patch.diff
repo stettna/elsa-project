@@ -1,0 +1,92 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/core/management/__init__.py b/django/core/management/__init__.py
+index 5f2e64761e..bbb5aff1c8 100644
+--- a/django/core/management/__init__.py
++++ b/django/core/management/__init__.py
+@@ -130,11 +130,32 @@ def call_command(command_name, *args, **options):
+                 yield opt
+ 
+     parser_actions = list(get_actions(parser))
+-    # Any required arguments which are passed in via **options must be passed
+-    # to parse_args().
++    # Collect dests that are part of any required mutually exclusive group
++    def get_required_group_dests(p):
++        dests = set()
++        for grp in getattr(p, "_mutually_exclusive_groups", []):
++            if getattr(grp, "required", False):
++                for act in getattr(grp, "_group_actions", []):
++                    if getattr(act, "dest", None):
++                        dests.add(act.dest)
++        # Recurse into subparsers to include their required groups as well.
++        for act in getattr(p, "_actions", ()): 
++            if isinstance(act, _SubParsersAction):
++                for sub in act.choices.values():
++                    dests.update(get_required_group_dests(sub))
++        return dests
++
++    parser_actions = list(get_actions(parser))
++    required_group_dests = get_required_group_dests(parser)
++    # Any required arguments or arguments that are part of a required
++    # mutually exclusive group which are passed in via **options must
++    # be passed to parse_args(). This prevents argparse from raising
++    # "one of the arguments ... is required" when values are supplied via kwargs.
+     parse_args += [
+-        '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+-        for opt in parser_actions if opt.required and opt.dest in options
++        (min(opt.option_strings) if getattr(opt, "nargs", None) == 0 else
++         "{}={}".format(min(opt.option_strings), arg_options[opt.dest]))
++        for opt in parser_actions
++        if opt.option_strings and opt.dest in options and (opt.required or opt.dest in required_group_dests)
+     ]
+     defaults = parser.parse_args(args=parse_args)
+     defaults = dict(defaults._get_kwargs(), **arg_options)
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..20f65c475a
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,38 @@
++call_command fails when argument of required mutually exclusive group is passed in kwargs.
++Description
++	
++This error 
++django.core.management.base.CommandError: Error: one of the arguments --shop-id --shop is required
++is raised when I run 
++call_command('my_command', shop_id=1)
++the argument 'shop_id' is part of a required mutually exclusive group:
++shop = parser.add_mutually_exclusive_group(required=True)
++shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++However, everything is fine when I call this command in this way:
++call_command('my_command, '--shop-id=1')
++In django sources I found that only those keyword arguments of call_command are passed to the parser that are defined as required:
++# Any required arguments which are passed in via '**options' must be passed
++# to parse_args().
++parse_args += [
++	'{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
++	for opt in parser._actions if opt.required and opt.dest in options
++]
++but in this special case both of them individually are not required, they are actually part of a group that is required. And the code of call_command does nothing with groups defined in the parser.
++
++
++Additional insight: In call_command(), only options with opt.required=True were
++forwarded to argparse, ignoring required mutually exclusive groups stored on
++ArgumentParser._mutually_exclusive_groups. This caused argparse to raise
++errors even when a valid kwarg for a member of such a group was provided.
++The fix detects required groups (recursing into subparsers) and forwards the
++provided option, handling flags (nargs==0) vs options with values.
++
++Validation note: pytest wasn't available in the environment, so the fix was
++validated using a custom inline BaseCommand harness that defines a required
++mutually exclusive group. call_command(cmd, shop_id=1) now succeeds without
++raising CommandError. Also verified a flag-in-group (store_true) case.
++
++Additional insight: BaseCommand.execute expects handle() to return a string (or None),
++as it writes the return value to stdout. Returning a non-string (e.g., dict) causes
++an AttributeError when .endswith is called. Harness updated accordingly.

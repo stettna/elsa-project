@@ -1,0 +1,185 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..73b158cefe
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,10 @@
++Upgrading 2.2>3.0 causes named tuples used as arguments to __range to error.
++Description
++	
++I noticed this while upgrading a project from 2.2 to 3.0.
++This project passes named 2-tuples as arguments to range queryset filters. This works fine on 2.2. On 3.0 it causes the following error: TypeError: __new__() missing 1 required positional argument: 'far'.
++This happens because django.db.models.sql.query.Query.resolve_lookup_value goes into the tuple elements to resolve lookups and then attempts to reconstitute the tuple with the resolved elements.
++When it attempts to construct the new tuple it preserves the type (the named tuple) but it passes a iterator to it's constructor.
++NamedTuples don't have the code path for copying an iterator, and so it errors on insufficient arguments.
++The fix is to * expand the contents of the iterator into the constructor.
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..831ba19ed4 100755
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1077,10 +1077,23 @@ class Query(BaseExpression):
+         elif isinstance(value, (list, tuple)):
+             # The items of the iterable may be expressions and therefore need
+             # to be resolved independently.
+-            return type(value)(
++            resolved = [
+                 self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                 for sub_value in value
+-            )
++            ]
++            if isinstance(value, tuple):
++                # For tuple subclasses (e.g., namedtuple), star-unpack to match
++                # their __new__ signatures. Plain tuple() accepts a single iterable.
++                if type(value) is tuple:
++                    return tuple(resolved)
++                try:
++                    return type(value)(*resolved)
++                except TypeError:
++                    # Fallback: some rare tuple subclasses may accept a single iterable.
++                    return type(value)(resolved)
++            else:
++                # Lists and list-like types accept a single iterable.
++                return type(value)(resolved)
+         return value
+ 
+     def solve_lookup_type(self, lookup):
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..ecfefd9f6a
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,12 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++
++[Appended] NamedTuple range filter fix workflow
++- Use tools/edit.py for safe, repeatable source edits.
++- Find and adjust resolve_lookup_value (django/db/models/sql/query.py) or equivalent to star-unpack iterables when reconstructing tuple subclasses (namedtuple) during lookup resolution (e.g., __range).
++- Build a minimal reproducer using a namedtuple passed to range() lookup; run before/after the fix.
++- Keep behavior identical for plain tuples/lists; only change reconstruction to use type_( *iterable ) where appropriate.
++- Run focused tests for lookups/range filters after implementing fix.
+diff --git a/tools/edit.py b/tools/edit.py
+new file mode 100755
+index 0000000000..b7f490e72e
+--- /dev/null
++++ b/tools/edit.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from pathlib import Path
++
++def read_stdin_or_literal(text_arg: str) -> str:
++    if text_arg == '-':
++        return sys.stdin.read()
++    return text_arg
++
++def replace_in_file(path, pattern, repl, multiline=False, dotall=False, count=0):
++    p = Path(path)
++    if not p.exists():
++        print(f"[edit.py] ERROR: File not found: {path}", file=sys.stderr)
++        sys.exit(2)
++    flags = 0
++    if multiline:
++        flags |= re.MULTILINE
++    if dotall:
++        flags |= re.DOTALL
++    content = p.read_text(encoding='utf-8')
++    try:
++        new_content, n = re.subn(pattern, repl, content, count=0 if count is None else count, flags=flags)
++    except re.error as e:
++        print(f"[edit.py] ERROR: Invalid regex: {e}", file=sys.stderr)
++        sys.exit(3)
++    if n == 0:
++        print(f"[edit.py] WARNING: No matches for pattern in {path}", file=sys.stderr)
++    p.write_text(new_content, encoding='utf-8')
++    print(f"[edit.py] Replaced {n} occurrence(s) in {path}")
++
++def insert_after_regex(path, pattern, text, multiline=False, dotall=False, first_only=True):
++    p = Path(path)
++    if not p.exists():
++        print(f"[edit.py] ERROR: File not found: {path}", file=sys.stderr)
++        sys.exit(2)
++    flags = 0
++    if multiline:
++        flags |= re.MULTILINE
++    if dotall:
++        flags |= re.DOTALL
++    content = p.read_text(encoding='utf-8')
++    try:
++        regex = re.compile(pattern, flags)
++    except re.error as e:
++        print(f"[edit.py] ERROR: Invalid regex: {e}", file=sys.stderr)
++        sys.exit(3)
++    pos = 0
++    pieces = []
++    matches = list(regex.finditer(content))
++    if not matches:
++        print(f"[edit.py] WARNING: No matches for pattern in {path}", file=sys.stderr)
++        sys.exit(4)
++    used = 0
++    for m in matches:
++        pieces.append(content[pos:m.end()])
++        pieces.append(text)
++        pos = m.end()
++        used += 1
++        if first_only:
++            break
++    pieces.append(content[pos:])
++    p.write_text(''.join(pieces), encoding='utf-8')
++    print(f"[edit.py] Inserted text after {used} match(es) in {path}")
++
++def append_text(path, text):
++    p = Path(path)
++    if not p.exists():
++        print(f"[edit.py] ERROR: File not found: {path}", file=sys.stderr)
++        sys.exit(2)
++    with p.open('a', encoding='utf-8') as f:
++        f.write(text)
++    print(f"[edit.py] Appended text to {path}")
++
++def main():
++    ap = argparse.ArgumentParser(description="Small file edit utility")
++    sub = ap.add_subparsers(dest='cmd')  # No 'required' for Python 3.6 compatibility
++
++    rp = sub.add_parser('replace', help='Regex replace in file')
++    rp.add_argument('path')
++    rp.add_argument('pattern')
++    rp.add_argument('repl')
++    rp.add_argument('--multiline', action='store_true')
++    rp.add_argument('--dotall', action='store_true')
++    rp.add_argument('--count', type=int, default=None, help='Limit replacements (default: no limit)')
++
++    ia = sub.add_parser('insert_after', help='Insert text after first match of regex')
++    ia.add_argument('path')
++    ia.add_argument('pattern')
++    ia.add_argument('text')
++    ia.add_argument('--multiline', action='store_true')
++    ia.add_argument('--dotall', action='store_true')
++    ia.add_argument('--all', action='store_true', help='Insert after all matches')
++
++    apd = sub.add_parser('append', help='Append text to file')
++    apd.add_argument('path')
++    apd.add_argument('text')
++
++    args = ap.parse_args()
++    if not getattr(args, 'cmd', None):
++        ap.print_help()
++        sys.exit(1)
++
++    if args.cmd == 'replace':
++        replace_in_file(args.path, args.pattern, read_stdin_or_literal(args.repl),
++                        multiline=args.multiline, dotall=args.dotall, count=args.count)
++    elif args.cmd == 'insert_after':
++        insert_after_regex(args.path, args.pattern, read_stdin_or_literal(args.text),
++                           multiline=args.multiline, dotall=args.dotall, first_only=not args.all)
++    elif args.cmd == 'append':
++        append_text(args.path, read_stdin_or_literal(args.text))
++
++if __name__ == '__main__':
++    main()

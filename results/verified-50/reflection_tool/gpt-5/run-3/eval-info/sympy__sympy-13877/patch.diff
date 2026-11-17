@@ -1,0 +1,217 @@
+diff --git a/devtools/edit_file.py b/devtools/edit_file.py
+new file mode 100644
+index 000000000..2a8fccd12
+--- /dev/null
++++ b/devtools/edit_file.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++import argparse, re, sys, os, tempfile, shutil
++
++def load(path):
++    try:
++        with open(path, 'r', encoding='utf-8') as f:
++            return f.read()
++    except FileNotFoundError:
++        return ''
++
++def save(path, content):
++    dname = os.path.dirname(path)
++    if dname and not os.path.exists(dname):
++        os.makedirs(dname, exist_ok=True)
++    fd, tmp = tempfile.mkstemp(prefix='.edit.', dir=dname or None, text=True)
++    with os.fdopen(fd, 'w', encoding='utf-8') as f:
++        f.write(content)
++    try:
++        if os.path.exists(path):
++            shutil.copystat(path, tmp, follow_symlinks=False)
++    except Exception:
++        pass
++    os.replace(tmp, path)
++
++def replace_regex(s, pattern, repl, count=None, flags=0):
++    rx = re.compile(pattern, flags)
++    return rx.sub(repl, s, count=count if count is not None else 0)
++
++def insert_before(s, pattern, text, regex=False, flags=0):
++    lines = s.splitlines(keepends=True)
++    prog = re.compile(pattern, flags) if regex else None
++    out, n = [], 0
++    for ln in lines:
++        if (prog.search(ln) if regex else (pattern in ln)):
++            out.append(text if text.endswith('\n') else text + '\n')
++            n += 1
++        out.append(ln)
++    return ''.join(out), n
++
++def insert_after(s, pattern, text, regex=False, flags=0):
++    lines = s.splitlines(keepends=True)
++    prog = re.compile(pattern, flags) if regex else None
++    out, n = [], 0
++    for ln in lines:
++        out.append(ln)
++        if (prog.search(ln) if regex else (pattern in ln)):
++            out.append(text if text.endswith('\n') else text + '\n')
++            n += 1
++    return ''.join(out), n
++
++def main():
++    ap = argparse.ArgumentParser(description="Safe editor for CI automation")
++    ap.add_argument('path')
++    ap.add_argument('--replace-literal', nargs=2, action='append', metavar=('OLD','NEW'))
++    ap.add_argument('--replace-regex', nargs=2, action='append', metavar=('PAT','REPL'))
++    ap.add_argument('--insert-before', nargs=2, action='append', metavar=('PATTERN','TEXT'))
++    ap.add_argument('--insert-after', nargs=2, action='append', metavar=('PATTERN','TEXT'))
++    ap.add_argument('--append', help='Append text at end')
++    ap.add_argument('--prepend', help='Prepend text at start')
++    ap.add_argument('--count', type=int, default=None)
++    ap.add_argument('--regex', action='store_true', help='Use regex for insert-before/after')
++    ap.add_argument('--flags', default='', help='Regex flags: IGNORECASE|MULTILINE|DOTALL')
++    ap.add_argument('--assert-contains', action='append')
++    ap.add_argument('--dry-run', action='store_true')
++    args = ap.parse_args()
++
++    flags = 0
++    for name in (args.flags.split('|') if args.flags else []):
++        name = name.strip()
++        if not name: continue
++        if not hasattr(re, name):
++            print(f"Unknown regex flag: {name}", file=sys.stderr)
++            sys.exit(2)
++        flags |= getattr(re, name)
++
++    content = load(args.path)
++    orig = content
++
++    if args.prepend:
++        t = args.prepend if args.prepend.endswith('\n') else args.prepend + '\n'
++        content = t + content
++
++    if args.replace_literal:
++        for old, new in args.replace_literal:
++            content = content.replace(old, new, args.count if args.count is not None else -1)
++
++    if args.replace_regex:
++        for pat, repl in args.replace_regex:
++            content = replace_regex(content, pat, repl, args.count, flags)
++
++    if args.insert-before:
++        for pat, txt in args.insert_before:
++            content, _ = insert_before(content, pat, txt, args.regex, flags)
++
++    if args.insert-after:
++        for pat, txt in args.insert_after:
++            content, _ = insert_after(content, pat, txt, args.regex, flags)
++
++    if args.append:
++        content = content + (args.append if args.append.endswith('\n') else args.append + '\n')
++
++    if args.assert_contains:
++        for pat in args.assert_contains:
++            if pat not in content:
++                print(f"assert-contains failed: {pat}", file=sys.stderr)
++                sys.exit(3)
++
++    if args.dry-run:
++        sys.stdout.write(content)
++        return
++
++    if content != orig:
++        save(args.path, content)
++        print(f"Saved {args.path}")
++    else:
++        print(f"No changes for {args.path}")
++
++if __name__ == "__main__":
++    main()
+diff --git a/devtools/search_code.py b/devtools/search_code.py
+new file mode 100644
+index 000000000..033a5b0ad
+--- /dev/null
++++ b/devtools/search_code.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++import argparse, os, re, sys
++
++def iter_files(root, exts):
++    for base, _, files in os.walk(root):
++        for f in files:
++            if any(f.endswith(e) for e in exts):
++                yield os.path.join(base, f)
++
++def main():
++    ap = argparse.ArgumentParser(description="Recursive code search with context")
++    ap.add_argument('pattern', help='Search pattern')
++    ap.add_argument('--path', default='.', help='Root path (default: .)')
++    ap.add_argument('--regex', action='store_true', help='Treat pattern as regex')
++    ap.add_argument('--context', type=int, default=2, help='Context lines around match')
++    ap.add_argument('--ext', action='append', help='File extensions to include (default: .py)', default=['.py'])
++    args = ap.parse_args()
++
++    prog = re.compile(args.pattern) if args.regex else None
++    hits = 0
++    for fpath in iter_files(args.path, args.ext):
++        try:
++            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
++                lines = f.readlines()
++        except Exception:
++            continue
++        for i, ln in enumerate(lines, 1):
++            ok = prog.search(ln) if prog else (args.pattern in ln)
++            if ok:
++                hits += 1
++                start = max(1, i - args.context)
++                end = min(len(lines), i + args.context)
++                print(f"==> {fpath}:{i}")
++                for j in range(start, end + 1):
++                    prefix = ">" if j == i else " "
++                    sys.stdout.write(f"{prefix} {j:6d}: {lines[j-1]}")
++                print()
++    print(f"[search_code] Total matches: {hits}")
++    if hits == 0:
++        sys.exit(1)
++
++if __name__ == '__main__':
++    main()
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 000000000..d97fe5804
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,18 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++- Augmented workflow for this task:
++  - Immediately create a small reproduction script to compute det(Matrix([[i + a*j for i in range(n)] for j in range(n)])) for n=1..6 and capture failures (nan or TypeError: Invalid NaN comparison).
++  - Map the failure path by grepping SymPy sources for determinant-related functions: det, _eval_determinant, _eval_det_bareiss, bareiss, factor_terms, and locations where comparisons (<, <=, >, >=) might be applied to Expr.
++  - If Bareiss or any fraction-free elimination path requires numeric ordering or sign checks on symbolic expressions, guard those with safe checks or remove ordering, and/or introduce a fallback symbolic-safe method (e.g., fraction-free Gaussian elimination without numeric comparisons, or LU with symbolic pivots and minimal assumptions).
++  - Ensure no code depends on comparing coefficients that might be NaN; avoid calls that attempt to order potentially NaN-bearing expressions.
++  - Validate fix by rerunning the reproduction for multiple n and for random symbolic linear forms; confirm no NaN comparison exceptions and sane results (e.g., zeros when rank-deficient).
++  - Keep changes minimal and localized to matrix determinant routines to reduce performance impact on numeric domains.
++- Tooling plan (to create next):
++  - Build a simple recursive code search tool (search_code.py) to find occurrences with context.
++  - Build a safe file editor tool (edit_file.py) to apply precise edits and assertions.
++- Safety reminders:
++  - Do not modify tests or configs.
++  - Prefer feature-gated fallbacks based on domain properties or expression type to avoid regressions on integer/rational matrices.
++  - After the fix, scan adjacent matrix routines for similar risky comparisons and add guards where appropriate.
+diff --git a/sympy/matrices/matrices.py b/sympy/matrices/matrices.py
+index 97cde62e2..bf2407fab 100644
+--- a/sympy/matrices/matrices.py
++++ b/sympy/matrices/matrices.py
+@@ -207,13 +207,11 @@ def bareiss(mat, cumm=1):
+ 
+             def entry(i, j):
+                 ret = (pivot_val*tmp_mat[i, j + 1] - mat[pivot_pos, j + 1]*tmp_mat[i, 0]) / cumm
+-                if not ret.is_Atom:
+-                    cancel(ret)
+                 return ret
+ 
+             return sign*bareiss(self._new(mat.rows - 1, mat.cols - 1, entry), pivot_val)
+ 
+-        return cancel(bareiss(self))
++        return bareiss(self)
+ 
+     def _eval_det_berkowitz(self):
+         """ Use the Berkowitz algorithm to compute the determinant."""

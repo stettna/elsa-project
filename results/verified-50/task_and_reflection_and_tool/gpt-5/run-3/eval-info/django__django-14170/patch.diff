@@ -1,0 +1,68 @@
+diff --git a/django/db/models/functions/datetime.py b/django/db/models/functions/datetime.py
+index 90e6f41be0..bbe9fa8c79 100644
+--- a/django/db/models/functions/datetime.py
++++ b/django/db/models/functions/datetime.py
+@@ -164,12 +164,6 @@ ExtractYear.register_lookup(YearGte)
+ ExtractYear.register_lookup(YearLt)
+ ExtractYear.register_lookup(YearLte)
+ 
+-ExtractIsoYear.register_lookup(YearExact)
+-ExtractIsoYear.register_lookup(YearGt)
+-ExtractIsoYear.register_lookup(YearGte)
+-ExtractIsoYear.register_lookup(YearLt)
+-ExtractIsoYear.register_lookup(YearLte)
+-
+ 
+ class Now(Func):
+     template = 'CURRENT_TIMESTAMP'
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..3ab6aa8593
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,5 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..4e6e32ef2c
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,34 @@
++Query optimization in YearLookup breaks filtering by __iso_year
++Description
++	 
++		(last modified by Florian Demmer)
++	 
++The optimization to use BETWEEN instead of the EXTRACT operation in ​YearLookup is also registered for the ​__iso_year lookup, which breaks the functionality provided by ​ExtractIsoYear when used via the lookup.
++This has unfortunately been broken ever since ExtractIsoYear was introduced in ​Django 2.2 via #28649 and wasn't easy to track down since ExtractIsoYear when used by itself eg. in an annotation works perfectly fine. Just when using the lookup in a filter, the optimization is used (even when explicitly using an annotation):
++# annotation works
++>>> qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++>>> print(qs.query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel
++# explicit annotation used in filter does not use extracted and adds BETWEEN
++>>> print(qs.filter(extracted=2020).query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++# implicit lookup uses BETWEEN
++>>> print(DTModel.objects.filter(start_date__iso_year=2020).only('id').query)
++SELECT db_functions_dtmodel.id FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++This results in the wrong data being returned by filters using iso_year.
++This PR fixes the behaviour, reverts the invalid changes to the tests and extends one test to catch this problem: ​https://github.com/django/django/pull/14157
++
++Additional insight (from code inspection):
++- In django/db/models/functions/datetime.py, ExtractIsoYear registers YearExact/YearGt/YearGte/YearLt/YearLte (lines ~167-171).
++- These Year* lookups inherit from YearLookup, which optimizes comparisons by avoiding EXTRACT and using BETWEEN on the underlying date/datetime field when the RHS is a direct value.
++- When applied to __iso_year lookups or annotated ExtractIsoYear filters, this optimization incorrectly bypasses the EXTRACT('isoyear', ...) operation and instead compares the base date field with BETWEEN, returning wrong results.
++Planned fix:
++- Do not register YearExact/YearGt/YearGte/YearLt/YearLte on ExtractIsoYear. Leave these registrations only on ExtractYear.
++- With this change, __iso_year filters and annotations will use standard integer lookups that preserve the EXTRACT('isoyear', ...) SQL generation.
++Update (based on repository inspection):
++- In django/db/models/functions/datetime.py, ExtractIsoYear (lookup_name='iso_year') currently registers YearExact, YearGt, YearGte, YearLt, and YearLte (lines ~167–171).
++- These Year* classes inherit from YearLookup in django/db/models/lookups.py, whose as_sql() optimizes direct RHS comparisons by bypassing EXTRACT and using BETWEEN on the base date/datetime field.
++- This optimization is correct for ExtractYear but incorrect for ExtractIsoYear, because it skips EXTRACT('isoyear', ...) and instead compares the raw date column with BETWEEN, leading to wrong results for __iso_year filters and annotated filters (matches the PR description).
++Planned fix:
++- Remove the registrations of YearExact/YearGt/YearGte/YearLt/YearLte on ExtractIsoYear so that iso_year comparisons use standard numeric lookups against the Extract expression (thus preserving EXTRACT('isoyear', ...) in SQL).
++- Keep Year* lookups registered on ExtractYear; only adjust ExtractIsoYear registrations.

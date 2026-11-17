@@ -1,0 +1,249 @@
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 000000000..cd4c3de56
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++Workflow additions:
++- After reproducing a bug, immediately record concrete outputs and stack traces in task_description.txt.
++- Consider algorithm fallback: if Bareiss risks NaN-related simplifications for symbolic matrices, fall back to Berkowitz; otherwise, guard factor_terms against NaN/unknown sign comparisons.
++- When changing simplification logic (factor_terms/cancel), ensure performance for integer/rational inputs is not degraded; limit changes to sign handling.
++- Use tools/edit_file.py to make safe, scriptable edits (string replace, regex, insert) to source files.
+diff --git a/sympy/core/exprtools.py b/sympy/core/exprtools.py
+index 4e0de9ec1..b0ed036e2 100644
+--- a/sympy/core/exprtools.py
++++ b/sympy/core/exprtools.py
+@@ -1176,7 +1176,7 @@ def do(expr):
+         if p.is_Add:
+             list_args = [do(a) for a in Add.make_args(p)]
+             # get a common negative (if there) which gcd_terms does not remove
+-            if all(a.as_coeff_Mul()[0] < 0 for a in list_args):
++            if all((a.as_coeff_Mul()[0]).is_negative for a in list_args):
+                 cont = -cont
+                 list_args = [-a for a in list_args]
+             # watch out for exp(-(x+2)) which gcd_terms will change to exp(-x-2)
+diff --git a/sympy/matrices/matrices.py b/sympy/matrices/matrices.py
+index 97cde62e2..62a40c491 100644
+--- a/sympy/matrices/matrices.py
++++ b/sympy/matrices/matrices.py
+@@ -381,52 +381,115 @@ def cofactor_matrix(self, method="berkowitz"):
+                          lambda i, j: self.cofactor(i, j, method))
+ 
+     def det(self, method="bareiss"):
++
+         """Computes the determinant of a matrix.  If the matrix
++
+         is at most 3x3, a hard-coded formula is used.
++
+         Otherwise, the determinant using the method `method`.
+ 
++    
++
++    
+ 
+         Possible values for "method":
++
+           bareis
++
+           berkowitz
++
+           lu
++
+         """
+ 
++    
++
+         # sanitize `method`
++
+         method = method.lower()
++
+         if method == "bareis":
++
+             method = "bareiss"
++
+         if method == "det_lu":
++
+             method = "lu"
++
+         if method not in ("bareiss", "berkowitz", "lu"):
++
+             raise ValueError("Determinant method '%s' unrecognized" % method)
+ 
++    
++
+         # if methods were made internal and all determinant calculations
++
+         # passed through here, then these lines could be factored out of
++
+         # the method routines
++
+         if self.rows != self.cols:
++
+             raise NonSquareMatrixError()
+ 
++    
++
+         n = self.rows
++
+         if n == 0:
++
+             return S.One
++
+         elif n == 1:
++
+             return self[0,0]
++
+         elif n == 2:
++
+             return self[0, 0] * self[1, 1] - self[0, 1] * self[1, 0]
++
+         elif n == 3:
++
+             return  (self[0, 0] * self[1, 1] * self[2, 2]
++
+                    + self[0, 1] * self[1, 2] * self[2, 0]
++
+                    + self[0, 2] * self[1, 0] * self[2, 1]
++
+                    - self[0, 2] * self[1, 1] * self[2, 0]
++
+                    - self[0, 0] * self[1, 2] * self[2, 1]
++
+                    - self[0, 1] * self[1, 0] * self[2, 2])
+ 
++    
++
+         if method == "bareiss":
+-            return self._eval_det_bareiss()
++
++            try:
++
++                res = self._eval_det_bareiss()
++
++                from sympy.core.singleton import S as _S
++
++                # Fallback to Berkowitz if Bareiss produced NaN (e.g., symbolic 0/0)
++
++                if (res is _S.NaN) or (hasattr(res, "has") and res.has(_S.NaN)):
++
++                    return self._eval_det_berkowitz()
++
++                return res
++
++            except Exception:
++
++                return self._eval_det_berkowitz()
++
+         elif method == "berkowitz":
++
+             return self._eval_det_berkowitz()
++
+         elif method == "lu":
++
+             return self._eval_det_lu()
+ 
+     def minor(self, i, j, method="berkowitz"):
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 000000000..ad324022c
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,11 @@
++Task Description:
++Insight added (reproduction and suspected cause):
++- Reproduced: For f(n) = det(Matrix([[i + a*j for i in range(n)] for j in range(n)])):
++  n=1->0, n=2->-a, n=3->2*a*(a + 2) + 2*a*(2*a + 1) - 3*a*(2*a + 2), n=4->0, n=5->nan, n>=6 raises TypeError("Invalid NaN comparison").
++- The traceback path includes Bareiss determinant evaluation calling cancel()->factor_terms, where factor_terms performs sign checks that compare coefficients; these may involve NaN and trigger "Invalid NaN comparison".
++- Hypotheses:
++  (1) Guard factor_terms sign-normalization to avoid direct < 0 comparisons when coefficients can be NaN; use is_negative or skip normalization when unknown/NaN.
++  (2) Prefer a symbolic-safe determinant algorithm (e.g., Berkowitz) for non-integer/symbolic matrices or when Bareiss would introduce such simplifications.
++- Next steps: Inspect sympy/core/exprtools.py::factor_terms sign logic and sympy/matrices/matrices.py::_eval_det_bareiss to decide minimal, general fix.
++
++Verification after fix: numeric substitution shows det (default) equals Berkowitz and evaluates to 0 for n=5,6 at a in {0,1,2,3}.
+diff --git a/tools/edit_file.py b/tools/edit_file.py
+new file mode 100755
+index 000000000..47f47f8a0
+--- /dev/null
++++ b/tools/edit_file.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++import argparse, re, sys, os, json
++def read_file(p):
++    with open(p, 'r', encoding='utf-8') as f:
++        return f.read()
++def write_file(p, s):
++    with open(p, 'w', encoding='utf-8') as f:
++        f.write(s)
++def do_replace(text, old, new, count):
++    if count is None or count <= 0:
++        return text.replace(old, new), text.count(old)
++    else:
++        return text.replace(old, new, count), min(text.count(old), count)
++def do_regex(text, pattern, repl, count, flags):
++    f = 0
++    if flags:
++        for fl in flags.split(','):
++            fl=fl.strip().upper()
++            if not fl: continue
++            if hasattr(re, fl):
++                f |= getattr(re, fl)
++    if count is None or count <= 0:
++        new_text, n = re.subn(pattern, repl, text, flags=f)
++    else:
++        rx = re.compile(pattern, flags=f)
++        pos = 0; n = 0; out=[]
++        while n < count:
++            m = rx.search(text, pos)
++            if not m: break
++            out.append(text[pos:m.start()])
++            out.append(rx.sub(repl, text[m.start():m.end()], count=1))
++            pos = m.end(); n += 1
++        out.append(text[pos:])
++        new_text = ''.join(out) if n else text
++    return new_text, n
++def do_insert(text, pattern, payload, where, nth, flags):
++    f = 0
++    if flags:
++        for fl in flags.split(','):
++            fl=fl.strip().upper()
++            if not fl: continue
++            if hasattr(re, fl):
++                f |= getattr(re, fl)
++    rx = re.compile(pattern, flags=f)
++    matches = list(rx.finditer(text))
++    if not matches: return text, 0
++    idx = nth-1 if nth>0 else len(matches)+nth
++    if idx < 0 or idx >= len(matches): return text, 0
++    m = matches[idx]; pos = m.start() if where=='before' else m.end()
++    return text[:pos] + payload + text[pos:], 1
++def main():
++    import argparse
++    ap = argparse.ArgumentParser(description="Simple file edit tool")
++    ap.add_argument('path'); sub = ap.add_subparsers(dest='cmd', required=True)
++    rp=sub.add_parser('replace'); rp.add_argument('old'); rp.add_argument('new'); rp.add_argument('--count', type=int, default=0)
++    rg=sub.add_parser('regex'); rg.add_argument('pattern'); rg.add_argument('repl'); rg.add_argument('--count', type=int, default=0); rg.add_argument('--flags', default='')
++    ia=sub.add_parser('insert-after'); ia.add_argument('pattern'); ia.add_argument('text'); ia.add_argument('--nth', type=int, default=1); ia.add_argument('--flags', default='')
++    ib=sub.add_parser('insert-before'); ib.add_argument('pattern'); ib.add_argument('text'); ib.add_argument('--nth', type=int, default=1); ib.add_argument('--flags', default='')
++    args = ap.parse_args()
++    if not os.path.exists(args.path):
++        print(json.dumps({"ok": False, "error": "file not found", "path": args.path})); sys.exit(1)
++    text = read_file(args.path)
++    if args.cmd == 'replace':
++        new_text, n = do_replace(text, args.old, args.new, args.count)
++    elif args.cmd == 'regex':
++        new_text, n = do_regex(text, args.pattern, args.repl, args.count, args.flags)
++    elif args.cmd == 'insert-after':
++        new_text, n = do_insert(text, args.pattern, args.text, 'after', args.nth, args.flags)
++    elif args.cmd == 'insert-before':
++        new_text, n = do_insert(text, args.pattern, args.text, 'before', args.nth, args.flags)
++    else:
++        print(json.dumps({"ok": False, "error": "unknown cmd"})); sys.exit(2)
++    if new_text != text: write_file(args.path, new_text)
++    print(json.dumps({"ok": True, "edited": n, "path": args.path}))
++if __name__ == "__main__": main()

@@ -31,7 +31,7 @@ CONFIG_NUM_OF_EVOL_TASKS = {
     "task_and_reflection_and_tool": 3, #tool + task + reflection
     "task_tool": 2,                    #tool + task
     "reflection_tool": 2,              #tool + reflection
-    "task_reflection": 2,              #reflection + task
+    "reflection_task": 2,              #reflection + task
     "task_only": 1,                    #task
     "reflection_only": 1,              #reflection
     "tool_only": 1,                    #tool
@@ -132,7 +132,7 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
     if tools_json_path is None:
         return {
             "n_tools_created": 0,
-            "n_unique_tools_created": 0,
+            #"n_unique_tools_created": 0,
             "n_custom_tool_uses": 0,
         }
 
@@ -178,7 +178,7 @@ def extract_tool_stats(traj_path: Path) -> Dict[str, int]:
 
         return {
             "n_tools_created": n_tools_created,
-            "n_unique_tools_created" : n_unique_tools_created,
+            #"n_unique_tools_created" : n_unique_tools_created,
             "n_custom_tool_uses": n_custom_tool_uses,
         }
 
@@ -198,7 +198,7 @@ def extract_stats(file_path: Path):
     """
     Extract:
       - name: everything before '.traj.json'
-      - instance_cost
+      - total_tokens
       - api_calls
       - optional prompt-evolution edit counts
       - optional tool-summary counts from a sibling tools JSON file
@@ -213,10 +213,14 @@ def extract_stats(file_path: Path):
         model_stats = data["info"]["model_stats"]
         prompt_evo_info = data["info"].get("prompt_evo_info", None)
 
+        total_tokens = 0
+        for m in data["messages"]:
+            total_tokens += m.get("extra", {}).get("response", {}).get("usage", {}).get("total_tokens", 0)
+
         res = {
             "instance": file_path.name[:-len(".traj.json")],
-            "instance_cost": round(float(model_stats["instance_cost"]), 2),
             "api_calls": model_stats["api_calls"],
+            "total_tokens": total_tokens,
         }
 
         if prompt_evo_info is not None:
@@ -242,19 +246,17 @@ def write_to_ag_csv(rows):
                 "configuration",
                 "n_evo_tasks",
                 "model", 
-                "total_cost",
                 "total_api_calls",
+                "total_total_tokens",
                 "total_task_description_edits",
                 "total_reflection_prompt_edits",
                 "total_tools_created",
-                "total_unique_tools_created",
                 "total_custom_tool_uses", 
-                "avg_cost", 
-                "avg_api_calls", 
+                "avg_api_calls",
+                "avg_total_tokens", 
                 "avg_task_edits",
                 "avg_reflection_edits", 
                 "avg_tools_created",
-                "avg_unique_tools_created", 
                 "avg_tools_used",
                 "resolve_rate"
             ],
@@ -273,12 +275,11 @@ def write_to_in_csv(rows):
                 "configuration",
                 "n_evo_tasks",
                 "model", 
-                "instance_cost",
                 "api_calls",
+                "total_tokens",
                 "n_task_description_edits",
                 "n_reflection_prompt_edits",
                 "n_tools_created",
-                "n_unique_tools_created",
                 "n_custom_tool_uses", 
                 "resolved"
             ],
@@ -293,85 +294,118 @@ def process_config_directory(config_dir: Path):
     config = str(config_dir).split("/")[-1]
     n_evo_tasks = CONFIG_NUM_OF_EVOL_TASKS[config]
 
-    for model_dir   in config_dir.iterdir():
+    for model_dir in config_dir.iterdir():
 
         #Ensure path is dir
         if not model_dir.is_dir():
             print(f"Warning: '{model_dir}' is not a directory; skipping.")
             continue
 
-        resolved_ids = get_resolved_ids(str(model_dir) + "/eval-results.json")
         model = str(model_dir).split("/")[-1]
 
-        total_cost = 0.0
+        #Initialize cumulative statistics for the model/configuration
+        avg_total_tokens = 0.0
+        avg_api_calls = 0.0
+        avg_task_description_edits = 0.0
+        avg_reflection_prompt_edits = 0.0
+        avg_tools_created = 0.0
+        avg_unique_tools_created = 0.0
+        avg_custom_tool_uses = 0.0
+        resolve_rate = 0.0
+
+        #Total counters for the model/configuration
+        total_total_tokens = 0.0
         total_api_calls = 0
         total_task_description_edits = 0
         total_reflection_prompt_edits = 0
         total_tools_created = 0
         total_unique_tools_created = 0
         total_custom_tool_uses = 0
-        total_resolved = 0
-        count = 0
+
+        NUMBER_OF_RUNS = len(list(model_dir.iterdir()))  # Count the number of runs for this model/configuration
 
         #Process each model dir in config dir
         model = model_dir.name
 
-        for file_path in find_traj_files(model_dir):
-            stats = extract_stats(file_path)
+        for run_dir in model_dir.iterdir():
 
-            if stats is None:
-                continue
+            resolved_ids = get_resolved_ids(str(run_dir) + "/eval-results.json")
 
-            resolved = int(stats["instance"] in resolved_ids)
-            stats.update({
-                            "resolved": resolved,
-                            "model" : model,
-                            "configuration": config,
-                            "n_evo_tasks" : n_evo_tasks
-                        })
+            run_total_tokens = 0.0
+            run_api_calls = 0
+            run_task_description_edits = 0
+            run_reflection_prompt_edits = 0
+            run_tools_created = 0
+            run_unique_tools_created = 0
+            run_custom_tool_uses = 0
+            run_resolved = 0
 
-            write_to_in_csv([stats])
-            global IN_MODE
-            IN_MODE = 'a'  # Switch to append mode after the first write
+            count =  0
 
-            total_cost += float(stats["instance_cost"])
-            total_api_calls += int(stats["api_calls"])
-            total_task_description_edits += int(stats.get("n_task_description_edits", 0))
-            total_reflection_prompt_edits += int(stats.get("n_reflection_prompt_edits", 0))
-            total_tools_created += int(stats.get("n_tools_created", 0))
-            total_unique_tools_created += int(stats.get("n_unique_tools_created", 0))
-            total_custom_tool_uses += int(stats.get("n_custom_tool_uses", 0))
-            total_resolved += resolved
-            count += 1
+            for file_path in find_traj_files(run_dir):
+                stats = extract_stats(file_path)
 
-        avg_cost = round(total_cost / count, 2) if count else 0.0
-        avg_api_calls = round(total_api_calls / count, 2) if count else 0.0
-        avg_task_description_edits = round(total_task_description_edits / count, 2) if count else 0.0
-        avg_reflection_prompt_edits = round(total_reflection_prompt_edits / count, 2) if count else 0.0
-        avg_tools_created = round(total_tools_created / count, 2) if count else 0.0
-        avg_unique_tools_created = total_unique_tools_created / count if count else 0.0
-        avg_custom_tool_uses = round(total_custom_tool_uses / count, 2) if count else 0.0
-        resolve_rate = round(total_resolved / count, 2) if count else 0.0
+                if stats is None:
+                    continue
+
+                resolved = int(stats["instance"] in resolved_ids)
+                stats.update({
+                                "resolved": resolved,
+                                "model" : model,
+                                "configuration": config,
+                                "n_evo_tasks" : n_evo_tasks
+                            })
+
+                write_to_in_csv([stats])
+                global IN_MODE
+                IN_MODE = 'a'  # Switch to append mode after the first write
+
+                run_total_tokens += float(stats["total_tokens"])
+                run_api_calls += int(stats["api_calls"])
+                run_task_description_edits += int(stats.get("n_task_description_edits", 0))
+                run_reflection_prompt_edits += int(stats.get("n_reflection_prompt_edits", 0))
+                run_tools_created += int(stats.get("n_tools_created", 0))
+                run_unique_tools_created += int(stats.get("n_unique_tools_created", 0))
+                run_custom_tool_uses += int(stats.get("n_custom_tool_uses", 0))
+                run_resolved += resolved
+                count += 1
+
+            avg_total_tokens += round(run_total_tokens / count, 2) if count else 0.0
+            avg_api_calls += round(run_api_calls / count, 2) if count else 0.0
+            avg_task_description_edits += round(run_task_description_edits / count, 2) if count else 0.0
+            avg_reflection_prompt_edits += round(run_reflection_prompt_edits / count, 2) if count else 0.0
+            avg_tools_created += round(run_tools_created / count, 2) if count else 0.0
+            avg_unique_tools_created += round(run_unique_tools_created / count, 2) if count else 0.0
+            avg_custom_tool_uses += round(run_custom_tool_uses / count, 2) if count else 0.0
+            resolve_rate += round(run_resolved / count, 2) if count else 0.0
+
+            total_total_tokens += run_total_tokens
+            total_api_calls += run_api_calls
+            total_task_description_edits += run_task_description_edits
+            total_reflection_prompt_edits += run_reflection_prompt_edits
+            total_tools_created += run_tools_created
+            total_unique_tools_created += run_unique_tools_created     
+            total_custom_tool_uses += run_custom_tool_uses
 
         cummulative_stats = {
             "model" :  model,
             "configuration" : config,
             "n_evo_tasks" : n_evo_tasks,
-            "total_cost" : round(total_cost, 2),
-            "total_api_calls" : total_api_calls,
-            "total_task_description_edits" : total_task_description_edits,
-            "total_reflection_prompt_edits" : total_reflection_prompt_edits,
-            "total_tools_created" : total_tools_created,
-            "total_unique_tools_created" : total_unique_tools_created,
-            "total_custom_tool_uses" : total_custom_tool_uses,
-            "avg_cost" : avg_cost,
-            "avg_api_calls" : avg_api_calls,
-            "avg_task_edits" : avg_task_description_edits,
-            "avg_reflection_edits" : avg_reflection_prompt_edits,
-            "avg_tools_created" : avg_tools_created,
-            "avg_unique_tools_created" : avg_unique_tools_created,
-            "avg_tools_used" : avg_custom_tool_uses,
-            "resolve_rate" : resolve_rate
+            "total_total_tokens" : round(total_total_tokens/NUMBER_OF_RUNS, 2),
+            "total_api_calls" : round(total_api_calls/NUMBER_OF_RUNS, 2),
+            "total_task_description_edits" : round(total_task_description_edits/NUMBER_OF_RUNS, 2),
+            "total_reflection_prompt_edits" : round(total_reflection_prompt_edits/NUMBER_OF_RUNS, 2),
+            "total_tools_created" : round(total_tools_created/NUMBER_OF_RUNS, 2),
+            #"total_unique_tools_created" : round(total_unique_tools_created/NUMBER_OF_RUNS, 2),
+            "total_custom_tool_uses" : round(total_custom_tool_uses/NUMBER_OF_RUNS, 2),
+            "avg_total_tokens" : round(avg_total_tokens/NUMBER_OF_RUNS, 2),
+            "avg_api_calls" : round(avg_api_calls/NUMBER_OF_RUNS, 2),
+            "avg_task_edits" : round(avg_task_description_edits/NUMBER_OF_RUNS, 2),
+            "avg_reflection_edits" : round(avg_reflection_prompt_edits/NUMBER_OF_RUNS, 2),
+            "avg_tools_created" : round(avg_tools_created/NUMBER_OF_RUNS, 2),
+            #"avg_unique_tools_created" : round(avg_unique_tools_created/NUMBER_OF_RUNS, 2),
+            "avg_tools_used" : round(avg_custom_tool_uses/NUMBER_OF_RUNS, 2),
+            "resolve_rate" : round(resolve_rate/NUMBER_OF_RUNS, 2)
         }
 
         write_to_ag_csv([cummulative_stats])

@@ -1,0 +1,217 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..5d5d05519f
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,5 @@
++Engine.render_to_string() should honor the autoescape attribute
++Description
++	
++In Engine.render_to_string, a Context is created without specifying the engine autoescape attribute. So if you create en engine with autoescape=False and then call its render_to_string() method, the result will always be autoescaped. It was probably overlooked in [19a5f6da329d58653bcda85].
++
+diff --git a/django/template/engine.py b/django/template/engine.py
+index dfaa67ba12..ff9ce58d59 100644
+--- a/django/template/engine.py
++++ b/django/template/engine.py
+@@ -160,7 +160,7 @@ class Engine:
+         if isinstance(context, Context):
+             return t.render(context)
+         else:
+-            return t.render(Context(context))
++            return t.render(Context(context, autoescape=self.autoescape))
+ 
+     def select_template(self, template_name_list):
+         """
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..b1a6445772
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,12 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Additions for this task:
++  - Use tools/file_edit.py for precise, idempotent edits to source files.
++  - Investigate django/template/engine.py (Engine.render_to_string) and ensure Context honors Engine.autoescape.
++  - Reproduce the issue with a small script: Engine(autoescape=False).render_to_string(...) should not escape.
++  - Apply minimal, consistent changes (e.g., pass autoescape to Context).
++  - Re-run the reproduction script after the fix and run relevant tests to verify.
++  - Keep changes backward-compatible and limited in scope.
+diff --git a/tools/file_edit.py b/tools/file_edit.py
+new file mode 100755
+index 0000000000..e9fe0b2515
+--- /dev/null
++++ b/tools/file_edit.py
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python3
++import argparse
++import io
++import os
++import re
++import sys
++from typing import Optional
++
++def read_file(path: str) -> str:
++    with open(path, 'r', encoding='utf-8') as f:
++        return f.read()
++
++def write_file(path: str, content: str):
++    # atomic-ish write
++    tmp_path = path + ".tmp_edit"
++    with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
++        f.write(content)
++    os.replace(tmp_path, path)
++
++def replace_all(content: str, search: str, replace: str, regex: bool=False, flags: int=0) -> str:
++    if regex:
++        return re.sub(search, replace, content, flags=flags)
++    return content.replace(search, replace)
++
++def replace_first(content: str, search: str, replace: str, regex: bool=False, flags: int=0) -> str:
++    if regex:
++        pattern = re.compile(search, flags)
++        return pattern.sub(replace, content, count=1)
++    return content.replace(search, replace, 1)
++
++def insert_before_pattern(content: str, pattern: str, text: str, regex: bool=False, flags: int=0) -> str:
++    lines = content.splitlines(keepends=True)
++    out = []
++    inserted = False
++    if regex:
++        rx = re.compile(pattern, flags)
++        for line in lines:
++            if not inserted and rx.search(line):
++                out.append(text if text.endswith('\n') else text + '\n')
++                inserted = True
++            out.append(line)
++    else:
++        for line in lines:
++            if not inserted and pattern in line:
++                out.append(text if text.endswith('\n') else text + '\n')
++                inserted = True
++            out.append(line)
++    if not inserted:
++        # append at end if not found
++        if lines and not lines[-1].endswith('\n'):
++            out.append('\n')
++        out.append(text if text.endswith('\n') else text + '\n')
++    return ''.join(out)
++
++def insert_after_pattern(content: str, pattern: str, text: str, regex: bool=False, flags: int=0) -> str:
++    lines = content.splitlines(keepends=True)
++    out = []
++    inserted = False
++    if regex:
++        rx = re.compile(pattern, flags)
++        for line in lines:
++            out.append(line)
++            if not inserted and rx.search(line):
++                out.append(text if text.endswith('\n') else text + '\n')
++                inserted = True
++    else:
++        for line in lines:
++            out.append(line)
++            if not inserted and pattern in line:
++                out.append(text if text.endswith('\n') else text + '\n')
++                inserted = True
++    if not inserted:
++        # append at end if not found
++        if lines and not lines[-1].endswith('\n'):
++            out.append('\n')
++        out.append(text if text.endswith('\n') else text + '\n')
++    return ''.join(out)
++
++def insert_at_line(content: str, line_no: int, text: str) -> str:
++    lines = content.splitlines(keepends=True)
++    idx = max(0, min(line_no - 1, len(lines)))
++    insertion = text if text.endswith('\n') else text + '\n'
++    new_lines = lines[:idx] + [insertion] + lines[idx:]
++    return ''.join(new_lines)
++
++def ensure_contains(content: str, needle: str) -> bool:
++    return needle in content
++
++def main():
++    parser = argparse.ArgumentParser(description="Lightweight file editing tool for automated code modifications.")
++    parser.add_argument("--path", required=True, help="Path to the file to edit")
++    parser.add_argument("--op", required=True, choices=[
++        "replace_all", "replace_first",
++        "insert_before", "insert_after", "insert_at_line",
++        "assert_contains"
++    ])
++    parser.add_argument("--search", help="Search string (or regex if --regex)")
++    parser.add_argument("--replace", help="Replacement text")
++    parser.add_argument("--pattern", help="Pattern string (or regex if --regex)")
++    parser.add_argument("--text", help="Text to insert")
++    parser.add_argument("--line", type=int, help="1-based line number for insert_at_line")
++    parser.add_argument("--regex", action="store_true", help="Interpret search/pattern as regex")
++    parser.add_argument("--flags", default="", help="Regex flags, e.g., IGNORECASE|MULTILINE")
++    parser.add_argument("--dry-run", action="store_true", help="Do not write changes, just preview to stdout")
++    args = parser.parse_args()
++
++    flags = 0
++    if args.regex and args.flags:
++        for name in args.flags.split("|"):
++            name = name.strip()
++            if not name:
++                continue
++            if not hasattr(re, name):
++                print(f"Unknown regex flag: {name}", file=sys.stderr)
++                sys.exit(2)
++            flags |= getattr(re, name)
++
++    content = read_file(args.path)
++
++    if args.op == "replace_all":
++        if args.search is None or args.replace is None:
++            print("replace_all requires --search and --replace", file=sys.stderr)
++            sys.exit(2)
++        new_content = replace_all(content, args.search, args.replace, args.regex, flags)
++    elif args.op == "replace_first":
++        if args.search is None or args.replace is None:
++            print("replace_first requires --search and --replace", file=sys.stderr)
++            sys.exit(2)
++        new_content = replace_first(content, args.search, args.replace, args.regex, flags)
++    elif args.op == "insert_before":
++        if args.pattern is None or args.text is None:
++            print("insert_before requires --pattern and --text", file=sys.stderr)
++            sys.exit(2)
++        new_content = insert_before_pattern(content, args.pattern, args.text, args.regex, flags)
++    elif args.op == "insert_after":
++        if args.pattern is None or args.text is None:
++            print("insert_after requires --pattern and --text", file=sys.stderr)
++            sys.exit(2)
++        new_content = insert_after_pattern(content, args.pattern, args.text, args.regex, flags)
++    elif args.op == "insert_at_line":
++        if args.line is None or args.text is None:
++            print("insert_at_line requires --line and --text", file=sys.stderr)
++            sys.exit(2)
++        new_content = insert_at_line(content, args.line, args.text)
++    elif args.op == "assert_contains":
++        if args.search is None:
++            print("assert_contains requires --search", file=sys.stderr)
++            sys.exit(2)
++        ok = ensure_contains(content, args.search)
++        if not ok:
++            print(f"Assertion failed: file does not contain given search string.", file=sys.stderr)
++            sys.exit(1)
++        print("OK: contains")
++        return
++    else:
++        print(f"Unknown op: {args.op}", file=sys.stderr)
++        sys.exit(2)
++
++    if args.dry_run:
++        sys.stdout.write(new_content)
++    else:
++        if new_content != content:
++            write_file(args.path, new_content)
++            print(f"Edited: {args.path}")
++        else:
++            print(f"No changes needed: {args.path}")
++
++if __name__ == "__main__":
++    main()

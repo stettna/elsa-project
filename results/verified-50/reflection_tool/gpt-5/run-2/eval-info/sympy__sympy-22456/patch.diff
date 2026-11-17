@@ -1,0 +1,177 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..96a41f535a
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,5 @@
++Argument invariance of codegen.ast String
++Currently, the codegen.ast String class does not support argument invariance like:
++expr.func(*expr.args) == expr, but instead uses the invariance expr.func(**expr.kwargs()) == expr.
++The former should hold for any Basic subclass, which String is.
++
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..6c44fc169c
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,12 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++- Create and use the tools/edit.py utility for reliable, repeatable file edits (write, append, replace, regex-replace).
++- Before implementing fixes, locate the codegen.ast String class and inspect how __new__/args/kwargs/func are defined.
++- Ensure argument invariance holds: for Basic subclasses, expr.func(*expr.args) must reconstruct expr. Avoid relying solely on kwargs invariance.
++- After changes, write a small reproduction script to verify invariance for String and other Basic subclasses in codegen.ast if present.
++- Run the test suite (or a focused subset) after modifications and iterate if failures arise.
++- Keep diffs minimal and consistent with existing patterns across the codebase.
++
++- Use tools/check_invariance.py to reproduce and verify the String argument invariance before and after making changes.
+diff --git a/sympy/codegen/ast.py b/sympy/codegen/ast.py
+index a02714b174..38ca097eee 100644
+--- a/sympy/codegen/ast.py
++++ b/sympy/codegen/ast.py
+@@ -895,7 +895,7 @@ class String(Token):
+ 
+     """
+     __slots__ = ('text',)
+-    not_in_args = ['text']
++    not_in_args = []
+     is_Atom = True
+ 
+     @classmethod
+diff --git a/tools/check_invariance.py b/tools/check_invariance.py
+new file mode 100755
+index 0000000000..84463ea969
+--- /dev/null
++++ b/tools/check_invariance.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++import sys
++from sympy.codegen.ast import String
++
++def check_string_invariance():
++    samples = [
++        String(""),
++        String("x"),
++        String("abc"),
++        String("\n"),
++        String('quote " and backslash \\'),
++    ]
++    ok = True
++    print("Checking invariance: expr.func(*expr.args) == expr")
++    for i, s in enumerate(samples, 1):
++        try:
++            recon = s.func(*s.args)
++            same = (recon == s)
++            print(f"[{i}] args={s.args!r} kwargs={getattr(s, 'kwargs', lambda: {})() if hasattr(s, 'kwargs') else {}} -> same={same}")
++            if not same:
++                ok = False
++        except Exception as e:
++            ok = False
++            print(f"[{i}] ERROR reconstructing with args: {e}")
++    print("\nChecking kwargs invariance: expr.func(**expr.kwargs()) == expr (if available)")
++    for i, s in enumerate(samples, 1):
++        try:
++            if hasattr(s, "kwargs"):
++                kw = s.kwargs()
++                recon = s.func(**kw)
++                same = (recon == s)
++                print(f"[{i}] kwargs={kw!r} -> same={same}")
++            else:
++                print(f"[{i}] no kwargs() method; skipping")
++        except Exception as e:
++            print(f"[{i}] ERROR reconstructing with kwargs: {e}")
++    return 0 if ok else 1
++
++if __name__ == "__main__":
++    sys.exit(check_string_invariance())
+diff --git a/tools/edit.py b/tools/edit.py
+new file mode 100755
+index 0000000000..01aa0fea53
+--- /dev/null
++++ b/tools/edit.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++import sys
++import argparse
++import re
++from pathlib import Path
++
++def read_stdin():
++    data = sys.stdin.read()
++    if data is None:
++        data = ""
++    if data == "":
++        print("No data provided on stdin.", file=sys.stderr)
++        sys.exit(1)
++    return data
++
++def main():
++    p = argparse.ArgumentParser(description="Simple file edit tool")
++    p.add_argument("file", help="Target file to edit")
++    mode = p.add_mutually_exclusive_group(required=True)
++    mode.add_argument("--write-from-stdin", action="store_true", help="Overwrite file with stdin content")
++    mode.add_argument("--append-from-stdin", action="store_true", help="Append stdin content to file")
++    mode.add_argument("--replace", nargs=2, metavar=("OLD", "NEW"), help="Simple string replace OLD -> NEW")
++    mode.add_argument("--regex-replace", nargs=2, metavar=("PATTERN", "REPL"), help="Regex replace")
++    mode.add_argument("--ensure-contains", metavar="TEXT", help="Exit nonzero if TEXT not present")
++    args = p.parse_args()
++
++    fpath = Path(args.file)
++    if not fpath.exists() and not args.write_from_stdin and not args.append_from_stdin:
++        print(f"File does not exist: {fpath}", file=sys.stderr)
++        sys.exit(2)
++
++    if args.write_from_stdin:
++        data = read_stdin()
++        fpath.parent.mkdir(parents=True, exist_ok=True)
++        fpath.write_text(data, encoding="utf-8")
++        print(f"Wrote {len(data)} bytes to {fpath}")
++        return
++
++    if args.append_from_stdin:
++        data = read_stdin()
++        fpath.parent.mkdir(parents=True, exist_ok=True)
++        with fpath.open("a", encoding="utf-8") as fh:
++            fh.write(data)
++        print(f"Appended {len(data)} bytes to {fpath}")
++        return
++
++    content = fpath.read_text(encoding="utf-8") if fpath.exists() else ""
++
++    if args.replace:
++        old, new = args.replace
++        if old not in content:
++            print("Pattern not found; no changes made.", file=sys.stderr)
++            sys.exit(3)
++        updated = content.replace(old, new)
++        if updated != content:
++            fpath.write_text(updated, encoding="utf-8")
++            print("Replaced occurrences.")
++        return
++
++    if args.regex_replace:
++        pat, repl = args.regex_replace
++        import re
++        try:
++            updated, n = re.subn(pat, repl, content, flags=re.MULTILINE | re.DOTALL)
++        except re.error as e:
++            print(f"Invalid regex: {e}", file=sys.stderr)
++            sys.exit(4)
++        if n == 0:
++            print("No matches for regex; no changes made.", file=sys.stderr)
++            sys.exit(5)
++        fpath.write_text(updated, encoding="utf-8")
++        print(f"Regex replaced {n} occurrence(s).")
++        return
++
++    if args.ensure_contains is not None:
++        if args.ensure_contains in content:
++            print("Pattern found.")
++            return
++        print("Pattern NOT found.", file=sys.stderr)
++        sys.exit(6)
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,297 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..b8d4107577
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,13 @@
++BaseForm's _clean_fields() and changed_data should access values via BoundField
++Description
++	 
++		(last modified by Chris Jerdonek)
++	 
++While working on #32917, I noticed that ​BaseForm._clean_fields() and ​BaseForm.changed_data don't currently access their values through a BoundField object. It would be better for consistency if they did, and to reduce the number of code paths.
++One consequence of the current code is that form._clean_fields() can return a different value from form[name].initial when they should be the same. This case is almost, but not quite, covered by ​test_datetime_clean_initial_callable_disabled() (the test can be adjusted to cover this case).
++As part of this ticket and in line with accessing data through the BoundField objects, I noticed that the code would also be simpler if the per-field logic of changed_data() were moved into a method of the BoundField class. It could be called something like bf.did_change(). This would be more appropriate because whether form data changed for a field is a property of its BoundField (as it depends on the underlying form data), as opposed to the unbound field. With this change, the method could change from its current ~20 lines to something like this--
++@cached_property
++def changed_data(self):
++	return [name for name, bf in self._bound_items() if bf._did_change()]
++A similar change could be made to BaseForm._clean_fields().
++
+diff --git a/_bf_import.ins b/_bf_import.ins
+new file mode 100644
+index 0000000000..f26a4a9bf2
+--- /dev/null
++++ b/_bf_import.ins
+@@ -0,0 +1 @@
++from django.core.exceptions import ValidationError
+diff --git a/_changed_data.body b/_changed_data.body
+new file mode 100644
+index 0000000000..e3994fd7dc
+--- /dev/null
++++ b/_changed_data.body
+@@ -0,0 +1 @@
++return [bf.name for bf in self if bf._did_change()]
+diff --git a/_clean_fields.body b/_clean_fields.body
+new file mode 100644
+index 0000000000..8eb7162a14
+--- /dev/null
++++ b/_clean_fields.body
+@@ -0,0 +1,18 @@
++for name, field in self.fields.items():
++    bf = self[name]
++    if field.disabled:
++        value = bf.initial
++    else:
++        value = bf.data
++    try:
++        if isinstance(field, FileField):
++            initial = bf.initial
++            value = field.clean(value, initial)
++        else:
++            value = field.clean(value)
++        self.cleaned_data[name] = value
++        if hasattr(self, 'clean_%s' % name):
++            value = getattr(self, 'clean_%s' % name)()
++            self.cleaned_data[name] = value
++    except ValidationError as e:
++        self.add_error(name, e)
+diff --git a/dev_edit.py b/dev_edit.py
+new file mode 100644
+index 0000000000..51899daed8
+--- /dev/null
++++ b/dev_edit.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python3
++import sys, re, textwrap
++
++def read(path):
++    with open(path, 'r', encoding='utf-8') as f:
++        return f.read()
++
++def write(path, content):
++    with open(path, 'w', encoding='utf-8') as f:
++        f.write(content)
++
++def replace_function(src, func_def_regex, new_body_indented):
++    lines = src.splitlines(True)
++    pattern = re.compile(func_def_regex)
++    for i, line in enumerate(lines):
++        if pattern.search(line):
++            base_indent = re.match(r'^(\s*)', line).group(1)
++            # Find end of function by scanning until next def/class with same or less indent.
++            j = i + 1
++            while j < len(lines):
++                if lines[j].strip() == '':
++                    j += 1
++                    continue
++                curr_indent = re.match(r'^(\s*)', lines[j]).group(1)
++                if (lines[j].lstrip().startswith('def ') or lines[j].lstrip().startswith('class ')) and len(curr_indent) <= len(base_indent):
++                    break
++                j += 1
++            header = lines[i]
++            # Body should be indented one level deeper than def line.
++            body = textwrap.indent(new_body_indented.rstrip('\n') + '\n', base_indent + '    ')
++            new = ''.join(lines[:i]) + header + body + ''.join(lines[j:])
++            return new
++    raise SystemExit(f"Function definition not found: {func_def_regex}")
++
++def insert_after_class(src, class_regex, insertion):
++    lines = src.splitlines(True)
++    cre = re.compile(class_regex)
++    for i, line in enumerate(lines):
++        if cre.search(line):
++            insert_at = i + 1
++            return ''.join(lines[:insert_at]) + insertion + ''.join(lines[insert_at:])
++    raise SystemExit(f"Class not found: {class_regex}")
++
++def insert_before_regex(src, pattern, insertion):
++    data = src.splitlines(True)
++    regex = re.compile(pattern, re.M)
++    for i, line in enumerate(data):
++        if regex.search(line):
++            return ''.join(data[:i]) + insertion + ''.join(data[i:])
++    raise SystemExit(f"Pattern not found for insert_before_regex: {pattern}")
++
++def insert_after_regex(src, pattern, insertion):
++    data = src.splitlines(True)
++    regex = re.compile(pattern, re.M)
++    for i, line in enumerate(data):
++        if regex.search(line):
++            return ''.join(data[:i+1]) + insertion + ''.join(data[i+1:])
++    raise SystemExit(f"Pattern not found for insert_after_regex: {pattern}")
++
++def view(path, start, end):
++    data = read(path).splitlines()
++    start = max(1, start)
++    end = min(len(data), end)
++    for i in range(start-1, end):
++        print(f"{i+1:6d}  {data[i]}")
++
++def main():
++    import argparse
++    ap = argparse.ArgumentParser(description="Dev edit/view tool")
++    sub = ap.add_subparsers(dest="cmd", required=True)
++
++    p1 = sub.add_parser("view")
++    p1.add_argument("path")
++    p1.add_argument("start", type=int)
++    p1.add_argument("end", type=int)
++
++    p2 = sub.add_parser("replace_func")
++    p2.add_argument("path")
++    p2.add_argument("func_def_regex")
++    p2.add_argument("new_body_file")
++
++    p3 = sub.add_parser("insert_after_class")
++    p3.add_argument("path")
++    p3.add_argument("class_regex")
++    p3.add_argument("insertion_file")
++
++    p4 = sub.add_parser("insert_before_regex")
++    p4.add_argument("path")
++    p4.add_argument("pattern")
++    p4.add_argument("insertion_file")
++
++    p5 = sub.add_parser("insert_after_regex")
++    p5.add_argument("path")
++    p5.add_argument("pattern")
++    p5.add_argument("insertion_file")
++
++    args = ap.parse_args()
++    if args.cmd == "view":
++        return view(args.path, args.start, args.end)
++    elif args.cmd == "replace_func":
++        src = read(args.path)
++        with open(args.new_body_file, 'r', encoding='utf-8') as f:
++            body = f.read()
++        new = replace_function(src, args.func_def_regex, body)
++        write(args.path, new)
++        print("OK: replaced function body")
++    elif args.cmd == "insert_after_class":
++        src = read(args.path)
++        with open(args.insertion_file, 'r', encoding='utf-8') as f:
++            ins = f.read()
++        new = insert_after_class(src, args.class_regex, ins)
++        write(args.path, new)
++        print("OK: inserted after class")
++    elif args.cmd == "insert_before_regex":
++        src = read(args.path)
++        with open(args.insertion_file, 'r', encoding='utf-8') as f:
++            ins = f.read()
++        new = insert_before_regex(src, args.pattern, ins)
++        write(args.path, new)
++        print("OK: inserted before regex")
++    elif args.cmd == "insert_after_regex":
++        src = read(args.path)
++        with open(args.insertion_file, 'r', encoding='utf-8') as f:
++            ins = f.read()
++        new = insert_after_regex(src, args.pattern, ins)
++        write(args.path, new)
++        print("OK: inserted after regex")
++    else:
++        raise SystemExit("Unknown cmd")
++
++if __name__ == "__main__":
++    main()
+diff --git a/django/forms/boundfield.py b/django/forms/boundfield.py
+index 88adadb37d..1497b4d2c4 100644
+--- a/django/forms/boundfield.py
++++ b/django/forms/boundfield.py
+@@ -1,5 +1,6 @@
+ import datetime
+ import re
++from django.core.exceptions import ValidationError
+ 
+ from django.forms.utils import flatatt, pretty_name
+ from django.forms.widgets import Textarea, TextInput
+@@ -228,6 +229,22 @@ class BoundField:
+             attrs['disabled'] = True
+         return attrs
+ 
++    def _did_change(self):
++        data_value = self.form._field_data_value(self.field, self.html_name)
++        if not self.field.show_hidden_initial:
++            initial_value = self.initial
++        else:
++            hidden_widget = self.field.hidden_widget()
++            try:
++                initial_value = self.field.to_python(
++                    self.form._widget_data_value(hidden_widget, self.html_initial_name)
++                )
++            except ValidationError:
++                # Always assume data has changed if validation fails.
++                return True
++        return self.field.has_changed(initial_value, data_value)
++
++
+     @property
+     def widget_type(self):
+         return re.sub(r'widget$|input$', '', self.field.widget.__class__.__name__.lower())
+diff --git a/django/forms/forms.py b/django/forms/forms.py
+index d14037bfe9..e84237ada1 100644
+--- a/django/forms/forms.py
++++ b/django/forms/forms.py
+@@ -388,13 +388,14 @@ class BaseForm:
+ 
+     def _clean_fields(self):
+         for name, field in self.fields.items():
++            bf = self[name]
+             if field.disabled:
+-                value = self.get_initial_for_field(field, name)
++                value = bf.initial
+             else:
+-                value = self._field_data_value(field, self.add_prefix(name))
++                value = bf.data
+             try:
+                 if isinstance(field, FileField):
+-                    initial = self.get_initial_for_field(field, name)
++                    initial = bf.initial
+                     value = field.clean(value, initial)
+                 else:
+                     value = field.clean(value)
+@@ -404,7 +405,6 @@ class BaseForm:
+                     self.cleaned_data[name] = value
+             except ValidationError as e:
+                 self.add_error(name, e)
+-
+     def _clean_form(self):
+         try:
+             cleaned_data = self.clean()
+@@ -436,29 +436,7 @@ class BaseForm:
+ 
+     @cached_property
+     def changed_data(self):
+-        data = []
+-        for name, field in self.fields.items():
+-            data_value = self._field_data_value(field, self.add_prefix(name))
+-            if not field.show_hidden_initial:
+-                # Use the BoundField's initial as this is the value passed to
+-                # the widget.
+-                initial_value = self[name].initial
+-            else:
+-                initial_prefixed_name = self.add_initial_prefix(name)
+-                hidden_widget = field.hidden_widget()
+-                try:
+-                    initial_value = field.to_python(
+-                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+-                    )
+-                except ValidationError:
+-                    # Always assume data has changed if validation fails.
+-                    data.append(name)
+-                    continue
+-            if field.has_changed(initial_value, data_value):
+-                data.append(name)
+-        return data
+-
+-    @property
++        return [bf.name for bf in self if bf._did_change()]
+     def media(self):
+         """Return all media required to render the widgets on this form."""
+         media = Media()

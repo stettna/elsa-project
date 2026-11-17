@@ -1,0 +1,181 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..c34af70a
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,41 @@
++Merging dataArray into dataset using dataset method fails
++While it's possible to merge a dataset and a dataarray object using the top-level merge() function, if you try the same thing with the ds.merge() method it fails.
++
++python
++import xarray as xr
++
++ds = xr.Dataset({'a': 0})
++da = xr.DataArray(1, name='b')
++
++expected = xr.merge([ds, da])  # works fine
++print(expected)
++
++ds.merge(da)  # fails
++
++
++Output:
++
++<xarray.Dataset>
++Dimensions:  ()
++Data variables:
++    a        int64 0
++    b        int64 1
++
++Traceback (most recent call last):
++  File mwe.py, line 6, in <module>
++    actual = ds.merge(da)
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/dataset.py, line 3591, in merge
++    fill_value=fill_value,
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 835, in dataset_merge_method
++    objs, compat, join, priority_arg=priority_arg, fill_value=fill_value
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 548, in merge_core
++    coerced = coerce_pandas_values(objects)
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 394, in coerce_pandas_values
++    for k, v in obj.items():
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/common.py, line 233, in __getattr__
++    {!r} object has no attribute {!r}.format(type(self).__name__, name)
++AttributeError: 'DataArray' object has no attribute 'items'
++
++
++
++
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 00000000..69d57d8d
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++- Before editing code, reproduce the bug with a minimal local script using the snippet in the PR description to confirm the failing path (ds.merge(da) vs xr.merge([ds, da])).
++- Locate and read implementations: xarray/core/dataset.py (Dataset.merge) and xarray/core/merge.py (top-level merge, merge_core, dataset_merge_method). Grep for "merge(" and "dataset_merge_method".
++- Mirror behavior from the top-level merge when updating Dataset.merge: if given a DataArray, coerce it to a Dataset (e.g., da.to_dataset()) so both paths handle inputs consistently.
++- Consider existing helpers for variable promotion (e.g., as_variable or similar) to ensure consistency with codebase patterns.
++- After each change, run a quick smoke test (python -c "...") to verify ds.merge(da) works and matches xr.merge([ds, da]).
++- Use tools/edit.py for precise, idempotent edits (regex insert/replace) to minimize mistakes during source modifications.
++- Avoid modifying tests or configuration files; only edit non-test source files under /testbed.
+diff --git a/tools/edit.py b/tools/edit.py
+new file mode 100644
+index 00000000..5439adbd
+--- /dev/null
++++ b/tools/edit.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++import sys, re
++
++def usage():
++    print(
++        "Usage:\n"
++        "  edit.py replace FILE PATTERN REPLACEMENT [--regex] [--count N] [--flags IMS]\n"
++        "  edit.py insert_after FILE PATTERN [--regex] [--flags IMS] <<'TEXT' ... TEXT\n"
++        "  edit.py insert_before FILE PATTERN [--regex] [--flags IMS] <<'TEXT' ... TEXT\n"
++        "  edit.py append FILE <<'TEXT' ... TEXT",
++        file=sys.stderr,
++    )
++    return 2
++
++def parse_flags(flagstr):
++    f = 0
++    if not flagstr:
++        return f
++    if 'I' in flagstr: f |= re.IGNORECASE
++    if 'M' in flagstr: f |= re.MULTILINE
++    if 'S' in flagstr: f |= re.DOTALL
++    return f
++
++def main():
++    if len(sys.argv) < 2:
++        sys.exit(usage())
++    cmd = sys.argv[1]
++    if cmd == 'replace':
++        if len(sys.argv) < 6:
++            sys.exit(usage())
++        file = sys.argv[2]
++        pattern = sys.argv[3]
++        repl = sys.argv[4]
++        regex = '--regex' in sys.argv
++        count = 0
++        if '--count' in sys.argv:
++            ci = sys.argv.index('--count'); count = int(sys.argv[ci + 1])
++        flags = 0
++        if '--flags' in sys.argv:
++            fi = sys.argv.index('--flags'); flags = parse_flags(sys.argv[fi + 1])
++        with open(file, 'r', encoding='utf-8') as f:
++            s = f.read()
++        rx = re.compile(pattern, flags) if regex else re.compile(re.escape(pattern), flags)
++        new, n = rx.subn(repl, s, count=0 if count == 0 else count)
++        if new == s:
++            print(f"No changes made to {file}", file=sys.stderr)
++        else:
++            with open(file, 'w', encoding='utf-8') as f:
++                f.write(new)
++            print(f"Replacements: {n} in {file}")
++        return 0
++    elif cmd in ('insert_after', 'insert_before'):
++        if len(sys.argv) < 4:
++            sys.exit(usage())
++        file = sys.argv[2]
++        pattern = sys.argv[3]
++        regex = '--regex' in sys.argv
++        flags = 0
++        if '--flags' in sys.argv:
++            fi = sys.argv.index('--flags'); flags = parse_flags(sys.argv[fi + 1])
++        text = sys.stdin.read()
++        with open(file, 'r', encoding='utf-8') as f:
++            s = f.read()
++        if regex:
++            m = re.search(pattern, s, flags)
++            if not m:
++                print("Pattern not found", file=sys.stderr); return 1
++            idx = m.end() if cmd == 'insert_after' else m.start()
++        else:
++            idx = s.find(pattern)
++            if idx == -1:
++                print("Pattern not found", file=sys.stderr); return 1
++            idx = idx + len(pattern) if cmd == 'insert_after' else idx
++        new = s[:idx] + text + s[idx:]
++        with open(file, 'w', encoding='utf-8') as f:
++            f.write(new)
++        print(f"Inserted text into {file}")
++        return 0
++    elif cmd == 'append':
++        if len(sys.argv) < 3:
++            sys.exit(usage())
++        file = sys.argv[2]
++        text = sys.stdin.read()
++        with open(file, 'a', encoding='utf-8') as f:
++            f.write(text)
++        print(f"Appended to {file}")
++        return 0
++    else:
++        sys.exit(usage())
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/xarray/core/merge.py b/xarray/core/merge.py
+index 10c7804d..40c02682 100644
+--- a/xarray/core/merge.py
++++ b/xarray/core/merge.py
+@@ -803,8 +803,12 @@ def dataset_merge_method(
+     join: str,
+     fill_value: Any,
+ ) -> _MergeResult:
+-    """Guts of the Dataset.merge method.
+-    """
++    """Guts of the Dataset.merge method."""
++    from .dataarray import DataArray
++    from .dataset import Dataset
++    if isinstance(other, DataArray):
++        other = other.to_dataset()
++
+     # we are locked into supporting overwrite_vars for the Dataset.merge
+     # method due for backwards compatibility
+     # TODO: consider deprecating it?

@@ -1,0 +1,129 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..092b404c57
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,20 @@
++RenameContentType._rename() doesn't save the content type on the correct database
++Description
++	
++The commit in question:
++​https://github.com/django/django/commit/f179113e6cbc8ba0a8d4e87e1d4410fb61d63e75
++The specific lines in question:
++​https://github.com/django/django/blob/586a9dc4295357de1f5ad0590ad34bf2bc008f79/django/contrib/contenttypes/management/__init__.py#L27
++with transaction.atomic(using=db): 
++	content_type.save(update_fields={'model'})
++The issue:
++For some background, we run a dynamic database router and have no real databases configured in the settings file, just a default sqlite3 backend which is never actually generated or used. We forked the migrate.py management command and modified it to accept a dictionary containing database connection parameters as the --database argument. 
++The dynamic database router is based on, and very similar to this: ​https://github.com/ambitioninc/django-dynamic-db-router/blob/master/dynamic_db_router/router.py
++This has worked beautifully for all migrations up until this point.
++The issue we're running into is that when attempting to run a migration which contains a call to migrations.RenameModel, and while specifying the database parameters to the migrate command, the migration fails with an OperationalError, stating that no such table: django_content_types exists.
++After having exhaustively stepped through the traceback, it appears that even though the content_type.save call is wrapped in the with transaction.atomic(using=db) context manager, the actual database operation is being attempted on the default database (which in our case does not exist) rather than the database specified via schema_editor.connection.alias (on line 15 of the same file) and thus fails loudly.
++So, I believe that:
++content_type.save(update_fields={'model'})
++should be
++content_type.save(using=db, update_fields={'model'})
++
+diff --git a/django/contrib/contenttypes/management/__init__.py b/django/contrib/contenttypes/management/__init__.py
+index 2b5f688136..563cba2fdf 100644
+--- a/django/contrib/contenttypes/management/__init__.py
++++ b/django/contrib/contenttypes/management/__init__.py
+@@ -24,7 +24,7 @@ class RenameContentType(migrations.RunPython):
+             content_type.model = new_model
+             try:
+                 with transaction.atomic(using=db):
+-                    content_type.save(update_fields={'model'})
++                    content_type.save(using=db, update_fields={'model'})
+             except IntegrityError:
+                 # Gracefully fallback if a stale content type causes a
+                 # conflict as remove_stale_contenttypes will take care of
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..db43989196
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,16 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++- Create lightweight, auditable tools to make safe, targeted source edits (e.g., regex replace with count control).
++- When fixing DB alias issues, search for transaction.atomic(using=...) blocks and ensure all ORM writes inside use the same "using" explicitly.
++- Prefer small, verifiable changes that align with Django patterns (e.g., passing "using" to Model.save()).
++- After editing, grep the repo to ensure there are no similar call sites that need consistent treatment.
++- Create lightweight, auditable tools to make safe, targeted source edits (e.g., regex replace with count control).
++- When fixing DB alias issues, search for transaction.atomic(using=...) blocks and ensure all ORM writes inside use the same "using" explicitly.
++- Prefer small, verifiable changes that align with Django patterns (e.g., passing "using" to Model.save()).
++- After editing, grep the repo to ensure there are no similar call sites that need consistent treatment.
++- Create lightweight, auditable tools to make safe, targeted source edits (e.g., regex replace with count control).
++- When fixing DB alias issues, search for transaction.atomic(using=...) blocks and ensure all ORM writes inside use the same "using" explicitly.
++- Prefer small, verifiable changes that align with Django patterns (e.g., passing "using" to Model.save()).
++- After editing, grep the repo to ensure there are no similar call sites that need consistent treatment.
+diff --git a/tools/edit.py b/tools/edit.py
+new file mode 100755
+index 0000000000..0a60840597
+--- /dev/null
++++ b/tools/edit.py
+@@ -0,0 +1,62 @@
++\
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from pathlib import Path
++
++def parse_flags(flag_str: str) -> int:
++    if not flag_str:
++        return 0
++    mapping = {
++        "I": re.IGNORECASE, "IGNORECASE": re.IGNORECASE,
++        "M": re.MULTILINE,  "MULTILINE": re.MULTILINE,
++        "S": re.DOTALL,     "DOTALL": re.DOTALL,
++        "X": re.VERBOSE,    "VERBOSE": re.VERBOSE,
++        "A": re.ASCII,      "ASCII": re.ASCII,
++        "L": re.LOCALE,
++        "U": re.UNICODE,    # default in py3; included for completeness
++    }
++    flags = 0
++    for token in [t.strip() for t in flag_str.split(",") if t.strip()]:
++        if token not in mapping:
++            print(f"Unknown flag: {token}", file=sys.stderr)
++            sys.exit(2)
++        flags |= mapping[token]
++    return flags
++
++def cmd_replace(args):
++    path = Path(args.file)
++    if not path.exists():
++        print(f"File not found: {path}", file=sys.stderr)
++        sys.exit(2)
++    text = path.read_text(encoding=args.encoding)
++    pattern = re.compile(args.pattern, parse_flags(args.flags))
++    count = args.count if args.count is not None and args.count > 0 else 0
++    new_text, n = pattern.subn(args.repl, text, count=count)
++    if n == 0:
++        print("No replacements applied.")
++        sys.exit(1)
++    if args.dry_run:
++        print(f"[DRY RUN] Would apply {n} replacement(s) in {path}")
++        sys.exit(0)
++    path.write_text(new_text, encoding=args.encoding)
++    print(f"Applied {n} replacement(s) in {path}")
++
++def main():
++    p = argparse.ArgumentParser(description="Lightweight file editing tool (regex replace).")
++    sub = p.add_subparsers(dest="cmd", required=True)
++    rp = sub.add_parser("replace", help="Regex replace in a file")
++    rp.add_argument("--file", required=True, help="Path to file to edit")
++    rp.add_argument("--pattern", required=True, help="Regex pattern")
++    rp.add_argument("--repl", required=True, help="Replacement string (use Python re syntax)")
++    rp.add_argument("--count", type=int, default=0, help="Max number of replacements (0 means unlimited)")
++    rp.add_argument("--flags", default="", help="Comma-separated regex flags (e.g., IGNORECASE,MULTILINE)")
++    rp.add_argument("--encoding", default="utf-8", help="File encoding")
++    rp.add_argument("--dry-run", action="store_true", help="Do not write changes")
++    rp.set_defaults(func=cmd_replace)
++    args = p.parse_args()
++    args.func(args)
++
++if __name__ == "__main__":
++    main()

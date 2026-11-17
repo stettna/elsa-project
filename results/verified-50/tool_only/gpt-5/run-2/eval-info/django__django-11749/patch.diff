@@ -1,0 +1,120 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..386b28e6ff
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,22 @@
++call_command fails when argument of required mutually exclusive group is passed in kwargs.
++Description
++	
++This error 
++django.core.management.base.CommandError: Error: one of the arguments --shop-id --shop is required
++is raised when I run 
++call_command('my_command', shop_id=1)
++the argument 'shop_id' is part of a required mutually exclusive group:
++shop = parser.add_mutually_exclusive_group(required=True)
++shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++However, everything is fine when I call this command in this way:
++call_command('my_command, '--shop-id=1')
++In django sources I found that only those keyword arguments of call_command are passed to the parser that are defined as required:
++# Any required arguments which are passed in via '**options' must be passed
++# to parse_args().
++parse_args += [
++	'{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
++	for opt in parser._actions if opt.required and opt.dest in options
++]
++but in this special case both of them individually are not required, they are actually part of a group that is required. And the code of call_command does nothing with groups defined in the parser.
++
+diff --git a/django/core/management/__init__.py b/django/core/management/__init__.py
+index 5f2e64761e..152e11e01c 100644
+--- a/django/core/management/__init__.py
++++ b/django/core/management/__init__.py
+@@ -2,7 +2,7 @@ import functools
+ import os
+ import pkgutil
+ import sys
+-from argparse import _SubParsersAction
++from argparse import _SubParsersAction, _MutuallyExclusiveGroup
+ from collections import defaultdict
+ from difflib import get_close_matches
+ from importlib import import_module
+@@ -130,12 +130,39 @@ def call_command(command_name, *args, **options):
+                 yield opt
+ 
+     parser_actions = list(get_actions(parser))
++    
+     # Any required arguments which are passed in via **options must be passed
+-    # to parse_args().
+-    parse_args += [
+-        '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+-        for opt in parser_actions if opt.required and opt.dest in options
+-    ]
++    # to parse_args(). This includes options that are individually required as well
++    # as options that are part of a required mutually exclusive group.
++    def _iter_parsers(p):
++        yield p
++        for _a in p._actions:
++            if isinstance(_a, _SubParsersAction):
++                for _sp in _a.choices.values():
++                    yield from _iter_parsers(_sp)
++
++    # Collect dests that are part of any required mutually exclusive group across all parsers.
++    _required_meg_dests = set()
++    for _p in _iter_parsers(parser):
++        for _g in getattr(_p, '_mutually_exclusive_groups', []):
++            if getattr(_g, 'required', False):
++                for _act in getattr(_g, '_group_actions', []):
++                    if getattr(_act, 'dest', None):
++                        _required_meg_dests.add(_act.dest)
++
++    _extra_cli_args = []
++    _seen_dests = set()
++    for opt in parser_actions:
++        needs_cli = False
++        if getattr(opt, 'required', False) and opt.dest in options:
++            needs_cli = True
++        elif opt.dest in options and opt.dest in _required_meg_dests:
++            needs_cli = True
++        if needs_cli and opt.option_strings and opt.dest not in _seen_dests:
++            _extra_cli_args.append('{}={}'.format(min(opt.option_strings), arg_options[opt.dest]))
++            _seen_dests.add(opt.dest)
++    parse_args += _extra_cli_args
++
+     defaults = parser.parse_args(args=parse_args)
+     defaults = dict(defaults._get_kwargs(), **arg_options)
+     # Raise an error if any unknown options were passed.
+diff --git a/repro_meg_call_command.py b/repro_meg_call_command.py
+new file mode 100644
+index 0000000000..90f7f95035
+--- /dev/null
++++ b/repro_meg_call_command.py
+@@ -0,0 +1,21 @@
++from django.core.management.base import BaseCommand
++from django.core.management import call_command
++
++class TestCommand(BaseCommand):
++    help = "Test mutually exclusive required group"
++
++    def add_arguments(self, parser):
++        shop = parser.add_mutually_exclusive_group(required=True)
++        shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++        shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++
++    def handle(self, *args, **options):
++        print("HANDLED", options)
++
++if __name__ == "__main__":
++    # This should work but currently fails due to required group not being considered in kwargs.
++    try:
++        call_command(TestCommand(), shop_id=1)
++    except Exception as e:
++        print("ERROR:", type(e).__name__, e)
++        raise

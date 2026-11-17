@@ -1,0 +1,105 @@
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 000000000..476e4b97f
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,10 @@
++
++
++- Before modifying code, update task_description.txt with any new insights from reproduction.
++- When fixing, ensure behavior matches common.py semantics across all matrix classes (e.g., SparseMatrix, ImmutableMatrix).
++- After code changes, re-run reproduction scripts for both hstack and vstack with mixed types and zero-dimension cases.
++
++- Also patch SparseMatrix.col_join analogous to row_join for zero-dimension cases.
++- Verify vstack with mixed types where the first is SparseMatrix with zero columns.
++
++- Patch SparseMatrix.col_join to handle zero-row cases like common.py; verify vstack with mixed types.
+diff --git a/sympy/matrices/sparse.py b/sympy/matrices/sparse.py
+index e6f36cdf3..494491b13 100755
+--- a/sympy/matrices/sparse.py
++++ b/sympy/matrices/sparse.py
+@@ -985,8 +985,9 @@ def col_join(self, other):
+         >>> C == A.row_insert(A.rows, Matrix(B))
+         True
+         """
+-        if not self:
+-            return type(self)(other)
++        # Handle null-matrix stacking similarly to common.Matrix.col_join
++        if self.rows == 0 and self.cols != other.cols:
++            return type(self).zeros(0, other.cols).col_join(other)
+         A, B = self, other
+         if not A.cols == B.cols:
+             raise ShapeError()
+@@ -1191,8 +1192,10 @@ def row_join(self, other):
+         >>> C == A.col_insert(A.cols, B)
+         True
+         """
+-        if not self:
+-            return type(self)(other)
++        # A null matrix can always be stacked (see #10770)
++        # Mirror common.Matrix.row_join behavior for 0-column with row mismatch
++        if self.cols == 0 and self.rows != other.rows:
++            return type(self).zeros(other.rows, 0).row_join(other)
+         A, B = self, other
+         if not A.rows == B.rows:
+             raise ShapeError()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 000000000..852c95263
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,54 @@
++Behavior of Matrix hstack and vstack changed in sympy 1.1
++In sympy 1.0:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns 
++(0, 6)
++
++Now, same in sympy 1.1:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns
++(0, 3)
++
++whereas:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(1, 0)
++M2 = sy.Matrix.zeros(1, 1)
++M3 = sy.Matrix.zeros(1, 2)
++M4 = sy.Matrix.zeros(1, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns
++(1, 6)
++
++
++
++Insights:
++- The incorrect (0, 3) result appears when using hstack with mixed types where the first arg is a SparseMatrix having zero rows.
++- Root cause: SparseMatrix.row_join uses `if not self: return type(self)(other)`, which treats 0×n as falsy (since __len__==0), discarding its zero columns and collapsing to `other` during reduce.
++- Fix approach: Mirror common.py row_join behavior in SparseMatrix.row_join: if self has 0 columns and row mismatch, create a 0-column matrix with other's rows and then row_join; remove/replace the broad falsy check so zero-row matrices don’t collapse.
++
++Additional Insights:
++- vstack with a leading SparseMatrix of shape (k, 0) also returns incorrect shape (only last segment kept). Example: SparseMatrix(1,0), ImmutableDenseMatrix(2,0), Dense(3,0) -> (3,0) but expected (6,0).
++- Root cause is likely a similar early-return in SparseMatrix.col_join; needs fix mirroring common.py col_join behavior for zero rows with column mismatches.
++
++Further Insights:
++- vstack with leading SparseMatrix of shape (k, 0) yields incorrect shape, retaining only the last segment instead of summing rows.
++- This mirrors the earlier row_join issue and indicates SparseMatrix.col_join needs a guard like common.Matrix.col_join for zero-row cases.
++
++Fix Note:
++- Removed an incorrect guard in SparseMatrix.col_join that used row_join for 0-column/row-mismatch. col_join should only special-case when self.rows == 0 and column counts differ, mirroring common.py. This fixes vstack with leading SparseMatrix of shape (k, 0) so rows properly sum.

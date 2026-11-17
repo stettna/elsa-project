@@ -1,0 +1,130 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..0b7878a129 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -193,13 +193,30 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+             else:
+                 rhs_key_transforms = [key]
+-            rhs_params.append(
+-                "%s%s"
+-                % (
++            # Build RHS path. If user passed a KeyTransform, strip any LHS prefix
++            # so we only append the tail beyond the already processed LHS path.
++            # This preserves numeric segments as array indexes. Otherwise (plain
++            # values), ensure the final segment is treated as an object key (quoted)
++            # to avoid interpreting numeric-looking keys as indices.
++            if isinstance(key, KeyTransform):
++                tail = rhs_key_transforms
++                if 'lhs_key_transforms' in locals() and lhs_key_transforms:
++                    if tail[: len(lhs_key_transforms)] == lhs_key_transforms:
++                        tail = tail[len(lhs_key_transforms) :]
++                rhs_path = "%s%s" % (
+                     lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
++                    compile_json_path(tail, include_root=False),
+                 )
+-            )
++            else:
++                if rhs_key_transforms:
++                    prefix_path = compile_json_path(
++                        rhs_key_transforms[:-1], include_root=False
++                    )
++                    last_segment = "." + json.dumps(str(rhs_key_transforms[-1]))
++                    rhs_path = f"{lhs_json_path}{prefix_path}{last_segment}"
++                else:
++                    rhs_path = lhs_json_path
++            rhs_params.append(rhs_path)
+         # Add condition for each key.
+         if self.logical_operator:
+             sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
+@@ -387,9 +404,10 @@ class KeyTransformTextLookupMixin:
+ class KeyTransformIsNull(lookups.IsNull):
+     # key__isnull=False is the same as has_key='key'
+     def as_oracle(self, compiler, connection):
++        rhs_expr = KeyTransform(self.lhs.key_name, self.lhs.lhs)
+         sql, params = HasKey(
+             self.lhs.lhs,
+-            self.lhs.key_name,
++            rhs_expr,
+         ).as_oracle(compiler, connection)
+         if not self.rhs:
+             return sql, params
+@@ -401,7 +419,8 @@ class KeyTransformIsNull(lookups.IsNull):
+         template = "JSON_TYPE(%s, %%s) IS NULL"
+         if not self.rhs:
+             template = "JSON_TYPE(%s, %%s) IS NOT NULL"
+-        return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
++        rhs_expr = KeyTransform(self.lhs.key_name, self.lhs.lhs)
++        return HasKey(self.lhs.lhs, rhs_expr).as_sql(
+             compiler,
+             connection,
+             template=template,
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..33621720d3
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,5 @@
++
++
++- Remember: For has_key/has_keys/has_any_keys on non-PostgreSQL backends, numeric-looking keys must be treated as object keys, not array indices. Ensure JSON path building quotes the final segment.
++
++- When KeyTransformIsNull uses HasKey internally, pass a KeyTransform as RHS so numeric segments keep array index semantics.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..7e7687dbac
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,51 @@
++has_key, has_keys, and has_any_keys JSONField() lookups don't handle numeric keys on SQLite, MySQL, and Oracle.
++Description
++	 
++		(last modified by TheTerrasque)
++	 
++Problem
++When using models.​JSONField() ​has_key lookup with numerical keys on SQLite database it fails to find the keys.
++Versions:
++Django: 4.0.3
++Python: 3.9.6 (tags/v3.9.6:db3ff76, Jun 28 2021, 15:26:21) [MSC v.1929 64 bit (AMD64)] on win32
++sqlite3.version: '2.6.0'
++sqlite3.sqlite_version: '3.35.5'
++Example:
++Database
++DATABASES = {
++	'default': {
++		'ENGINE': 'django.db.backends.sqlite3',
++		'NAME': 'db.sqlite3',
++	}
++}
++Model
++class JsonFieldHasKeyTest(models.Model):
++	data = models.JSONField()
++Test
++from django.test import TestCase
++from .models import JsonFieldHasKeyTest
++class JsonFieldHasKeyTestCase(TestCase):
++	def setUp(self) -> None:
++		test = JsonFieldHasKeyTest(data={'foo': 'bar'})
++		test2 = JsonFieldHasKeyTest(data={'1111': 'bar'})
++		test.save()
++		test2.save()
++	def test_json_field_has_key(self):
++		c1 = JsonFieldHasKeyTest.objects.filter(data__has_key='foo').count()
++		c2 = JsonFieldHasKeyTest.objects.filter(data__has_key='1111').count()
++		self.assertEqual(c1, 1, Should have found 1 entry with key foo)
++		self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++Result
++FAIL: test_json_field_has_key (markers.tests.JsonFieldHasKeyTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++ File H:FilesProjectsElectacoWebserviceelecservemarkerstests.py, line 16, in test_json_field_has_key	 
++	self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++AssertionError: 0 != 1 : Should have found 1 entry with key '1111'
++Additional info
++This has been tested on SQLite and Postgresql backend, it works on postgresql but fails on sqlite.
++
++
++Added insight: The failure stems from compile_json_path interpreting numeric RHS segments as array indices. For HasKey/HasKeys/HasAnyKeys, the last segment should always be a quoted property (e.g., ."1111") on SQLite/MySQL/Oracle. Fix applied in HasKeyLookup.as_sql to quote the final segment while preserving preceding path segments.
++
++New insight: KeyTransformIsNull delegates to HasKey for JSON path checks. After forcing RHS final segment quoting in HasKey, filters like value__d__0__isnull started failing because '0' was treated as an object key. Fix: In KeyTransformIsNull.as_sqlite/as_oracle, pass RHS as KeyTransform(self.lhs.key_name, self.lhs.lhs) so array indices are preserved.

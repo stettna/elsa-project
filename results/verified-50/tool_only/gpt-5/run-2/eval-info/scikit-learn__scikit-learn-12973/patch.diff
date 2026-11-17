@@ -1,0 +1,155 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 000000000..8b1378917
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 000000000..4ac4752ed
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,13 @@
++LassoLarsIC: unintuitive copy_X behaviour
++Hi, I would like to report what seems to be a bug in the treatment of the copy_X parameter of the LassoLarsIC class. Because it's a simple bug, it's much easier to see in the code directly than in the execution, so I am not posting steps to reproduce it.
++
++As you can see here, LassoLarsIC accepts a copy_X parameter.
++https://github.com/scikit-learn/scikit-learn/blob/7389dbac82d362f296dc2746f10e43ffa1615660/sklearn/linear_model/least_angle.py#L1487
++
++However, it also takes a copy_X parameter a few lines below, in the definition of fit.
++    def fit(self, X, y, copy_X=True):
++
++Now there are two values (potentially contradicting each other) for copy_X and each one is used once. Therefore fit can have a mixed behaviour. Even worse, this can be completely invisible to the user, since copy_X has a default value of True. Let's assume that I'd like it to be False, and have set it to False in the initialization, my_lasso = LassoLarsIC(copy_X=False). I then call my_lasso.fit(X, y) and my choice will be silently overwritten. 
++
++Ideally I think that copy_X should be removed as an argument in fit. No other estimator seems to have a duplication in class parameters and fit arguments (I've checked more than ten in the linear models module). However, this would break existing code. Therefore I propose that fit takes a default value of None and only overwrites the existing value if the user has explicitly passed it as an argument to fit. I will submit a PR to that effect.
++
+diff --git a/patch_llic.py b/patch_llic.py
+new file mode 100644
+index 000000000..f116c9a7e
+--- /dev/null
++++ b/patch_llic.py
+@@ -0,0 +1,85 @@
++import sys, re
++
++path = "/testbed/sklearn/linear_model/least_angle.py"
++with open(path, "r", encoding="utf-8") as f:
++    text = f.read()
++
++cls_idx = text.find("class LassoLarsIC(")
++if cls_idx == -1:
++    print("ERROR: LassoLarsIC class not found", file=sys.stderr)
++    sys.exit(1)
++
++m_next_class = re.search(r"\nclass\s+\w+\s*\(", text[cls_idx+1:])
++class_end = cls_idx + 1 + m_next_class.start() if m_next_class else len(text)
++class_text = text[cls_idx:class_end]
++
++m_fit = re.search(r"\n\s*def\s+fit\s*\(\s*self\s*,\s*X\s*,\s*y\s*,\s*copy_X\s*=\s*True\s*\)\s*:", class_text)
++if not m_fit:
++    print("ERROR: fit signature with copy_X=True not found in LassoLarsIC", file=sys.stderr)
++    sys.exit(1)
++
++method_start = m_fit.start()
++m_next_def = re.search(r"\n\s*def\s+\w+\s*\(", class_text[m_fit.end():])
++method_end = m_fit.end() + (m_next_def.start() if m_next_def else len(class_text) - m_fit.end())
++method_text = class_text[method_start:method_end]
++orig_method_text = method_text
++
++# 1) Update signature to copy_X=None
++method_text = re.sub(
++    r"def\s+fit\s*\(\s*self\s*,\s*X\s*,\s*y\s*,\s*copy_X\s*=\s*True\s*\)\s*:",
++    "def fit(self, X, y, copy_X=None):",
++    method_text,
++    count=1
++)
++
++# 2) Update docstring for copy_X
++method_text = method_text.replace(
++    "copy_X : boolean, optional, default True",
++    "copy_X : boolean or None, optional, default None"
++)
++method_text = method_text.replace(
++    "If ``True``, X will be copied; else, it may be overwritten.",
++    "If None, use the estimator's copy_X parameter set at initialization. If True, X will be copied; else, it may be overwritten."
++)
++
++# 3) After check_X_y, resolve None to self.copy_X
++method_text = method_text.replace(
++    "X, y = check_X_y(X, y, y_numeric=True)\n",
++    "X, y = check_X_y(X, y, y_numeric=True)\n\n        if copy_X is None:\n            copy_X = self.copy_X\n\n",
++    1
++)
++
++# 4) Ensure preprocessing uses the resolved copy_X instead of self.copy_X
++method_text = method_text.replace("self.copy_X)", "copy_X)")
++
++if method_text == orig_method_text:
++    print("ERROR: No changes applied; aborting.", file=sys.stderr)
++    sys.exit(1)
++
++new_class_text = class_text[:method_start] + method_text + class_text[method_end:]
++new_text = text[:cls_idx] + new_class_text + text[class_end:]
++
++with open(path, "w", encoding="utf-8") as f:
++    f.write(new_text)
++
++print("Patched LassoLarsIC.fit successfully.")
++PY && python /testbed/patch_llic.py && python - <<'PY'
++import inspect
++import numpy as np
++from sklearn.linear_model import LassoLarsIC
++
++print("Signature:", inspect.signature(LassoLarsIC.fit))
++
++# Simple sanity tests
++X = np.array([[-1., 1.], [0., 0.], [1., 1.], [2., 2.], [3., 3.]], dtype=float)
++y = np.array([-1.0, 0.0, -1.0, -2.0, -3.0], dtype=float)
++
++# Case 1: use estimator's copy_X (False)
++est1 = LassoLarsIC(copy_X=False, criterion='aic')
++est1.fit(X, y)
++print("Case1 OK:", est1.alpha_, est1.coef_.shape, "copy_X_attr:", est1.copy_X)
++
++# Case 2: override at fit (True) without changing attribute
++est2 = LassoLarsIC(copy_X=False, criterion='aic')
++est2.fit(X, y, copy_X=True)
++print("Case2 OK:", est2.alpha_, est2.coef_.shape, "copy_X_attr:", est2.copy_X)
+diff --git a/sklearn/linear_model/least_angle.py b/sklearn/linear_model/least_angle.py
+index 03b34a0dc..8bfc4318f 100644
+--- a/sklearn/linear_model/least_angle.py
++++ b/sklearn/linear_model/least_angle.py
+@@ -1479,7 +1479,7 @@ class LassoLarsIC(LassoLars):
+         self.eps = eps
+         self.fit_path = True
+ 
+-    def fit(self, X, y, copy_X=True):
++    def fit(self, X, y, copy_X=None):
+         """Fit the model using X, y as training data.
+ 
+         Parameters
+@@ -1490,8 +1490,8 @@ class LassoLarsIC(LassoLars):
+         y : array-like, shape (n_samples,)
+             target values. Will be cast to X's dtype if necessary
+ 
+-        copy_X : boolean, optional, default True
+-            If ``True``, X will be copied; else, it may be overwritten.
++        copy_X : boolean or None, optional, default None
++            If None, use the estimator's copy_X parameter set at initialization. If True, X will be copied; else, it may be overwritten.
+ 
+         Returns
+         -------
+@@ -1500,8 +1500,12 @@ class LassoLarsIC(LassoLars):
+         """
+         X, y = check_X_y(X, y, y_numeric=True)
+ 
++        if copy_X is None:
++            copy_X = self.copy_X
++
++
+         X, y, Xmean, ymean, Xstd = LinearModel._preprocess_data(
+-            X, y, self.fit_intercept, self.normalize, self.copy_X)
++            X, y, self.fit_intercept, self.normalize, copy_X)
+         max_iter = self.max_iter
+ 
+         Gram = self.precompute

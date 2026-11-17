@@ -1,0 +1,150 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..7503a15d88 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -126,12 +126,34 @@ class JSONField(CheckFieldDefaultMixin, Field):
+         )
+ 
+ 
+-def compile_json_path(key_transforms, include_root=True):
++def compile_json_path(key_transforms, include_root=True, force_last_key_string=False):
++    """
++    Build a JSON path string from a sequence of key transforms.
++    - By default, integer-like segments are treated as array indices: [N].
++    - Non-integer segments are treated as object member names: ."key" (quoted).
++    - If force_last_key_string is True, the last segment is always treated as an
++      object member name when it's a string, even if it looks like an integer.
++      This is required for has_key/has_keys/has_any_keys lookups on backends
++      that use JSON path expressions (SQLite, MySQL, Oracle), where numeric-like
++      keys must not be interpreted as array indices.
++    """
+     path = ["$"] if include_root else []
+-    for key_transform in key_transforms:
+-        try:
+-            num = int(key_transform)
+-        except ValueError:  # non-integer
++    last_index = len(key_transforms) - 1
++    for idx, key_transform in enumerate(key_transforms):
++        # Determine whether to force string-member semantics for the last segment.
++        force_string = (
++            force_last_key_string
++            and idx == last_index
++            and isinstance(key_transform, str)
++        )
++        if not force_string:
++            try:
++                num = int(key_transform)
++            except (ValueError, TypeError):  # non-integer or non-castable
++                num = None
++        else:
++            num = None
++        if num is None:
+             path.append(".")
+             path.append(json.dumps(key_transform))
+         else:
+@@ -197,7 +219,11 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 "%s%s"
+                 % (
+                     lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
++                    compile_json_path(
++                        rhs_key_transforms,
++                        include_root=False,
++                        force_last_key_string=True,
++                    ),
+                 )
+             )
+         # Add condition for each key.
+@@ -401,7 +427,7 @@ class KeyTransformIsNull(lookups.IsNull):
+         template = "JSON_TYPE(%s, %%s) IS NULL"
+         if not self.rhs:
+             template = "JSON_TYPE(%s, %%s) IS NOT NULL"
+-        return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
++        return HasKey(self.lhs.lhs, (int(self.lhs.key_name) if isinstance(self.lhs.key_name, str) and self.lhs.key_name.isdigit() else self.lhs.key_name)).as_sql(
+             compiler,
+             connection,
+             template=template,
+@@ -466,7 +492,7 @@ class KeyTransformExact(JSONExact):
+         rhs, rhs_params = super().process_rhs(compiler, connection)
+         if rhs_params == ["null"]:
+             # Field has key and it's NULL.
+-            has_key_expr = HasKey(self.lhs.lhs, self.lhs.key_name)
++            has_key_expr = HasKey(self.lhs.lhs, (int(self.lhs.key_name) if isinstance(self.lhs.key_name, str) and self.lhs.key_name.isdigit() else self.lhs.key_name))
+             has_key_sql, has_key_params = has_key_expr.as_oracle(compiler, connection)
+             is_null_expr = self.lhs.get_lookup("isnull")(self.lhs, True)
+             is_null_sql, is_null_params = is_null_expr.as_sql(compiler, connection)
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..bc6a3d9d67
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,62 @@
++ADDED INSIGHTS UPDATE (2026-11-12):
++- After forcing RHS keys in HasKeyLookup JSON paths to be strings, several JSONField tests failed.
++- Root cause: KeyTransformIsNull uses HasKey internally (e.g., for value__d__0__isnull), where numeric RHS like "0" must be treated as array indices, not object keys.
++- Resolution: When KeyTransformIsNull calls HasKey, coerce numeric key_name strings to int so HasKeyLookup can distinguish indices (ints) from object keys (str). This keeps array semantics intact while still fixing numeric string object key lookups for has_key/has_keys/has_any_keys.
++
++ADDED INSIGHTS (2026-11-12):
++- Root cause located in django/db/models/fields/json.py:
++  - compile_json_path(key_transforms, include_root=True) currently casts integer-like segments to array indices.
++  - This breaks has_key/has_keys/has_any_keys RHS when keys are numeric strings (e.g., "1111") on SQLite/MySQL/Oracle.
++- HasKeyLookup.as_sql() builds RHS JSON paths using compile_json_path(..., include_root=False), causing numeric-like keys to be misinterpreted as array indices.
++- PostgreSQL is unaffected because has_* lookups use native operators and bypass JSON path building.
++- Proposed fix:
++  - Extend compile_json_path() to allow forcing string-member semantics (quoting) for RHS segments that look numeric.
++  - Update HasKey/HasKeys/HasAnyKeys (non-PostgreSQL paths) to use this mode for RHS keys so '$[1111]' becomes '$."1111"'.
++
++has_key, has_keys, and has_any_keys JSONField() lookups don't handle numeric keys on SQLite, MySQL, and Oracle.
++Description
++	 
++		(last modified by TheTerrasque)
++	 
++Problem
++When using models.​JSONField() ​has_key lookup with numerical keys on SQLite database it fails to find the keys.
++Versions:
++Django: 4.0.3
++Python: 3.9.6 (tags/v3.9.6:db3ff76, Jun 28 2021, 15:26:21) [MSC v.1929 64 bit (AMD64)] on win32
++sqlite3.version: '2.6.0'
++sqlite3.sqlite_version: '3.35.5'
++Example:
++Database
++DATABASES = {
++	'default': {
++		'ENGINE': 'django.db.backends.sqlite3',
++		'NAME': 'db.sqlite3',
++	}
++}
++Model
++class JsonFieldHasKeyTest(models.Model):
++	data = models.JSONField()
++Test
++from django.test import TestCase
++from .models import JsonFieldHasKeyTest
++class JsonFieldHasKeyTestCase(TestCase):
++	def setUp(self) -> None:
++		test = JsonFieldHasKeyTest(data={'foo': 'bar'})
++		test2 = JsonFieldHasKeyTest(data={'1111': 'bar'})
++		test.save()
++		test2.save()
++	def test_json_field_has_key(self):
++		c1 = JsonFieldHasKeyTest.objects.filter(data__has_key='foo').count()
++		c2 = JsonFieldHasKeyTest.objects.filter(data__has_key='1111').count()
++		self.assertEqual(c1, 1, Should have found 1 entry with key foo)
++		self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++Result
++FAIL: test_json_field_has_key (markers.tests.JsonFieldHasKeyTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++ File H:FilesProjectsElectacoWebserviceelecservemarkerstests.py, line 16, in test_json_field_has_key	 
++	self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++AssertionError: 0 != 1 : Should have found 1 entry with key '1111'
++Additional info
++This has been tested on SQLite and Postgresql backend, it works on postgresql but fails on sqlite.
++

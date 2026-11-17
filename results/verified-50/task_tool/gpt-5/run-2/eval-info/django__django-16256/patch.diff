@@ -1,0 +1,362 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index c5d87f647a..a943cfdb6a 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -63,6 +63,7 @@ and two directions (forward and reverse) for a total of six combinations.
+    ``ReverseManyToManyDescriptor``, use ``ManyToManyDescriptor`` instead.
+ """
+ 
++from asgiref.sync import sync_to_async
+ from django.core.exceptions import FieldError
+ from django.db import (
+     DEFAULT_DB_ALIAS,
+@@ -793,6 +794,12 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+         create.alters_data = True
+ 
++
++        async def acreate(self, **kwargs):
++            return await sync_to_async(self.create)(**kwargs)
++
++        acreate.alters_data = True
++
+         def get_or_create(self, **kwargs):
+             self._check_fk_val()
+             kwargs[self.field.name] = self.instance
+@@ -801,6 +808,12 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+         get_or_create.alters_data = True
+ 
++
++        async def aget_or_create(self, **kwargs):
++            return await sync_to_async(self.get_or_create)(**kwargs)
++
++        aget_or_create.alters_data = True
++
+         def update_or_create(self, **kwargs):
+             self._check_fk_val()
+             kwargs[self.field.name] = self.instance
+@@ -809,6 +822,12 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+         update_or_create.alters_data = True
+ 
++
++        async def aupdate_or_create(self, **kwargs):
++            return await sync_to_async(self.update_or_create)(**kwargs)
++
++        aupdate_or_create.alters_data = True
++
+         # remove() and clear() are only provided if the ForeignKey can have a
+         # value of null.
+         if rel.field.null:
+@@ -1191,6 +1210,12 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+ 
+         create.alters_data = True
+ 
++
++        async def acreate(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.create)(through_defaults=through_defaults, **kwargs)
++
++        acreate.alters_data = True
++
+         def get_or_create(self, *, through_defaults=None, **kwargs):
+             db = router.db_for_write(self.instance.__class__, instance=self.instance)
+             obj, created = super(ManyRelatedManager, self.db_manager(db)).get_or_create(
+@@ -1204,6 +1229,12 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+ 
+         get_or_create.alters_data = True
+ 
++
++        async def aget_or_create(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.get_or_create)(through_defaults=through_defaults, **kwargs)
++
++        aget_or_create.alters_data = True
++
+         def update_or_create(self, *, through_defaults=None, **kwargs):
+             db = router.db_for_write(self.instance.__class__, instance=self.instance)
+             obj, created = super(
+@@ -1217,6 +1248,12 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+ 
+         update_or_create.alters_data = True
+ 
++
++        async def aupdate_or_create(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.update_or_create)(through_defaults=through_defaults, **kwargs)
++
++        aupdate_or_create.alters_data = True
++
+         def _get_target_ids(self, target_field_name, objs):
+             """
+             Return the set of ids of `objs` that the target field references.
+diff --git a/scripts/apply_patch_related_async.py b/scripts/apply_patch_related_async.py
+new file mode 100644
+index 0000000000..da5a360f12
+--- /dev/null
++++ b/scripts/apply_patch_related_async.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++import re, sys, pathlib
++
++path = pathlib.Path("django/db/models/fields/related_descriptors.py")
++s = path.read_text()
++
++changed = False
++
++# 1) Ensure import of sync_to_async
++if "from asgiref.sync import sync_to_async" not in s:
++    anchor = "from django.core.exceptions import FieldError"
++    if anchor in s:
++        s = s.replace(anchor, "from asgiref.sync import sync_to_async\n" + anchor, 1)
++        changed = True
++    else:
++        m = re.search(r'"""\s*\n', s)
++        if m:
++            idx = m.end()
++            s = s[:idx] + "from asgiref.sync import sync_to_async\n" + s[idx:]
++            changed = True
++
++def insert_after_last(haystack, token, insert_text, start=0, end=None):
++    end = len(haystack) if end is None else end
++    pos = haystack.rfind(token, start, end)
++    if pos == -1:
++        return haystack, False
++    insert_at = pos + len(token)
++    return haystack[:insert_at] + insert_text + haystack[insert_at:], True
++
++rev_cls = "class RelatedManager(superclass, AltersData):"
++m2m_cls = "class ManyRelatedManager(superclass, AltersData):"
++rev_start = s.find(rev_cls)
++m2m_start = s.find(m2m_cls)
++
++# 2) Reverse many-to-one (RelatedManager)
++if rev_start != -1:
++    limit = m2m_start if m2m_start != -1 else len(s)
++    rev_block = s[rev_start:limit]
++    if "async def acreate(self, **kwargs):" not in rev_block:
++        insert_text = (
++            "\n\n        async def acreate(self, **kwargs):\n"
++            "            return await sync_to_async(self.create)(**kwargs)\n\n"
++            "        acreate.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        create.alters_data = True\n", insert_text, rev_start, limit)
++        changed = changed or ok
++        m2m_start = s.find(m2m_cls)
++        limit = m2m_start if m2m_start != -1 else len(s)
++        rev_block = s[rev_start:limit]
++    if "async def aget_or_create(self, **kwargs):" not in rev_block:
++        insert_text = (
++            "\n\n        async def aget_or_create(self, **kwargs):\n"
++            "            return await sync_to_async(self.get_or_create)(**kwargs)\n\n"
++            "        aget_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        get_or_create.alters_data = True\n", insert_text, rev_start, limit)
++        changed = changed or ok
++        m2m_start = s.find(m2m_cls)
++        limit = m2m_start if m2m_start != -1 else len(s)
++        rev_block = s[rev_start:limit]
++    if "async def aupdate_or_create(self, **kwargs):" not in rev_block:
++        insert_text = (
++            "\n\n        async def aupdate_or_create(self, **kwargs):\n"
++            "            return await sync_to_async(self.update_or_create)(**kwargs)\n\n"
++            "        aupdate_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        update_or_create.alters_data = True\n", insert_text, rev_start, limit)
++        changed = changed or ok
++
++# 3) Many-to-many (ManyRelatedManager)
++m2m_start = s.find(m2m_cls)
++if m2m_start != -1:
++    tail = s[m2m_start:]
++    if "async def acreate(self, *, through_defaults=None, **kwargs):" not in tail:
++        insert_text = (
++            "\n\n        async def acreate(self, *, through_defaults=None, **kwargs):\n"
++            "            return await sync_to_async(self.create)(through_defaults=through_defaults, **kwargs)\n\n"
++            "        acreate.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        create.alters_data = True\n", insert_text, m2m_start)
++        changed = changed or ok
++        tail = s[m2m_start:]
++    if "async def aget_or_create(self, *, through_defaults=None, **kwargs):" not in tail:
++        insert_text = (
++            "\n\n        async def aget_or_create(self, *, through_defaults=None, **kwargs):\n"
++            "            return await sync_to_async(self.get_or_create)(through_defaults=through_defaults, **kwargs)\n\n"
++            "        aget_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        get_or_create.alters_data = True\n", insert_text, m2m_start)
++        changed = changed or ok
++        tail = s[m2m_start:]
++    if "async def aupdate_or_create(self, *, through_defaults=None, **kwargs):" not in tail:
++        insert_text = (
++            "\n\n        async def aupdate_or_create(self, *, through_defaults=None, **kwargs):\n"
++            "            return await sync_to_async(self.update_or_create)(through_defaults=through_defaults, **kwargs)\n\n"
++            "        aupdate_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        update_or_create.alters_data = True\n", insert_text, m2m_start)
++        changed = changed or ok
++
++if changed:
++    path.write_text(s)
++    print("Patched:", path)
++else:
++    print("No changes needed.")
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..b017de6577
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,148 @@
++Task: Fix async methods on related managers in Django.
++
++Problem Summary:
++- Async-compatible interface was added to QuerySet, which unintentionally exposed async methods (acreate, aget_or_create, aupdate_or_create) on related managers.
++- These async methods currently resolve to QuerySet implementations instead of the related manager methods, causing incorrect behavior when manager methods override/augment behavior.
++- We must provide proper async versions on related managers that call the manager’s own create(), get_or_create(), and update_or_create().
++
++Repository Observations:
++- This is the Django codebase.
++- The target implementations for related managers are in:
++  django/db/models/fields/related_descriptors.py
++- We will need to import:
++  from asgiref.sync import sync_to_async
++- We should implement async wrappers:
++  - acreate() -> await sync_to_async(self.create)(**kwargs)
++  - aget_or_create() -> await sync_to_async(self.get_or_create)(**kwargs)
++  - aupdate_or_create() -> await sync_to_async(self.update_or_create)(**kwargs)
++- These should be added for both directions where related managers are defined:
++  - Reverse many-to-one manager
++  - Forward many-to-many manager
++- Total combinations: 3 methods x 2 directions = 6.
++- Ensure .alters_data flags mirror their sync counterparts for these async methods.
++
++Next steps:
++- Inspect django/db/models/fields/related_descriptors.py to locate create_reverse_many_to_one_manager() and create_forward_many_to_many_manager() (and any other relevant manager factories).
++- Add proper async wrappers that call the related manager methods.
++- Run tests or create a minimal reproduction to verify behavior.
++
++New insights (from inspecting related_descriptors.py):
++- reverse many-to-one manager class: RelatedManager(superclass, AltersData).
++- forward/reverse many-to-many manager class: ManyRelatedManager(superclass, AltersData).
++- Neither class currently defines async wrappers acreate/aget_or_create/aupdate_or_create.
++- Reverse m2o signatures: create(self, **kwargs), get_or_create(self, **kwargs), update_or_create(self, **kwargs).
++- Many-to-many signatures: create(self, *, through_defaults=None, **kwargs); get_or_create(self, *, through_defaults=None, **kwargs); update_or_create(self, *, through_defaults=None, **kwargs).
++- Async wrappers must mirror these signatures, call the manager methods via sync_to_async, and set alters_data = True.
++EOF && mkdir -p scripts && cat > scripts/apply_patch_related_async.py <<'PY'
++#!/usr/bin/env python3
++import re, pathlib
++
++path = pathlib.Path("django/db/models/fields/related_descriptors.py")
++s = path.read_text()
++
++changed = False
++
++# 1) Ensure import of sync_to_async
++if "from asgiref.sync import sync_to_async" not in s:
++    anchor = "from django.core.exceptions import FieldError"
++    if anchor in s:
++        s = s.replace(anchor, "from asgiref.sync import sync_to_async\n" + anchor, 1)
++        changed = True
++    else:
++        m = re.search(r'"""\s*\n', s)
++        if m:
++            idx = m.end()
++            s = s[:idx] + "from asgiref.sync import sync_to_async\n" + s[idx:]
++            changed = True
++
++def insert_after_last(haystack, token, insert_text, start=0, end=None):
++    end = len(haystack) if end is None else end
++    pos = haystack.rfind(token, start, end)
++    if pos == -1:
++        return haystack, False
++    insert_at = pos + len(token)
++    return haystack[:insert_at] + insert_text + haystack[insert_at:], True
++
++rev_cls = "class RelatedManager(superclass, AltersData):"
++m2m_cls = "class ManyRelatedManager(superclass, AltersData):"
++rev_start = s.find(rev_cls)
++m2m_start = s.find(m2m_cls)
++
++# 2) Reverse many-to-one (RelatedManager)
++if rev_start != -1:
++    limit = m2m_start if m2m_start != -1 else len(s)
++    rev_block = s[rev_start:limit]
++    if "async def acreate(self, **kwargs):" not in rev_block:
++        insert_text = (
++            "\n\n        async def acreate(self, **kwargs):\n"
++            "            return await sync_to_async(self.create)(**kwargs)\n\n"
++            "        acreate.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        create.alters_data = True\n", insert_text, rev_start, limit)
++        changed = changed or ok
++        m2m_start = s.find(m2m_cls)
++        limit = m2m_start if m2m_start != -1 else len(s)
++        rev_block = s[rev_start:limit]
++    if "async def aget_or_create(self, **kwargs):" not in rev_block:
++        insert_text = (
++            "\n\n        async def aget_or_create(self, **kwargs):\n"
++            "            return await sync_to_async(self.get_or_create)(**kwargs)\n\n"
++            "        aget_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        get_or_create.alters_data = True\n", insert_text, rev_start, limit)
++        changed = changed or ok
++        m2m_start = s.find(m2m_cls)
++        limit = m2m_start if m2m_start != -1 else len(s)
++        rev_block = s[rev_start:limit]
++    if "async def aupdate_or_create(self, **kwargs):" not in rev_block:
++        insert_text = (
++            "\n\n        async def aupdate_or_create(self, **kwargs):\n"
++            "            return await sync_to_async(self.update_or_create)(**kwargs)\n\n"
++            "        aupdate_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        update_or_create.alters_data = True\n", insert_text, rev_start, limit)
++        changed = changed or ok
++
++# 3) Many-to-many (ManyRelatedManager)
++m2m_start = s.find(m2m_cls)
++if m2m_start != -1:
++    tail = s[m2m_start:]
++    if "async def acreate(self, *, through_defaults=None, **kwargs):" not in tail:
++        insert_text = (
++            "\n\n        async def acreate(self, *, through_defaults=None, **kwargs):\n"
++            "            return await sync_to_async(self.create)(through_defaults=through_defaults, **kwargs)\n\n"
++            "        acreate.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        create.alters_data = True\n", insert_text, m2m_start)
++        changed = changed or ok
++        tail = s[m2m_start:]
++    if "async def aget_or_create(self, *, through_defaults=None, **kwargs):" not in tail:
++        insert_text = (
++            "\n\n        async def aget_or_create(self, *, through_defaults=None, **kwargs):\n"
++            "            return await sync_to_async(self.get_or_create)(through_defaults=through_defaults, **kwargs)\n\n"
++            "        aget_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        get_or_create.alters_data = True\n", insert_text, m2m_start)
++        changed = changed or ok
++        tail = s[m2m_start:]
++    if "async def aupdate_or_create(self, *, through_defaults=None, **kwargs):" not in tail:
++        insert_text = (
++            "\n\n        async def aupdate_or_create(self, *, through_defaults=None, **kwargs):\n"
++            "            return await sync_to_async(self.update_or_create)(through_defaults=through_defaults, **kwargs)\n\n"
++            "        aupdate_or_create.alters_data = True\n"
++        )
++        s, ok = insert_after_last(s, "\n        update_or_create.alters_data = True\n", insert_text, m2m_start)
++        changed = changed or ok
++
++if changed:
++    path.write_text(s)
++    print("Patched:", path)
++else:
++    print("No changes needed.")
++PY
++&& python3 scripts/apply_patch_related_async.py
++&& python3 -m py_compile django/db/models/fields/related_descriptors.py
++Adjustment note:
++- Initial automated patch attempt did not inject async methods or import due to exact token matching issues. Updating the tool to target class ranges and insert after alters_data markers robustly.
++Adjustment note: Initial automated patch attempt did not modify related_descriptors.py as expected. Implementing a more robust in-place patch now.
++Applied patch: added async acreate/aget_or_create/aupdate_or_create to RelatedManager and ManyRelatedManager, and ensured sync_to_async import. Verifying presence.

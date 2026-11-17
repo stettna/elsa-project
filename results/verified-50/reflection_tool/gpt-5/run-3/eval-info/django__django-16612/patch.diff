@@ -1,0 +1,180 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..2d457c7fff
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,11 @@
++AdminSite.catch_all_view() drops query string in redirects
++Description
++	
++#31747 introduced AdminSite.catch_all_view(). However, in the process it broke the ability to redirect with settings.APPEND_SLASH = True when there are query strings.
++Provided URL: ​http://127.0.0.1:8000/admin/auth/foo?id=123
++Expected redirect: ​http://127.0.0.1:8000/admin/auth/foo/?id=123
++Actual redirect: ​http://127.0.0.1:8000/admin/auth/foo/
++This seems to be because the redirect in question does not include the query strings (such as via request.META['QUERY_STRING']):
++return HttpResponsePermanentRedirect(%s/ % request.path)
++​https://github.com/django/django/blob/c57ff9ba5e251cd4c2761105a6046662c08f951e/django/contrib/admin/sites.py#L456
++
+diff --git a/django/contrib/admin/sites.py b/django/contrib/admin/sites.py
+index 61be31d890..0d709ee672 100644
+--- a/django/contrib/admin/sites.py
++++ b/django/contrib/admin/sites.py
+@@ -453,7 +453,12 @@ class AdminSite:
+                 pass
+             else:
+                 if getattr(match.func, "should_append_slash", True):
+-                    return HttpResponsePermanentRedirect("%s/" % request.path)
++                    qs = request.META.get("QUERY_STRING")
++                    if qs:
++                        new_url = "%s/?%s" % (request.path, qs)
++                    else:
++                        new_url = "%s/" % request.path
++                    return HttpResponsePermanentRedirect(new_url)
+         raise Http404
+ 
+     def _build_app_dict(self, request, label=None):
+diff --git a/file_edit.py b/file_edit.py
+new file mode 100644
+index 0000000000..5a6f1558ca
+--- /dev/null
++++ b/file_edit.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++import sys, re
++
++USAGE = """
++file_edit.py commands:
++  show <path> [start_line] [end_line]
++  replace <path> <old> <new> [count]
++  rreplace <path> <regex> <new> [flags(i)] [count]
++  insert_after <path> <pattern> <text>
++  rinsert_after <path> <regex> <text>
++  insert_before <path> <pattern> <text>
++  rinsert_before <path> <regex> <text>
++
++Notes:
++- For insert_* commands, <text> may contain literal \\n which will be interpreted as newlines.
++- r* variants treat pattern as regex. Flags: i for IGNORECASE (only for rreplace).
++"""
++
++def read(path):
++    with open(path, 'r', encoding='utf-8') as f:
++        return f.read()
++
++def write(path, content):
++    with open(path, 'w', encoding='utf-8') as f:
++        f.write(content)
++
++def show(args):
++    if len(args) < 1:
++        print("show requires <path> [start] [end]", file=sys.stderr); sys.exit(2)
++    path = args[0]
++    start = int(args[1]) if len(args) > 1 else 1
++    end = int(args[2]) if len(args) > 2 else None
++    with open(path, 'r', encoding='utf-8') as f:
++        lines = f.readlines()
++    if end is None: end = len(lines)
++    for i in range(start, end + 1):
++        if 1 <= i <= len(lines):
++            sys.stdout.write(f"{i:6d}: {lines[i-1]}")
++    if len(lines) and not lines[-1].endswith('\\n'):
++        sys.stdout.write("\\n")
++
++def do_replace(args, regex=False):
++    if len(args) < 3:
++        print("replace requires <path> <old/regex> <new> [flags(i)] [count]", file=sys.stderr); sys.exit(2)
++    path, old, new = args[0], args[1], args[2]
++    new = new.encode('utf-8').decode('unicode_escape')
++    flags = args[3] if regex and len(args) > 3 else ""
++    count = int(args[4]) if (regex and len(args) > 4) or (not regex and len(args) > 3) else 0
++    content = read(path)
++    if not regex:
++        occurrences = content.count(old)
++        limit = count if count > 0 else occurrences
++        new_content = content.replace(old, new, limit)
++        print(f"Replaced {min(limit, occurrences)} occurrence(s).")
++    else:
++        fl = 0
++        if 'i' in flags: fl |= re.IGNORECASE
++        new_content, n = re.subn(old, new, content, count=count if count>0 else 0, flags=fl)
++        print(f"Replaced {n} occurrence(s) with regex.")
++    if new_content != content:
++        write(path, new_content)
++
++def do_insert(args, before=False, regex=False):
++    if len(args) < 3:
++        print("insert requires <path> <pattern/regex> <text>", file=sys.stderr); sys.exit(2)
++    path, pattern, text = args[0], args[1], args[2]
++    text = text.encode('utf-8').decode('unicode_escape')  # interpret \n, \t, etc.
++    with open(path, 'r', encoding='utf-8') as f:
++        lines = f.readlines()
++    idx = None
++    if regex:
++        r = re.compile(pattern)
++        for i, line in enumerate(lines):
++            if r.search(line):
++                idx = i
++                break
++    else:
++        for i, line in enumerate(lines):
++            if pattern in line:
++                idx = i
++                break
++    if idx is None:
++        print("Pattern not found.", file=sys.stderr); sys.exit(2)
++    insert_at = idx if before else idx + 1
++    text_lines = text.splitlines(True)
++    lines[insert_at:insert_at] = text_lines
++    with open(path, 'w', encoding='utf-8') as f:
++        f.writelines(lines)
++    where = "before" if before else "after"
++    print(f"Inserted {len(text_lines)} line(s) {where} line {idx+1}.")
++
++def main():
++    if len(sys.argv) < 2:
++        print(USAGE.strip()); sys.exit(1)
++    cmd, *args = sys.argv[1:]
++    if cmd == "show":
++        show(args)
++    elif cmd == "replace":
++        do_replace(args, regex=False)
++    elif cmd == "rreplace":
++        do_replace(args, regex=True)
++    elif cmd == "insert_after":
++        do_insert(args, before=False, regex=False)
++    elif cmd == "rinsert_after":
++        do_insert(args, before=False, regex=True)
++    elif cmd == "insert_before":
++        do_insert(args, before=True, regex=False)
++    elif cmd == "rinsert_before":
++        do_insert(args, before=True, regex=True)
++    else:
++        print("Unknown command.\\n" + USAGE.strip(), file=sys.stderr)
++        sys.exit(2)
++
++if __name__ == "__main__":
++    main()
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..74b3436b64
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,18 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++- Before modifying code, locate the exact function and confirm behavior with small reproduction steps.
++- For redirect issues, preserve query strings. Prefer using request.get_full_path() or append request.META['QUERY_STRING'] correctly when adding a trailing slash.
++- When constructing redirect targets, ensure only the path (before '?') has the slash appended, then re-attach the original query string (if any).
++- Validate edge cases: no query string, existing trailing slash, empty query, Unicode/encoded characters.
++- After changes, run focused tests for admin site redirects and settings.APPEND_SLASH behavior.
++- Use a file-editing tool to make minimal, reviewable changes and show context around changes.
++- Locate the exact function (AdminSite.catch_all_view in django/contrib/admin/sites.py) and confirm how it builds redirects.
++- When APPEND_SLASH redirects, preserve the original query string:
++  - Extract the query via request.META.get('QUERY_STRING', ''), or consider using request.get_full_path() to capture current query.
++  - Only modify the path component (append '/' if missing) and then re-attach the query string with '?' + query if present.
++- Ensure the redirect target uses the correct path normalization and does not double-encode or drop Unicode/encoded characters.
++- Edge cases to validate: no query string; existing trailing slash; empty query (? only); multiple params; encoded characters; unusual paths.
++- Prefer minimal, localized code changes consistent with Django style, and use HttpResponsePermanentRedirect with full URL including query when redirecting.
++- After changes, run focused tests around admin catch-all routing and APPEND_SLASH behavior to confirm expected vs actual redirects.

@@ -1,0 +1,225 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..71976c1afb
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,10 @@
++model_to_dict() should return an empty dict for an empty list of fields.
++Description
++	
++Been called as model_to_dict(instance, fields=[]) function should return empty dict, because no fields were requested. But it returns all fields
++The problem point is
++if fields and f.name not in fields:
++which should be
++if fields is not None and f.name not in fields:
++PR: ​https://github.com/django/django/pull/11150/files
++
+diff --git a/django/forms/models.py b/django/forms/models.py
+index d157c291ef..5edbbd376f 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -83,7 +83,7 @@ def model_to_dict(instance, fields=None, exclude=None):
+     for f in chain(opts.concrete_fields, opts.private_fields, opts.many_to_many):
+         if not getattr(f, 'editable', False):
+             continue
+-        if fields and f.name not in fields:
++        if fields is not None and f.name not in fields:
+             continue
+         if exclude and f.name in exclude:
+             continue
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..25ce7236d0
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,13 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++[2026-11-15] Notes for this task:
++- Beware of semantics: fields=None vs fields=[] must behave differently. When fields is an empty list, filtering should still apply and return an empty result where appropriate.
++- Add a lightweight local reproducer (no DB) to simulate _meta fields and validate model_to_dict() behavior for fields=None, fields=[], and specific lists.
++- Create a simple file edit tool (Python) to make precise, reviewable code changes across files (e.g., safe find/replace or line edits).
++- After implementing the fix, re-run the reproducer to confirm correctness. Optionally scan codebase for similar patterns ("if fields and ...") to avoid regressions.
++[2026-11-15] Decision:
++- Apply the None-vs-empty-list fix only within model_to_dict() initially.
++- Leave the similar condition in _save_m2m unchanged unless tests or a reproducer indicate a need to adjust it for consistency.
++- Next steps: create a quick reproducer to verify model_to_dict(instance, fields=[]) returns {} and that fields=None continues to include all editable fields.
+diff --git a/scripts/edit_file.py b/scripts/edit_file.py
+new file mode 100644
+index 0000000000..d40fa77e06
+--- /dev/null
++++ b/scripts/edit_file.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++import argparse
++import sys
++from pathlib import Path
++
++def replace_in_range(content, find, replace, start_line=None, end_line=None):
++    """
++    Replace occurrences only within the specified 1-based inclusive line range.
++    Returns (new_content, num_replaced).
++    """
++    lines = content.splitlines(keepends=True)
++    total_lines = len(lines)
++    # Convert to 0-based indices
++    if start_line is None:
++        start_idx = 0
++    else:
++        if start_line < 1 or start_line > total_lines + 1:
++            raise ValueError(f"start-line {start_line} out of bounds (1..{total_lines})")
++        start_idx = start_line - 1
++    if end_line is None:
++        end_idx = total_lines
++    else:
++        if end_line < 1 or end_line < start_line or end_line > total_lines:
++            raise ValueError(f"end-line {end_line} out of bounds or before start-line (1..{total_lines})")
++        end_idx = end_line
++
++    prefix = "".join(lines[:start_idx])
++    target = "".join(lines[start_idx:end_idx])
++    suffix = "".join(lines[end_idx:])
++
++    occurrences = target.count(find)
++    new_target = target.replace(find, replace)
++
++    new_content = prefix + new_target + suffix
++    return new_content, occurrences
++
++def main():
++    p = argparse.ArgumentParser(description="Safe in-file text replacement with occurrence checks and optional line range.")
++    p.add_argument("--file", required=True, help="Path to file to edit")
++    p.add_argument("--find", required=True, help="Exact text to find")
++    p.add_argument("--replace", required=True, help="Replacement text")
++    p.add_argument("--count", type=int, default=None, help="Expected number of replacements (validate)")
++    p.add_argument("--dry-run", action="store_true", help="Show what would change but don't write")
++    p.add_argument("--start-line", type=int, default=None, help="1-based start line for constrained replacement (inclusive)")
++    p.add_argument("--end-line", type=int, default=None, help="1-based end line for constrained replacement (inclusive)")
++    args = p.parse_args()
++
++    path = Path(args.file)
++    if not path.exists():
++        print(f"[edit_file] ERROR: File not found: {path}", file=sys.stderr)
++        sys.exit(2)
++
++    try:
++        original = path.read_text(encoding="utf-8")
++    except Exception as e:
++        print(f"[edit_file] ERROR: Failed to read {path}: {e}", file=sys.stderr)
++        sys.exit(2)
++
++    try:
++        new_content, num_replaced = replace_in_range(
++            original, args.find, args.replace,
++            start_line=args.start_line, end_line=args.end_line
++        )
++    except Exception as e:
++        print(f"[edit_file] ERROR: {e}", file=sys.stderr)
++        sys.exit(2)
++
++    # Report found occurrences
++    print(f"[edit_file] Replacements in specified range: {num_replaced}")
++    if args.count is not None and num_replaced != args.count:
++        print(f"[edit_file] ERROR: Expected to replace {args.count} occurrence(s) but found {num_replaced}. Aborting.", file=sys.stderr)
++        sys.exit(3)
++
++    if original == new_content:
++        print("[edit_file] No changes made (content identical).")
++        sys.exit(0)
++
++    # Show a concise preview
++    preview_limit = 500
++    print("[edit_file] Preview of change (truncated):")
++    print(f"  - find:    '{args.find[:preview_limit]}'")
++    print(f"  + replace: '{args.replace[:preview_limit]}'")
++
++    if args.dry_run:
++        print("[edit_file] Dry run; not writing changes.")
++        sys.exit(0)
++
++    try:
++        path.write_text(new_content, encoding="utf-8")
++    except Exception as e:
++        print(f"[edit_file] ERROR: Failed to write {path}: {e}", file=sys.stderr)
++        sys.exit(2)
++
++    print(f"[edit_file] Wrote changes to {path}. Replacements applied: {num_replaced}")
++    sys.exit(0)
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/repro_model_to_dict.py b/scripts/repro_model_to_dict.py
+new file mode 100644
+index 0000000000..9dfb2dcfc4
+--- /dev/null
++++ b/scripts/repro_model_to_dict.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++import sys
++sys.path.insert(0, ".")
++from django.forms.models import model_to_dict
++
++class FieldStub:
++    def __init__(self, name, editable=True):
++        self.name = name
++        self.editable = editable
++    def value_from_object(self, instance):
++        return getattr(instance, self.name, None)
++
++class MetaStub:
++    def __init__(self, fields_concrete, fields_private, fields_m2m):
++        self.concrete_fields = fields_concrete
++        self.private_fields = fields_private
++        self.many_to_many = fields_m2m
++
++class InstanceStub:
++    def __init__(self, **kwargs):
++        for k, v in kwargs.items():
++            setattr(self, k, v)
++
++def assert_equal(actual, expected, msg):
++    if actual != expected:
++        print("FAIL:", msg)
++        print("  Expected:", expected)
++        print("  Actual:  ", actual)
++        sys.exit(1)
++
++def main():
++    # Define editable and non-editable fields
++    f_a = FieldStub("a", editable=True)
++    f_b = FieldStub("b", editable=True)
++    f_c = FieldStub("c", editable=False)  # non-editable, should be skipped
++    f_priv = FieldStub("priv", editable=True)
++    f_m2m = FieldStub("m2m", editable=True)
++
++    meta = MetaStub(
++        fields_concrete=[f_a, f_b, f_c],
++        fields_private=[f_priv],
++        fields_m2m=[f_m2m],
++    )
++
++    inst = InstanceStub(a=1, b=2, c=3, priv="p", m2m=[10, 20])
++    inst._meta = meta
++
++    # Case 1: fields=None -> include all editable fields
++    res1 = model_to_dict(inst)
++    assert_equal(res1, {"a": 1, "b": 2, "priv": "p", "m2m": [10, 20]}, "fields=None should include all editable fields")
++
++    # Case 2: fields=[] -> expect empty dict after fix
++    res2 = model_to_dict(inst, fields=[])
++    assert_equal(res2, {}, "fields=[] should return empty dict")
++
++    # Case 3: fields=['b','x'] -> include only 'b' (ignore unknown/nonexistent)
++    res3 = model_to_dict(inst, fields=["b", "x"])
++    assert_equal(res3, {"b": 2}, "fields=['b','x'] should include only 'b'")
++
++    # Case 4: fields=None, exclude=['b'] -> exclude b
++    res4 = model_to_dict(inst, exclude=["b"])
++    assert_equal(res4, {"a": 1, "priv": "p", "m2m": [10, 20]}, "exclude should remove specified fields when fields=None")
++
++    print("OK: model_to_dict behavior matches expectations after fix.")
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,130 @@
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 00000000..ccbc9846
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,9 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Remember to append concrete insights to task_description.txt after each discovery.
++- Consider creating a small Python edit tool for safer multi-file patches.
++- Verify where axis grid/margins are finalized (likely Plotter._finalize_figure) and how to detect nominal scale on x/y.
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..78775cc3 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -1274,6 +1274,21 @@ class Plotter:
+                 seed_values = self._get_subplot_data(var_df, var, view, share_state)
+                 view_scale = scale._setup(seed_values, prop, axis=axis_obj)
+                 set_scale_obj(view["ax"], axis, view_scale._matplotlib_scale)
++                # Nominal axis tagging for categorical-like rendering
++                try:
++                    from seaborn._core.scales import Nominal as _NominalScale
++                except Exception:
++                    _NominalScale = None
++                is_nominal_axis = bool(_NominalScale and isinstance(view_scale, _NominalScale))
++                view[f"_{axis}_nominal"] = is_nominal_axis
++                if is_nominal_axis:
++                    try:
++                        order = getattr(scale, 'order', None)
++                        cats = categorical_order(seed_values, order)
++                        view[f"_{axis}_n_cats"] = len(cats)
++                    except Exception:
++                        view[f"_{axis}_n_cats"] = None
++
+ 
+                 for layer, new_series in zip(layers, transformed_data):
+                     layer_df = layer["data"].frame
+@@ -1475,7 +1490,20 @@ class Plotter:
+ 
+                 axes_df = self._filter_subplot_data(df, view)
+ 
+-                with pd.option_context("mode.use_inf_as_null", True):
++                from contextlib import contextmanager
++                @contextmanager
++                def _sbnpd_inf_as_na_ctx():
++                    import pandas as _pd
++                    try:
++                        with _pd.option_context("mode.use_inf_as_null", True):
++                            yield
++                    except Exception:
++                        try:
++                            with _pd.option_context("mode.use_inf_as_na", True):
++                                yield
++                        except Exception:
++                            yield
++                with _sbnpd_inf_as_na_ctx():
+                     if keep_na:
+                         # The simpler thing to do would be x.dropna().reindex(x.index).
+                         # But that doesn't work with the way that the subset iteration
+@@ -1643,6 +1671,34 @@ class Plotter:
+                     if isinstance(b, str):
+                         hi = cast(float, hi) + 0.5
+                     ax.set(**{f"{axis}lim": (lo, hi)})
++                else:
++                    # Apply categorical-like behaviors for nominal axes
++                    if sub.get(f"_{axis}_nominal", False):
++                        # Remove margins along the nominal axis
++                        try:
++                            if axis == "x":
++                                ax.margins(x=0)
++                            else:
++                                ax.margins(y=0)
++                        except Exception:
++                            pass
++                        # Set +/-0.5 limits around the category extents
++                        n_cats = sub.get(f"_{axis}_n_cats")
++                        if isinstance(n_cats, int) and n_cats >= 1:
++                            lo, hi = -0.5, n_cats - 0.5
++                            ax.set(**{f"{axis}lim": (lo, hi)})
++                        # Hide gridlines on the nominal axis
++                        try:
++                            ax.grid(False, axis=axis)
++                        except Exception:
++                            pass
++                        # Invert the y-axis when it is nominal
++                        if axis == "y":
++                            try:
++                                ax.invert_yaxis()
++                            except Exception:
++                                pass
++
+ 
+         engine_default = None if p._target is not None else "tight"
+         layout_engine = p._layout_spec.get("engine", engine_default)
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 00000000..0cce8a78
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,26 @@
++Nominal scale should be drawn the same way as categorical scales
++Three distinctive things happen on the categorical axis in seaborn's categorical plots:
++
++1. The scale is drawn to +/- 0.5 from the first and last tick, rather than using the normal margin logic
++2. A grid is not shown, even when it otherwise would be with the active style
++3. If on the y axis, the axis is inverted
++
++It probably makes sense to have so.Nominal scales (including inferred ones) do this too. Some comments on implementation:
++
++1. This is actually trickier than you'd think; I may have posted an issue over in matplotlib about this at one point, or just discussed on their gitter. I believe the suggested approach is to add an invisible artist with sticky edges and set the margin to 0. Feels like a hack! I might have looked into setting the sticky edges _on the spine artist_ at one point?
++
++2. Probably straightforward to do in Plotter._finalize_figure. Always a good idea? How do we defer to the theme if the user wants to force a grid? Should the grid be something that is set in the scale object itself
++
++3. Probably straightforward to implement but I am not exactly sure where would be best.
++
++
++Insights:
++- seaborn code is in /testbed/seaborn
++- Will search for objects API and scale handling to modify Nominal behavior
++
++Insights Update:
++- Implemented objects-API Nominal axis behavior: +/-0.5 extents, no grid, invert y when nominal, and zero margins.
++- Tagging per-subplot nominal status and category counts during _setup_scales; applying in _finalize_figure when user limits are not set.
++
++Insights Update:
++- Added Nominal axis handling in objects API: +/-0.5 extents, no grid, invert y if nominal, remove margins. Tagged axes per subplot in _setup_scales and applied behavior in _finalize_figure when explicit limits are not provided.

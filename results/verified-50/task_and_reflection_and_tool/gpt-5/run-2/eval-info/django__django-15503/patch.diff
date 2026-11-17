@@ -1,0 +1,178 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..bf301f265b 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -172,7 +172,7 @@ class ContainedBy(PostgresOperatorLookup):
+ class HasKeyLookup(PostgresOperatorLookup):
+     logical_operator = None
+ 
+-    def as_sql(self, compiler, connection, template=None):
++    def as_sql(self, compiler, connection, template=None, force_object_keys=False):
+         # Process JSON path from the left-hand side.
+         if isinstance(self.lhs, KeyTransform):
+             lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
+@@ -191,15 +191,15 @@ class HasKeyLookup(PostgresOperatorLookup):
+         for key in rhs:
+             if isinstance(key, KeyTransform):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
++                path_suffix = compile_json_path(rhs_key_transforms, include_root=False)
+             else:
+-                rhs_key_transforms = [key]
+-            rhs_params.append(
+-                "%s%s"
+-                % (
+-                    lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
+-                )
+-            )
++                if force_object_keys:
++                    # Treat simple RHS keys as object properties (quoted), even if numeric-like.
++                    path_suffix = "." + json.dumps(str(key))
++                else:
++                    # Preserve default semantics (numeric strings -> array indices) for internal uses.
++                    path_suffix = compile_json_path([key], include_root=False)
++            rhs_params.append("%s%s" % (lhs_json_path, path_suffix))
+         # Add condition for each key.
+         if self.logical_operator:
+             sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
+@@ -237,6 +237,22 @@ class HasKey(HasKeyLookup):
+     postgres_operator = "?"
+     prepare_rhs = False
+ 
++    def as_mysql(self, compiler, connection):
++        return super().as_sql(
++            compiler, connection, template="JSON_CONTAINS_PATH(%s, 'one', %%s)", force_object_keys=True
++        )
++
++    def as_sqlite(self, compiler, connection):
++        return super().as_sql(
++            compiler, connection, template="JSON_TYPE(%s, %%s) IS NOT NULL", force_object_keys=True
++        )
++
++    def as_oracle(self, compiler, connection):
++        sql, params = super().as_sql(
++            compiler, connection, template="JSON_EXISTS(%s, '%%s')", force_object_keys=True
++        )
++        return sql % tuple(params), []
++
+ 
+ class HasKeys(HasKeyLookup):
+     lookup_name = "has_keys"
+@@ -245,6 +261,22 @@ class HasKeys(HasKeyLookup):
+ 
+     def get_prep_lookup(self):
+         return [str(item) for item in self.rhs]
++    def as_mysql(self, compiler, connection):
++        return super().as_sql(
++            compiler, connection, template="JSON_CONTAINS_PATH(%s, 'one', %%s)", force_object_keys=True
++        )
++
++    def as_sqlite(self, compiler, connection):
++        return super().as_sql(
++            compiler, connection, template="JSON_TYPE(%s, %%s) IS NOT NULL", force_object_keys=True
++        )
++
++    def as_oracle(self, compiler, connection):
++        sql, params = super().as_sql(
++            compiler, connection, template="JSON_EXISTS(%s, '%%s')", force_object_keys=True
++        )
++        return sql % tuple(params), []
++
+ 
+ 
+ class HasAnyKeys(HasKeys):
+@@ -253,6 +285,22 @@ class HasAnyKeys(HasKeys):
+     logical_operator = " OR "
+ 
+ 
++
++    def as_mysql(self, compiler, connection):
++        return super().as_sql(
++            compiler, connection, template="JSON_CONTAINS_PATH(%s, 'one', %%s)", force_object_keys=True
++        )
++
++    def as_sqlite(self, compiler, connection):
++        return super().as_sql(
++            compiler, connection, template="JSON_TYPE(%s, %%s) IS NOT NULL", force_object_keys=True
++        )
++
++    def as_oracle(self, compiler, connection):
++        sql, params = super().as_sql(
++            compiler, connection, template="JSON_EXISTS(%s, '%%s')", force_object_keys=True
++        )
++        return sql % tuple(params), []
+ class CaseInsensitiveMixin:
+     """
+     Mixin to allow case-insensitive comparison of JSON values on MySQL.
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..90fef7fe08
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,8 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++[Workflow note 2026-11-15]
++- When modifying shared lookup helpers, prefer adding optional flags and using targeted overrides in concrete lookups to avoid regressions in other features (e.g., KeyTransform isnull behavior).
++- After changes, validate both direct has_key/has_keys/has_any_keys behavior and related KeyTransform/isnull queries on SQLite.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..8f017c5c06
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,52 @@
++has_key, has_keys, and has_any_keys JSONField() lookups don't handle numeric keys on SQLite, MySQL, and Oracle.
++Description
++	 
++		(last modified by TheTerrasque)
++	 
++Problem
++When using models.​JSONField() ​has_key lookup with numerical keys on SQLite database it fails to find the keys.
++Versions:
++Django: 4.0.3
++Python: 3.9.6 (tags/v3.9.6:db3ff76, Jun 28 2021, 15:26:21) [MSC v.1929 64 bit (AMD64)] on win32
++sqlite3.version: '2.6.0'
++sqlite3.sqlite_version: '3.35.5'
++Example:
++Database
++DATABASES = {
++	'default': {
++		'ENGINE': 'django.db.backends.sqlite3',
++		'NAME': 'db.sqlite3',
++	}
++}
++Model
++class JsonFieldHasKeyTest(models.Model):
++	data = models.JSONField()
++Test
++from django.test import TestCase
++from .models import JsonFieldHasKeyTest
++class JsonFieldHasKeyTestCase(TestCase):
++	def setUp(self) -> None:
++		test = JsonFieldHasKeyTest(data={'foo': 'bar'})
++		test2 = JsonFieldHasKeyTest(data={'1111': 'bar'})
++		test.save()
++		test2.save()
++	def test_json_field_has_key(self):
++		c1 = JsonFieldHasKeyTest.objects.filter(data__has_key='foo').count()
++		c2 = JsonFieldHasKeyTest.objects.filter(data__has_key='1111').count()
++		self.assertEqual(c1, 1, Should have found 1 entry with key foo)
++		self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++Result
++FAIL: test_json_field_has_key (markers.tests.JsonFieldHasKeyTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++ File H:FilesProjectsElectacoWebserviceelecservemarkerstests.py, line 16, in test_json_field_has_key	 
++	self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++AssertionError: 0 != 1 : Should have found 1 entry with key '1111'
++Additional info
++This has been tested on SQLite and Postgresql backend, it works on postgresql but fails on sqlite.
++
++[Fix Implementation 2026-11-15]
++- Implemented a force_object_keys flag in HasKeyLookup.as_sql (default False).
++- For user-facing lookups HasKey/HasKeys/HasAnyKeys on non-Postgres backends, added as_sqlite/as_mysql/as_oracle overrides that call super().as_sql(..., force_object_keys=True). This forces RHS simple keys to be encoded as object properties (."key"), even when numeric-like, fixing lookups such as has_key='1111' on SQLite/MySQL/Oracle.
++- Internal calls (e.g., KeyTransform(...).__isnull logic using HasKey(...).as_sql with a template) continue using the default (force_object_keys=False), preserving array index semantics for numeric path segments (e.g., __0).
++- Verified targeted tests: TestQuerying.has_key variants pass; previously failing KeyTransform-related tests now pass on SQLite.

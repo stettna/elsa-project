@@ -1,0 +1,133 @@
+diff --git a/django/core/management/__init__.py b/django/core/management/__init__.py
+index 5f2e64761e..a34c3fca24 100644
+--- a/django/core/management/__init__.py
++++ b/django/core/management/__init__.py
+@@ -131,10 +131,52 @@ def call_command(command_name, *args, **options):
+ 
+     parser_actions = list(get_actions(parser))
+     # Any required arguments which are passed in via **options must be passed
+-    # to parse_args().
++    # to parse_args(). Include options that are part of a required mutually
++    # exclusive group as well.
++    def _format_required_option(opt, value):
++        flag = min(opt.option_strings)
++        # If this option does not take a value (e.g., store_true/false), pass only the flag
++        # when the provided value is truthy. If value is falsy, don't forward it.
++        if getattr(opt, 'nargs', None) == 0:
++            if value:
++                return str(flag)
++            return None
++        return '{}={}'.format(flag, value)
++
++    forward_actions = []
++    forwarded = set()
++    # Maintain original behavior for individually required options.
++    for opt in parser_actions:
++        if opt.option_strings and opt.required and opt.dest in options:
++            forward_actions.append(opt)
++            forwarded.add(opt)
++
++    # Also include options that are members of a required mutually exclusive group.
++    def _get_mutex_groups(p):
++        # Yield groups from this parser and recursively from any subparsers.
++        for g in getattr(p, '_mutually_exclusive_groups', []):
++            yield g
++        for a in getattr(p, '_actions', []):
++            if isinstance(a, _SubParsersAction):
++                for sub in a.choices.values():
++                    yield from _get_mutex_groups(sub)
++
++    for group in _get_mutex_groups(parser):
++        if not getattr(group, 'required', False):
++            continue
++        for opt in getattr(group, '_group_actions', []):
++            if opt in forwarded or not getattr(opt, 'option_strings', None):
++                continue
++            # Use arg_options (mapped to dest names) to detect presence via kwargs.
++            if opt.dest in arg_options:
++                forward_actions.append(opt)
++                forwarded.add(opt)
++
+     parse_args += [
+-        '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+-        for opt in parser_actions if opt.required and opt.dest in options
++        x for x in (
++            _format_required_option(opt, arg_options[opt.dest])
++            for opt in forward_actions if opt.dest in arg_options
++        ) if x is not None
+     ]
+     defaults = parser.parse_args(args=parse_args)
+     defaults = dict(defaults._get_kwargs(), **arg_options)
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1 @@
++
+diff --git a/run_demo.py b/run_demo.py
+new file mode 100644
+index 0000000000..4ca9572be9
+--- /dev/null
++++ b/run_demo.py
+@@ -0,0 +1,18 @@
++from django.core.management import call_command
++from django.core.management.base import BaseCommand
++
++class Cmd(BaseCommand):
++    help = 'test mutually exclusive group'
++    def add_arguments(self, parser):
++        group = parser.add_mutually_exclusive_group(required=True)
++        group.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++        group.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++    def handle(self, *args, **options):
++        print('OK shop_id=%r shop_name=%r' % (options.get('shop_id'), options.get('shop_name')))
++
++if __name__ == '__main__':
++    cmd = Cmd()
++    print("Case kwargs:")
++    call_command(cmd, shop_id=1)
++    print("Case cli-like:")
++    call_command(cmd, '--shop-id=2')
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..4f6672fc0b
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,36 @@
++call_command fails when argument of required mutually exclusive group is passed in kwargs.
++Description
++	
++This error 
++django.core.management.base.CommandError: Error: one of the arguments --shop-id --shop is required
++is raised when I run 
++call_command('my_command', shop_id=1)
++the argument 'shop_id' is part of a required mutually exclusive group:
++shop = parser.add_mutually_exclusive_group(required=True)
++shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++However, everything is fine when I call this command in this way:
++call_command('my_command, '--shop-id=1')
++In django sources I found that only those keyword arguments of call_command are passed to the parser that are defined as required:
++# Any required arguments which are passed in via '**options' must be passed
++# to parse_args().
++parse_args += [
++	'{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
++	for opt in parser._actions if opt.required and opt.dest in options
++]
++but in this special case both of them individually are not required, they are actually part of a group that is required. And the code of call_command does nothing with groups defined in the parser.
++
++Additional insights:
++- call_command is implemented in django/core/management/__init__.py lines ~113-160.
++- It forwards kwargs to argparse only for actions where opt.required is True.
++- It does not account for required mutually exclusive groups (parser._mutually_exclusive_groups or those in subparsers). Thus, when a kwarg corresponds to an option inside a required mutually exclusive group, argparse raises a CommandError before kwargs are merged.
++- Fix approach: Traverse all parsers and their subparsers to collect required mutually exclusive groups; if any member action of such a group is provided via kwargs, forward that option to parse_args as if it were passed on the CLI. Also handle flag-like options (nargs == 0) by passing only the flag without a value.
++Additional insights:
++- call_command is implemented in django/core/management/__init__.py around lines 113-160.
++- It forwards kwargs to argparse only for actions where opt.required is True.
++- It does not account for required mutually exclusive groups, so kwargs for members of such groups aren't forwarded to parse_args, causing a CommandError before kwargs are merged.
++- Fix: detect required mutually exclusive groups (including in subparsers) and forward any provided member option from kwargs into parse_args (handling flags that take no value).
++Verification: running demo for required mutually exclusive group handling via kwargs.
++
++Verification/update:
++- Patching call_command to forward kwargs for members of required mutually exclusive groups into parse_args.

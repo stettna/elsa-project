@@ -1,0 +1,256 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 000000000..8b1378917
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 000000000..a3c5a2795
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,90 @@
++Inherited classes not correctly documented when mocked
++### Describe the bug
++
++We're experiencing an issue when documenting classes that inherit mocked classes. However, classes which inherit other classes from our own package are ok.
++
++This issue appears to be dependent on the sphinx version:
++
++- sphinx<3.0: Everything is OK. 
++- sphinx>=3.0 < 3.4.2: Classes that inherit mocked classes are not documented. (see [sphinx #8164](https://github.com/sphinx-doc/sphinx/issues/8164)). This is fixed in sphinx 3.4.2. 
++- sphinx>=3.4.2: The previously missing classes are now documented, but there is a problem with the Bases section in the docs. 
++ 
++Example: In the docs for alibi_detect.utils.pytorch.kernels.DeepKernel in this readthedocs build https://seldon--338.org.readthedocs.build/projects/alibi-detect/en/338/api/alibi_detect.utils.pytorch.kernels.html, the base class is listed as Bases: torch.nn. instead of Bases: torch.nn.Module. 
++
++
++### How to Reproduce
++
++
++$ git clone https://github.com/ascillitoe/alibi-detect.git
++$ cd alibi-detect
++$ pip install -r requirements/docs.txt
++$ make build_docs
++$ # open doc/_build/html/api/alibi_detect.utils.pytorch.kernels.html and see Bases section.
++
++
++
++### Expected behavior
++
++The Bases section should report torch.nn.Module not torch.nn.. 
++
++i.e. see
++https://seldon--325.org.readthedocs.build/projects/alibi-detect/en/325/api/alibi_detect.utils.pytorch.kernels.html
++
++### Your project
++
++https://github.com/ascillitoe/alibi-detect/tree/feature_sphinx4
++
++### Screenshots
++
++### Screenshot with sphinx==4.2
++![sphinx_problem](https://user-images.githubusercontent.com/32061685/133816582-ca162b07-41c7-4b8e-98ea-781e7c659229.png)
++
++### Screenshot with sphinx<3.0
++![sphinx_working](https://user-images.githubusercontent.com/32061685/133816065-6291ce1b-96cf-4b0f-9648-7f993fc15611.png)
++
++
++
++### OS
++
++Ubuntu 18.04 (used by readthedocs/build:6.0)
++
++### Python version
++
++3.8.11
++
++### Sphinx version
++
++>=3.4.2
++
++### Sphinx extensions
++
++    [sphinx.ext.autodoc,
++    sphinx.ext.doctest,
++    sphinx.ext.intersphinx,
++    sphinx.ext.todo,
++    sphinx.ext.coverage,
++    sphinx.ext.mathjax,
++    sphinx.ext.ifconfig,
++    sphinx.ext.viewcode,
++    sphinx.ext.napoleon,
++    sphinx_autodoc_typehints,
++    sphinxcontrib.apidoc, 
++    nbsphinx,
++    nbsphinx_link,  
++    myst_parser]
++
++
++### Extra tools
++
++_No response_
++
++### Additional context
++
++demo PR:
++https://github.com/SeldonIO/alibi-detect/pull/338
++
++readthedocs demo build:
++https://seldon--338.org.readthedocs.build/projects/alibi-detect/en/338/api/alibi_detect.utils.pytorch.kernels.html
++
++
++
+diff --git a/dev_edit.py b/dev_edit.py
+new file mode 100644
+index 000000000..88ef505e8
+--- /dev/null
++++ b/dev_edit.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++import re, sys, pathlib
++
++def patch_restify_py37(path):
++    src = pathlib.Path(path).read_text()
++    pattern = r"""
++(\s+elif\s+hasattr\(cls,\s*'__qualname__'\)\s*:\n)   # start branch
++(\s+if\s+cls\.__module__\s*==\s*'typing':\n
++\s+return\s+['"]:py:class:`~%s\.%s`['"]\s*%\s*\(cls\.__module__,\s*cls\.__qualname__\)\n
++\s+else:\n
++\s+return\s+['"]:py:class:`%s\.%s`['"]\s*%\s*\(cls\.__module__,\s*cls\.__qualname__\)\n)
++"""
++    repl = (
++r"\1"
++r"        qualname = getattr(cls, '__qualname__', None)\n"
++r"        if not qualname:\n"
++r"            # Fallback for mocked instances whose __qualname__ may be empty string\n"
++r"            qualname = getattr(getattr(cls, '__class__', None), '__qualname__', None) or getattr(cls, '__name__', None)\n"
++r"        if cls.__module__ == 'typing':\n"
++r"            return ':py:class:`~%s.%s`' % (cls.__module__, qualname)\n"
++r"        else:\n"
++r"            return ':py:class:`%s.%s`' % (cls.__module__, qualname)\n"
++    )
++    new_src, n = re.subn(pattern, repl, src, flags=re.VERBOSE)
++    if n == 0:
++        print("Patch failed: pattern not found", file=sys.stderr)
++        sys.exit(1)
++    pathlib.Path(path).write_text(new_src)
++    print(f"Patched {path} ({n} replacement)")
++
++def main():
++    patch_restify_py37('sphinx/util/typing.py')
++
++if __name__ == '__main__':
++    main()
+diff --git a/patch_restify_fallback.py b/patch_restify_fallback.py
+new file mode 100644
+index 000000000..15b963bc0
+--- /dev/null
++++ b/patch_restify_fallback.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++import sys
++from pathlib import Path
++
++PATH = Path('sphinx/util/typing.py')
++
++def patch_py37(text: str) -> str:
++    target = "elif hasattr(cls, '__qualname__'):\n"
++    idx = text.find(target)
++    if idx == -1:
++        print("py37 branch not found")
++        return text
++    start = idx + len(target)
++    # Find the end of this elif block by locating the next "elif" or "else:" at same indent (4 spaces)
++    rest = text[start:]
++    # We expect a small block; replace it entirely with a safer version
++    before = text[:start]
++    replacement = (
++        "        qualname = getattr(cls, '__qualname__', None)\n"
++        "        if not qualname:\n"
++        "            qualname = getattr(cls, '__name__', None)\n"
++        "        if cls.__module__ == 'typing':\n"
++        "            return ':py:class:`~%s.%s`' % (cls.__module__, qualname)\n"
++        "        else:\n"
++        "            return ':py:class:`%s.%s`' % (cls.__module__, qualname)\n"
++    )
++    # Original block ends before "elif isinstance(cls, ForwardRef):" or "else:" following it
++    # We'll search for the next line that starts with 4 spaces + "elif " or "else:"
++    import re
++    m = re.search(r'^( {4}(elif|else):)', rest, re.M)
++    if not m:
++        print("Could not find end of py37 __qualname__ block; aborting")
++        return text
++    end = start + m.start()
++    return before + replacement + text[end:]
++
++def patch_py36(text: str) -> str:
++    # Replace the line: qualname = '%s.%s' % (module, cls.__qualname__)
++    old = "        qualname = '%s.%s' % (module, cls.__qualname__)\n"
++    new = (
++        "        _qn = getattr(cls, '__qualname__', None) or getattr(cls, '__name__', '')\n"
++        "        qualname = '%s.%s' % (module, _qn)\n"
++    )
++    if old in text:
++        return text.replace(old, new)
++    else:
++        print("py36 qualname assignment not found")
++        return text
++
++def main():
++    src = PATH.read_text()
++    orig = src
++    src = patch_py37(src)
++    src = patch_py36(src)
++    if src == orig:
++        print("No changes applied; patch may have failed")
++        sys.exit(1)
++    PATH.write_text(src)
++    print("Patched:", PATH)
++
++if __name__ == '__main__':
++    main()
+diff --git a/sphinx/util/typing.py b/sphinx/util/typing.py
+index 87707d48f..3b3fa5039 100644
+--- a/sphinx/util/typing.py
++++ b/sphinx/util/typing.py
+@@ -192,12 +192,19 @@ def _restify_py37(cls: Optional[Type]) -> str:
+     elif isinstance(cls, typing._SpecialForm):
+         return ':py:obj:`~%s.%s`' % (cls.__module__, cls._name)
+     elif hasattr(cls, '__qualname__'):
++        qualname = getattr(cls, '__qualname__', None)
++        if not qualname:
++            # If it's a class, use its __name__; else prefer the instance's class name
++            if isinstance(cls, type):
++                qualname = getattr(cls, '__name__', None)
++            else:
++                qualname = (getattr(getattr(cls, '__class__', None), '__qualname__', None)
++                            or getattr(getattr(cls, '__class__', None), '__name__', None)
++                            or getattr(cls, '__name__', None))
+         if cls.__module__ == 'typing':
+-            return ':py:class:`~%s.%s`' % (cls.__module__, cls.__qualname__)
++            return ':py:class:`~%s.%s`' % (cls.__module__, qualname)
+         else:
+-            return ':py:class:`%s.%s`' % (cls.__module__, cls.__qualname__)
+-    elif isinstance(cls, ForwardRef):
+-        return ':py:class:`%s`' % cls.__forward_arg__
++            return ':py:class:`%s.%s`' % (cls.__module__, qualname)
+     else:
+         # not a class (ex. TypeVar)
+         if cls.__module__ == 'typing':
+@@ -220,7 +227,14 @@ def _restify_py36(cls: Optional[Type]) -> str:
+         else:
+             qualname = repr(cls).replace('typing.', '')
+     elif hasattr(cls, '__qualname__'):
+-        qualname = '%s.%s' % (module, cls.__qualname__)
++        if isinstance(cls, type):
++            _qn = getattr(cls, '__qualname__', None) or getattr(cls, '__name__', '')
++        else:
++            _qn = (getattr(cls, '__qualname__', None)
++                   or getattr(getattr(cls, '__class__', None), '__qualname__', None)
++                   or getattr(getattr(cls, '__class__', None), '__name__', None)
++                   or getattr(cls, '__name__', ''))
++        qualname = '%s.%s' % (module, _qn)
+     else:
+         qualname = repr(cls)
+ 

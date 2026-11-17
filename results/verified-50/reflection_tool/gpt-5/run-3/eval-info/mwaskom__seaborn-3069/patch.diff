@@ -1,0 +1,370 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..a32d47d9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,15 @@
++Nominal scale should be drawn the same way as categorical scales
++Three distinctive things happen on the categorical axis in seaborn's categorical plots:
++
++1. The scale is drawn to +/- 0.5 from the first and last tick, rather than using the normal margin logic
++2. A grid is not shown, even when it otherwise would be with the active style
++3. If on the y axis, the axis is inverted
++
++It probably makes sense to have so.Nominal scales (including inferred ones) do this too. Some comments on implementation:
++
++1. This is actually trickier than you'd think; I may have posted an issue over in matplotlib about this at one point, or just discussed on their gitter. I believe the suggested approach is to add an invisible artist with sticky edges and set the margin to 0. Feels like a hack! I might have looked into setting the sticky edges _on the spine artist_ at one point?
++
++2. Probably straightforward to do in Plotter._finalize_figure. Always a good idea? How do we defer to the theme if the user wants to force a grid? Should the grid be something that is set in the scale object itself
++
++3. Probably straightforward to implement but I am not exactly sure where would be best.
++
+diff --git a/devtools.py b/devtools.py
+new file mode 100644
+index 00000000..df8700e6
+--- /dev/null
++++ b/devtools.py
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python3
++import sys
++import re
++import argparse
++from pathlib import Path
++from typing import Optional
++
++DESC = """
++devtools.py - simple code editing helper
++
++Subcommands:
++  replace FILE PATTERN REPLACEMENT [-n COUNT] [--flags MULTILINE,DOTALL,IGNORECASE] [--stdin-repl]
++      Replace regex PATTERN with REPLACEMENT. If --stdin-repl is set, read REPLACEMENT from stdin.
++  insert_after FILE PATTERN TEXT [--stdin-text]
++      Insert TEXT after first match of PATTERN. If --stdin-text, read TEXT from stdin.
++  insert_before FILE PATTERN TEXT [--stdin-text]
++      Insert TEXT before first match of PATTERN. If --stdin-text, read TEXT from stdin.
++  append FILE TEXT [--stdin-text]
++      Append TEXT to FILE (optionally from stdin).
++  show FILE PATTERN [-c CONTEXT] [--flags ...]
++      Show lines around first match of PATTERN with CONTEXT lines.
++Exit codes:
++  0 on success, 2 on file not found, 3 on no match (for insert/show), 4 on invalid args.
++"""
++
++def _read_file(path: Path) -> str:
++    try:
++        return path.read_text(encoding="utf-8")
++    except FileNotFoundError:
++        print(f"[devtools] ERROR: File not found: {path}", file=sys.stderr)
++        sys.exit(2)
++
++def _write_file(path: Path, content: str):
++    path.write_text(content, encoding="utf-8")
++
++def _flags_from_names(names: Optional[str]) -> int:
++    flags = 0
++    if not names:
++        return re.MULTILINE | re.DOTALL
++    for name in names.split(","):
++        n = name.strip().upper()
++        if not n:
++            continue
++        if n == "MULTILINE":
++            flags |= re.MULTILINE
++        elif n == "DOTALL":
++            flags |= re.DOTALL
++        elif n == "IGNORECASE":
++            flags |= re.IGNORECASE
++        else:
++            print(f"[devtools] WARNING: Unknown flag {n}, ignoring", file=sys.stderr)
++    return flags or (re.MULTILINE | re.DOTALL)
++
++def cmd_replace(args):
++    path = Path(args.file)
++    text = _read_file(path)
++    repl = sys.stdin.read() if args.stdin_repl else args.replacement
++    flags = _flags_from_names(args.flags)
++    new_text, n = re.subn(args.pattern, repl, text, count=0 if args.count is None else args.count, flags=flags)
++    if n == 0:
++        print(f"[devtools] WARNING: No replacements made for pattern: {args.pattern}", file=sys.stderr)
++    else:
++        print(f"[devtools] INFO: Replacements made: {n}")
++    if new_text != text:
++        _write_file(path, new_text)
++        print(f"[devtools] INFO: Wrote updated file: {path}")
++    else:
++        print(f"[devtools] INFO: File unchanged: {path}")
++
++def _insert_common(args, before: bool):
++    path = Path(args.file)
++    text = _read_file(path)
++    flags = _flags_from_names(args.flags)
++    m = re.search(args.pattern, text, flags)
++    if not m:
++        print(f"[devtools] ERROR: Pattern not found: {args.pattern}", file=sys.stderr)
++        sys.exit(3)
++    insert_text = sys.stdin.read() if args.stdin_text else args.text
++    idx = m.start() if before else m.end()
++    new_text = text[:idx] + insert_text + text[idx:]
++    _write_file(path, new_text)
++    where = "before" if before else "after"
++    print(f"[devtools] INFO: Inserted {len(insert_text)} chars {where} first match in {path}")
++
++def cmd_insert_after(args):
++    _insert_common(args, before=False)
++
++def cmd_insert_before(args):
++    _insert_common(args, before=True)
++
++def cmd_append(args):
++    path = Path(args.file)
++    text = _read_file(path)
++    add = sys.stdin.read() if args.stdin_text else args.text
++    if not text.endswith("\n") and not add.startswith("\n"):
++        add = "\n" + add
++    _write_file(path, text + add)
++    print(f"[devtools] INFO: Appended {len(add)} chars to {path}")
++
++def cmd_show(args):
++    path = Path(args.file)
++    content = _read_file(path)
++    flags = _flags_from_names(args.flags)
++    m = re.search(args.pattern, content, flags)
++    if not m:
++        print(f"[devtools] ERROR: Pattern not found: {args.pattern}", file=sys.stderr)
++        sys.exit(3)
++    start = m.start()
++    line_starts = [0]
++    for i, ch in enumerate(content):
++        if ch == "\n":
++            line_starts.append(i + 1)
++    line_num = 1
++    for i, s in enumerate(line_starts):
++        if s > start:
++            break
++        line_num = i + 1
++    lines = content.splitlines()
++    idx = line_num - 1
++    lo = max(0, idx - args.context)
++    hi = min(len(lines), idx + args.context + 1)
++    width = len(str(hi))
++    for i in range(lo, hi):
++        prefix = ">" if i == idx else " "
++        print(f"{prefix} {str(i+1).rjust(width)} | {lines[i]}")
++    print(f"[devtools] INFO: Match spans chars [{m.start()}..{m.end()}) and lines {idx+1}")
++
++def main():
++    parser = argparse.ArgumentParser(description=DESC, formatter_class=argparse.RawDescriptionHelpFormatter)
++    subparsers = parser.add_subparsers(dest="cmd")
++
++    p = subparsers.add_parser("replace")
++    p.add_argument("file")
++    p.add_argument("pattern")
++    p.add_argument("replacement")
++    p.add_argument("-n", "--count", type=int, default=None)
++    p.add_argument("--flags", type=str, default=None, help="Comma separated: MULTILINE,DOTALL,IGNORECASE")
++    p.add_argument("--stdin-repl", action="store_true")
++    p.set_defaults(func=cmd_replace)
++
++    p = subparsers.add_parser("insert_after")
++    p.add_argument("file")
++    p.add_argument("pattern")
++    p.add_argument("text")
++    p.add_argument("--flags", type=str, default=None)
++    p.add_argument("--stdin-text", action="store_true")
++    p.set_defaults(func=cmd_insert_after)
++
++    p = subparsers.add_parser("insert_before")
++    p.add_argument("file")
++    p.add_argument("pattern")
++    p.add_argument("text")
++    p.add_argument("--flags", type=str, default=None)
++    p.add_argument("--stdin-text", action="store_true")
++    p.set_defaults(func=cmd_insert_before)
++
++    p = subparsers.add_parser("append")
++    p.add_argument("file")
++    p.add_argument("text")
++    p.add_argument("--stdin-text", action="store_true")
++    p.set_defaults(func=cmd_append)
++
++    p = subparsers.add_parser("show")
++    p.add_argument("file")
++    p.add_argument("pattern")
++    p.add_argument("-c", "--context", type=int, default=3)
++    p.add_argument("--flags", type=str, default=None)
++    p.set_defaults(func=cmd_show)
++
++    args = parser.parse_args()
++    if not args.cmd:
++        print(DESC.strip())
++        sys.exit(4)
++    args.func(args)
++
++if __name__ == "__main__":
++    main()
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 00000000..7eac5215
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,31 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++# PR-specific additions: Nominal scales categorical behavior
++- Identify where so.Nominal (and inferred nominal) scales are applied to axes; likely in seaborn/objects/scales.py and plot finalization logic (e.g., Plotter._finalize_figure or similar).
++- Implement categorical-like axis behavior for nominal scales:
++  1) Margins: Axis limits should be [first_index - 0.5, last_index + 0.5]. Approach: add an invisible artist with sticky_edges set to these bounds and set axis margins to 0 (or equivalent). Avoid breaking continuous scales.
++  2) Grid: Suppress major gridlines on nominal axes by default (match seaborn categorical plots). Respect explicit user/theme settings if they force grid on; do not override if user set grid=True explicitly.
++  3) Y-axis inversion: Invert when nominal is on the y axis to match categorical plot conventions.
++- Detection: Add logic to detect nominal on x and/or y and apply the above, without affecting ordinal/continuous scales.
++- Placement: Prefer finalization step for grid/inversion, and scale object for sticky-edges/margin behavior. Keep behavior encapsulated so theme overrides still work.
++- Testing plan:
++  - Create a small script that draws a nominal axis, verifies:
++    * limits equal n_categories +/- 0.5,
++    * gridlines disabled by default but can be re-enabled by explicit user command/theme,
++    * y-axis inverted when nominal on y.
++  - Check mixed scenarios (x nominal, y continuous; both nominal).
++- Edge cases:
++  - Empty or single-category data: ensure limits still make sense (e.g., [-0.5, 0.5] for single category).
++  - Facets/subplots: logic should apply per-axes safely, no global state leakage.
++  - Explicit user limits: do not fight set_xlim/set_ylim if provided.
++- Implementation tips:
++  - Use matplotlib sticky_edges via an invisible Line2D or Patch with set_solid_capstyle and not drawn; set axis.margins(0) for that axis.
++  - For grid suppression, prefer calling ax.grid(False, axis=...) conditionally unless theme/user has explicitly enabled it (detect via rcParams or a flag if available).
++  - Keep changes minimal and isolated; add inline comments linking to PR rationale.
++- Workflow:
++  - Use devtools.py (replace/insert/show) for safe, repeatable edits.
++  - After edits, run quick script checks; then run related tests.
++  - If needed, adjust to respect theme and user overrides.
++
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..d2e14c38 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -42,10 +42,26 @@ from seaborn.rcmod import axes_style, plotting_context
+ from seaborn.palettes import color_palette
+ from seaborn.external.version import Version
+ 
+-from typing import TYPE_CHECKING
+-if TYPE_CHECKING:
+-    from matplotlib.figure import SubFigure
+ 
++from contextlib import contextmanager, nullcontext
++@contextmanager
++def _safe_pandas_null_context(pd):
++    # Prefer newer pandas option if available
++    try:
++        with pd.option_context("mode.use_inf_as_na", True):
++            yield
++            return
++    except Exception:
++        pass
++    # Fallback to older seaborn/pandas option name if available
++    try:
++        with pd.option_context("mode.use_inf_as_null", True):
++            yield
++            return
++    except Exception:
++        pass
++    # No-op context if neither option exists
++    yield
+ 
+ if sys.version_info >= (3, 8):
+     from typing import TypedDict
+@@ -1006,6 +1022,33 @@ class Plotter:
+             for axis in "xy":
+                 axis_key = sub[axis]
+ 
++                # Apply categorical-like behavior for nominal axes
++                axis_obj = getattr(ax, f"{axis}axis")
++                if getattr(axis_obj, "_seaborn_nominal", False):
++                    # Set zero margins on the nominal axis
++                    try:
++                        if axis == "x":
++                            ax.margins(x=0)
++                        else:
++                            ax.margins(y=0)
++                    except Exception:
++                        pass
++                    # Default limits to center categories at +/- 0.5 if user did not set limits
++                    if axis_key not in p._limits:
++                        n = getattr(axis_obj, "_seaborn_nominal_n", None)
++                        if n is not None:
++                            ax.set(**{f"{axis}lim": (-0.5, float(n) - 0.5)})
++                    # Suppress gridlines on nominal axes by default
++                    try:
++                        ax.grid(False, axis=axis)
++                    except Exception:
++                        pass
++                    # Invert y-axis when nominal
++                    if axis == "y":
++                        try:
++                            ax.invert_yaxis()
++                        except Exception:
++                            pass
+                 # ~~ Axis labels
+ 
+                 # TODO Should we make it possible to use only one x/y label for
+@@ -1475,7 +1518,7 @@ class Plotter:
+ 
+                 axes_df = self._filter_subplot_data(df, view)
+ 
+-                with pd.option_context("mode.use_inf_as_null", True):
++                with _safe_pandas_null_context(pd):
+                     if keep_na:
+                         # The simpler thing to do would be x.dropna().reindex(x.index).
+                         # But that doesn't work with the way that the subset iteration
+@@ -1632,6 +1675,34 @@ class Plotter:
+             for axis in "xy":
+                 axis_key = sub[axis]
+ 
++                # Apply categorical-like behavior for nominal axes
++                axis_obj = getattr(ax, f"{axis}axis")
++                if getattr(axis_obj, "_seaborn_nominal", False):
++                    # Set zero margins on the nominal axis
++                    try:
++                        if axis == "x":
++                            ax.margins(x=0)
++                        else:
++                            ax.margins(y=0)
++                    except Exception:
++                        pass
++                    # Default limits to center categories at +/- 0.5 if user did not set limits
++                    if axis_key not in p._limits:
++                        n = getattr(axis_obj, "_seaborn_nominal_n", None)
++                        if n is not None:
++                            ax.set(**{f"{axis}lim": (-0.5, float(n) - 0.5)})
++                    # Suppress gridlines on nominal axes by default
++                    try:
++                        ax.grid(False, axis=axis)
++                    except Exception:
++                        pass
++                    # Invert y-axis when nominal
++                    if axis == "y":
++                        try:
++                            ax.invert_yaxis()
++                        except Exception:
++                            pass
++
+                 # Axis limits
+                 if axis_key in p._limits:
+                     convert_units = getattr(ax, f"{axis}axis").convert_units
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+index bbd71ec1..941fc413 100644
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -199,6 +199,12 @@ class Nominal(Scale):
+         # (i.e. if we have [1, 2.5], do we want [1.0, 2.5]? Unclear)
+         axis.update_units(stringify(np.array(units_seed)))
+ 
++        # Mark axis as nominal for downstream adjustments
++        try:
++            axis._seaborn_nominal = True
++            axis._seaborn_nominal_n = len(units_seed)
++        except Exception:
++            pass
+         # TODO define this more centrally
+         def convert_units(x):
+             # TODO only do this with explicit order?

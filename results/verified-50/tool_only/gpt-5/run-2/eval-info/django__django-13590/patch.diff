@@ -1,0 +1,125 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..73b158cefe
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,10 @@
++Upgrading 2.2>3.0 causes named tuples used as arguments to __range to error.
++Description
++	
++I noticed this while upgrading a project from 2.2 to 3.0.
++This project passes named 2-tuples as arguments to range queryset filters. This works fine on 2.2. On 3.0 it causes the following error: TypeError: __new__() missing 1 required positional argument: 'far'.
++This happens because django.db.models.sql.query.Query.resolve_lookup_value goes into the tuple elements to resolve lookups and then attempts to reconstitute the tuple with the resolved elements.
++When it attempts to construct the new tuple it preserves the type (the named tuple) but it passes a iterator to it's constructor.
++NamedTuples don't have the code path for copying an iterator, and so it errors on insufficient arguments.
++The fix is to * expand the contents of the iterator into the constructor.
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..b09b91bda9 100755
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1077,10 +1077,17 @@ class Query(BaseExpression):
+         elif isinstance(value, (list, tuple)):
+             # The items of the iterable may be expressions and therefore need
+             # to be resolved independently.
+-            return type(value)(
++            resolved = [
+                 self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                 for sub_value in value
+-            )
++            ]
++            # Preserve the original container type. For namedtuples, the
++            # constructor expects positional arguments rather than a single
++            # iterable, so expand the elements. Plain tuples and lists accept
++            # a single iterable to construct.
++            if isinstance(value, tuple) and hasattr(value, '_fields'):
++                return type(value)(*resolved)
++            return type(value)(resolved)
+         return value
+ 
+     def solve_lookup_type(self, lookup):
+diff --git a/tools/edit_query.py b/tools/edit_query.py
+new file mode 100644
+index 0000000000..428a8bd85f
+--- /dev/null
++++ b/tools/edit_query.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++import io
++import os
++import re
++import sys
++
++FILE_PATH = os.path.join("django", "db", "models", "sql", "query.py")
++
++def main():
++    with io.open(FILE_PATH, "r", encoding="utf-8") as f:
++        lines = f.readlines()
++
++    # Locate the block with "elif isinstance(value, (list, tuple)):" then the generator-based return.
++    elif_idx = None
++    for i, line in enumerate(lines):
++        if line.lstrip().startswith("elif isinstance(value, (list, tuple))"):
++            elif_idx = i
++            break
++    if elif_idx is None:
++        print("Did not find elif isinstance(value, (list, tuple)) block; no changes made.", file=sys.stderr)
++        sys.exit(1)
++
++    # Find the 'return type(value)(' line after the elif.
++    ret_idx = None
++    for j in range(elif_idx + 1, min(elif_idx + 50, len(lines))):
++        if "return type(value)(" in lines[j]:
++            ret_idx = j
++            break
++    if ret_idx is None:
++        print("Did not find generator-based return inside the tuple/list block; no changes made.", file=sys.stderr)
++        sys.exit(1)
++
++    # Find the closing parenthesis line for the generator return (a line that's just spaces then ')').
++    end_idx = None
++    for k in range(ret_idx + 1, min(ret_idx + 50, len(lines))):
++        if lines[k].strip() == ")":
++            end_idx = k
++            break
++    if end_idx is None:
++        print("Did not find closing parenthesis for generator-based return; no changes made.", file=sys.stderr)
++        sys.exit(1)
++
++    base_indent = re.match(r'^(\s*)', lines[ret_idx]).group(1)
++    inner_indent = base_indent + " " * 4
++
++    new_block = [
++        f"{base_indent}resolved = [\n",
++        f"{inner_indent}self.resolve_lookup_value(sub_value, can_reuse, allow_joins)\n",
++        f"{inner_indent}for sub_value in value\n",
++        f"{base_indent}]\n",
++        f"{base_indent}# Preserve the original container type. For namedtuples, the\n",
++        f"{base_indent}# constructor expects positional arguments rather than a single\n",
++        f"{base_indent}# iterable, so expand the elements. Plain tuples and lists accept\n",
++        f"{base_indent}# a single iterable to construct.\n",
++        f"{base_indent}if isinstance(value, tuple) and hasattr(value, '_fields'):\n",
++        f"{inner_indent}return type(value)(*resolved)\n",
++        f"{base_indent}return type(value)(resolved)\n",
++    ]
++
++    new_lines = lines[:ret_idx] + new_block + lines[end_idx+1:]
++
++    if new_lines == lines:
++        print("No changes detected (content identical).", file=sys.stderr)
++        sys.exit(0)
++
++    with io.open(FILE_PATH, "w", encoding="utf-8") as f:
++        f.writelines(new_lines)
++
++    print(f"Patched {FILE_PATH} successfully.")
++
++if __name__ == "__main__":
++    main()

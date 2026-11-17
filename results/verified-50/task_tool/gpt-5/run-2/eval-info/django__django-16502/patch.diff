@@ -1,0 +1,85 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..52cc5764d3 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,6 +143,27 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        """Override to suppress body for HEAD requests while still sending headers."""
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not self.status:
++                raise AssertionError("write() before start_response()")
++            elif not self.headers_sent:
++                # Send headers but do not write the body for HEAD responses.
++                cl = None
++                try:
++                    cl = self.headers.get("Content-Length")
++                except Exception:
++                    cl = None
++                try:
++                    self.bytes_sent = int(cl) if cl is not None else 0
++                except (ValueError, TypeError):
++                    self.bytes_sent = 0
++                self.send_headers()
++            # Ignore any further body data.
++            return
++        return super().write(data)
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..34b62da1b2
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,40 @@
++PR focus: runserver returns response body for HTTP HEAD requests since body stripping in Django was removed in favor of server-side handling (#26052). Development server must ensure HEAD responses have no body per RFC 2616 4.3.
++
++Initial insights:
++- This repository is the Django source tree; implementation likely in django/core/servers/basehttp.py where the dev WSGI server/handler lives.
++- Goal: Ensure the development server (runserver) does not send a response body for HEAD requests. Common production servers already handle this.
++- Next step: Locate WSGIServer/WSGIRequestHandler/dev server code paths to implement HEAD body stripping and/or ensure Content-Length is preserved while body is omitted.
++
++Planned approach:
++- Search for WSGIServer, WSGIRequestHandler, and basehttp to identify the correct code path where runserver writes the response body.
++New insights after code search:
++- runserver relies on django/core/servers/basehttp.py (WSGIServer, WSGIRequestHandler).
++- Files of interest:
++  - django/core/management/commands/runserver.py (uses WSGIServer, run())
++  - django/core/servers/basehttp.py (defines WSGIServer, ThreadedWSGIServer, WSGIRequestHandler, and run())
++- The fix likely belongs in WSGIRequestHandler or its ServerHandler path where the response body is written, ensuring HEAD requests do not include the body.
++
++Next step:
++- Inspect django/core/servers/basehttp.py to locate request handling and response writing to add HEAD-body stripping.
++Additional insights:
++- django/core/servers/basehttp.py defines a custom ServerHandler subclassing wsgiref.simple_server.ServerHandler.
++- It overrides cleanup_headers() and close(), suggesting this is the right place to handle HEAD logic by overriding write()/finish_response() to suppress the body for HEAD requests while preserving headers and Content-Length if provided.
++
++Next step:
++- Inspect wsgiref.handlers.ServerHandler to identify the correct hook (write or finish_response) for skipping the response body on HEAD requests.
++Update: Attempting to inspect wsgiref.handlers.ServerHandler failed; the development server subclass extends wsgiref.simple_server.ServerHandler. We'll hook into that class to suppress the body on HEAD requests, likely by overriding write()/finish_response()/finish_content and possibly sendfile() if used.
++
++Implementation plan and insights:
++- Override ServerHandler.write() in django/core/servers/basehttp.py to skip writing the body for HEAD requests.
++- Ensure headers are still sent and bytes_sent reflects Content-Length if provided by the application.
++Changes made:
++- Implemented HEAD-body suppression by overriding ServerHandler.write() in django/core/servers/basehttp.py.
++- On HEAD, headers are sent but body is not written; bytes_sent is set based on Content-Length if provided, else 0.
++- Local simulation encountered an AttributeError due to a dummy request_handler lacking 'server' during cleanup_headers; this is a limitation of the ad-hoc harness, not the actual runserver path where request_handler is fully populated.
++
++Next steps:
++- Run the test suite to validate behavior and ensure no regressions.
++- Next validation: search tests mentioning HEAD and runserver/basehttp to ensure compliance and catch edge cases (e.g., file wrapper paths).
++- Validating by searching tests for HEAD, runserver, ServerHandler, WSGIRequestHandler to understand expectations and edge cases.
++- Implemented HEAD suppression in ServerHandler.write(); now validating via a stubbed WSGI run to ensure no body is written for HEAD.
++- Verifying GET requests are unaffected and still return the body.

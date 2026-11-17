@@ -1,0 +1,145 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/edit_inject_ascii_validation.py b/edit_inject_ascii_validation.py
+new file mode 100644
+index 00000000..1830ed13
+--- /dev/null
++++ b/edit_inject_ascii_validation.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++import sys, re, io
++
++def main():
++    if len(sys.argv) != 2:
++        print("Usage: edit_inject_ascii_validation.py <file>", file=sys.stderr)
++        sys.exit(2)
++    path = sys.argv[1]
++    with io.open(path, 'r', encoding='utf-8') as f:
++        s = f.read()
++
++    # Find the wildcard check and insert an ASCII validation else-block after it.
++    pattern = re.compile(
++        r"(?m)^(?P<indent>[ \t]+)elif host\.startswith\(u'\\*'\):\n"
++        r"(?P<indent2>[ \t]+)raise InvalidURL\('URL has an invalid label\\.'\)\n"
++    )
++
++    def repl(m):
++        indent = m.group('indent')
++        indent2 = m.group('indent2')
++        add = (
++            f"{indent}else:\n"
++            f"{indent2}# Validate ASCII host labels to ensure invalid empty labels are rejected.\n"
++            f"{indent2}# Disallow leading/trailing dots and consecutive dots to avoid UnicodeError downstream.\n"
++            f"{indent2}if host.startswith(u'.') or host.endswith(u'.') or u'..' in host:\n"
++            f"{indent2}    raise InvalidURL('URL has an invalid label.')\n"
++        )
++        return m.group(0) + add
++
++    new, n = pattern.subn(repl, s, count=1)
++    if n == 0:
++        print("No changes made; pattern not found", file=sys.stderr)
++        sys.exit(1)
++
++    with io.open(path, 'w', encoding='utf-8', newline='') as f:
++        f.write(new)
++    print(f"Patched {path} successfully.")
++
++if __name__ == "__main__":
++    main()
+diff --git a/requests/models.py b/requests/models.py
+index e7d292d5..4df11c4a 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -405,6 +405,11 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+                 raise InvalidURL('URL has an invalid label.')
+         elif host.startswith(u'*'):
+             raise InvalidURL('URL has an invalid label.')
++        else:
++            # Validate ASCII host labels to ensure invalid empty labels are rejected.
++            # Disallow leading/trailing dots and consecutive dots to avoid UnicodeError downstream.
++            if host.startswith(u'.') or host.endswith(u'.') or u'..' in host:
++                raise InvalidURL('URL has an invalid label.')
+ 
+         # Carefully reconstruct the network location
+         netloc = auth or ''
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 00000000..951735fa
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,70 @@
++Getting http://.example.com raises UnicodeError
++Attempting to get e.g. http://.example.com results in a UnicodeError. It seems like the intention so far has been to raise InvalidUrl instead (see e.g. [this line](https://github.com/psf/requests/blob/ca6f9af5dba09591007b15a7368bc0f006b7cc50/requests/models.py#L401)).
++
++I see there was some hesitation in fixing a similar issue (#4168) and would like to add that even catching the error just to rethrow as a requests exception would be beneficial.
++
++## Expected Result
++
++Based on PR #774: InvalidUrl: URL has an invalid label.
++
++## Actual Result
++
++UnicodeError: encoding with 'idna' codec failed (UnicodeError: label empty or too long)
++
++## Reproduction Steps
++
++python3
++import requests
++requests.get(http://.example.com)
++
++
++## System Information
++
++    $ python -m requests.help
++
++
++{
++  chardet: {
++    version: 3.0.4
++  },
++  cryptography: {
++    version: 2.8
++  },
++  idna: {
++    version: 2.8
++  },
++  implementation: {
++    name: CPython,
++    version: 3.8.0
++  },
++  platform: {
++    release: 5.3.0-40-generic,
++    system: Linux
++  },
++  pyOpenSSL: {
++    openssl_version: 1010104f,
++    version: 19.1.0
++  },
++  requests: {
++    version: 2.23.0
++  },
++  system_ssl: {
++    version: 1010103f
++  },
++  urllib3: {
++    version: 1.25.8
++  },
++  using_pyopenssl: true
++}
++
++
++
++INSIGHT: In requests/models.py, prepare_url only validates non-ASCII hosts via IDNA; ASCII hosts (e.g. '.example.com') skip IDNA and only check for wildcard '*', allowing invalid empty labels to pass and later cause a UnicodeError from downstream idna encoding. We should add ASCII host label validation (e.g., disallow leading/trailing dots or empty labels) and raise InvalidURL('URL has an invalid label.') in prepare_url to match expected behavior.
++
++INSIGHT: Regex-based patch failed due to formatting/indentation differences; proceeding with a programmatic insertion of ASCII host validation after the wildcard check in requests/models.py.
++INSIGHT: After patch, GET http://.example.com raised -> InvalidURL: URL has an invalid label.
++INSIGHT: ASCII host validation code present in requests/models.py
++INSIGHT: prepare() for 'http://example.com' succeeded
++INSIGHT: prepare() for 'http://.example.com' raised -> InvalidURL: URL has an invalid label.
++INSIGHT: prepare() for 'http://example..com' raised -> InvalidURL: URL has an invalid label.
++INSIGHT: prepare() for 'http://éxample.com' succeeded

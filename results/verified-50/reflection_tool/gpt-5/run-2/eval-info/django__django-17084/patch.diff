@@ -1,0 +1,229 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..76f2055a91
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,19 @@
++Cannot use aggregate over window functions since 4.2
++Description
++	 
++		(last modified by younes-chaoui)
++	 
++After upgrading to Django 4.2, I encountered an exception when executing ORM queries that involve aggregates over Window functions. The specific error was psycopg2.errors.GroupingError: aggregate function calls cannot contain window function calls
++Dependencies :
++psycopg2 version: 2.9.3
++django version: 4.2.3
++PostgreSQL version: 13.4
++Example Code:
++queryset = queryset.annotate(
++	cumul_DJR=Coalesce(Window(Sum(DJR), order_by=F(date).asc()), 0.0)
++)
++aggregate = queryset.aggregate(
++	DJR_total=Sum(DJR),
++	cumul_DJR_total=Sum(cumul_DJR)
++)
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..2745979fd5 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -403,6 +403,7 @@ class Query(BaseExpression):
+         # Store annotation mask prior to temporarily adding aggregations for
+         # resolving purpose to facilitate their subsequent removal.
+         refs_subquery = False
++        refs_over_clause = False
+         replacements = {}
+         annotation_select_mask = self.annotation_select_mask
+         for alias, aggregate_expr in aggregate_exprs.items():
+@@ -419,6 +420,14 @@ class Query(BaseExpression):
+                 getattr(self.annotations[ref], "subquery", False)
+                 for ref in aggregate.get_refs()
+             )
++            # Detect if aggregation references windowed annotations or contains windows itself.
++            refs_over_clause |= (
++                getattr(aggregate, "contains_over_clause", False)
++                or any(
++                    getattr(self.annotations[ref], "contains_over_clause", False)
++                    for ref in aggregate.get_refs()
++                )
++            )
+             aggregate = aggregate.replace_expressions(replacements)
+             self.annotations[alias] = aggregate
+             replacements[Ref(alias, aggregate)] = aggregate
+@@ -451,6 +460,7 @@ class Query(BaseExpression):
+             or self.is_sliced
+             or has_existing_aggregation
+             or refs_subquery
++                or refs_over_clause
+             or qualify
+             or self.distinct
+             or self.combinator
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..2e5874af43
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,17 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++[Added by assistant]
++- Issue focus: Aggregates over Window() expressions raise GroupingError on PostgreSQL since Django 4.2.
++- Likely solution: Materialize window annotations in a subquery, then aggregate in an outer SELECT. This avoids "aggregate contains window function" by separating phases.
++- Code hotspots to inspect: django/db/models/expressions.py, expressions/window.py, aggregates.py, sql/query.py, sql/compiler.py, backend features flags.
++- Implementation hints:
++  - Ensure Query detects aggregation over windowed annotations and forces a subquery/outer query plan.
++  - Consider flags like contains_aggregate/contains_window to prevent illegal inlining.
++  - Keep backend-agnostic; opt-in subquery for backends that require it (PostgreSQL).
++- Workflow:
++  - Create a minimal reproduction (annotate Window(Sum(...)) then aggregate that annotation).
++  - Run targeted tests in tests/expressions, tests/window, tests/aggregation.
++  - Make small edits using tools/edit.py and re-run focused tests iteratively.
+diff --git a/tools/edit.py b/tools/edit.py
+new file mode 100755
+index 0000000000..ca844d0688
+--- /dev/null
++++ b/tools/edit.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from pathlib import Path
++
++def read_file(path):
++    p = Path(path)
++    if not p.exists():
++        sys.stderr.write(f"[edit.py] ERROR: File not found: {path}\n")
++        sys.exit(2)
++    return p.read_text(encoding="utf-8")
++
++def write_file(path, content):
++    p = Path(path)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(content, encoding="utf-8")
++    sys.stdout.write(f"[edit.py] WROTE: {path} ({len(content)} bytes)\n")
++
++def cmd_write(args):
++    if args.stdin:
++        content = sys.stdin.read()
++    elif args.content is not None:
++        content = args.content
++    else:
++        sys.stderr.write("[edit.py] ERROR: provide --stdin or --content\n")
++        sys.exit(2)
++    write_file(args.path, content)
++
++def cmd_replace(args):
++    text = read_file(args.path)
++    count_before = text.count(args.pattern) if not args.regex else len(re.findall(args.pattern, text, flags=re.MULTILINE|re.DOTALL))
++    if args.regex:
++        new_text, n = re.subn(args.pattern, args.repl, text, count=0 if args.count == 0 else args.count, flags=re.MULTILINE|re.DOTALL)
++    else:
++        if args.count == 0:
++            new_text = text.replace(args.pattern, args.repl)
++            n = count_before
++        else:
++            new_text = text
++            n = 0
++            for _ in range(args.count):
++                idx = new_text.find(args.pattern)
++                if idx == -1:
++                    break
++                new_text = new_text.replace(args.pattern, args.repl, 1)
++                n += 1
++    if n == 0 and not args.allow_zero:
++        sys.stderr.write(f"[edit.py] ERROR: No occurrences replaced in {args.path}\n")
++        sys.exit(3)
++    if new_text != text:
++        write_file(args.path, new_text)
++    sys.stdout.write(f"[edit.py] REPLACED {n} occurrence(s) in {args.path}\n")
++
++def insert_relative(text, anchor, insert, before=False, after=False, first=True):
++    lines = text.splitlines(keepends=True)
++    matches = [i for i,l in enumerate(lines) if anchor in l]
++    if not matches:
++        return None, 0
++    idx = matches[0] if first else matches[-1]
++    pos = idx if before else idx + 1
++    if after and before:
++        raise ValueError("Cannot use both --before and --after")
++    lines.insert(pos, insert if insert.endswith("\\n") else insert + "\\n")
++    return "".join(lines), 1
++
++def cmd_insert(args):
++    text = read_file(args.path)
++    new_text, n = insert_relative(
++        text,
++        anchor=args.anchor,
++        insert=args.insert,
++        before=args.before,
++        after=args.after,
++        first=not args.last
++    )
++    if n == 0 or new_text is None:
++        sys.stderr.write(f"[edit.py] ERROR: Anchor not found in {args.path}\n")
++        sys.exit(4)
++    if new_text != text:
++        write_file(args.path, new_text)
++    sys.stdout.write(f"[edit.py] INSERTED near anchor in {args.path}\n")
++
++def cmd_replace_between(args):
++    text = read_file(args.path)
++    start_idx = text.find(args.start)
++    end_idx = text.find(args.end, start_idx + len(args.start) if start_idx != -1 else 0)
++    if start_idx == -1 or end_idx == -1:
++        sys.stderr.write(f"[edit.py] ERROR: Start or end marker not found in {args.path}\n")
++        sys.exit(5)
++    if args.include_markers:
++        new_text = text[:start_idx] + args.insert + text[end_idx + len(args.end):]
++    else:
++        new_text = text[:start_idx + len(args.start)] + args.insert + text[end_idx:]
++    if new_text != text:
++        write_file(args.path, new_text)
++    sys.stdout.write(f"[edit.py] REPLACED between markers in {args.path}\n")
++
++def main():
++    parser = argparse.ArgumentParser(description="Simple editing utility for automated code changes.")
++    sub = parser.add_subparsers(dest="cmd", required=True)
++
++    p_write = sub.add_parser("write", help="Write content to a file")
++    p_write.add_argument("path")
++    p_write.add_argument("--stdin", action="store_true", help="Read content from stdin")
++    p_write.add_argument("--content", help="Content string to write")
++    p_write.set_defaults(func=cmd_write)
++
++    p_replace = sub.add_parser("replace", help="Replace text or regex in a file")
++    p_replace.add_argument("path")
++    p_replace.add_argument("--pattern", required=True, help="Pattern string or regex")
++    p_replace.add_argument("--repl", required=True, help="Replacement string")
++    p_replace.add_argument("--regex", action="store_true", help="Interpret pattern as regex")
++    p_replace.add_argument("--count", type=int, default=0, help="Max replacements (0 = all)")
++    p_replace.add_argument("--allow-zero", action="store_true", help="Do not error if zero replacements")
++    p_replace.set_defaults(func=cmd_replace)
++
++    p_insert = sub.add_parser("insert", help="Insert text before/after an anchor line")
++    p_insert.add_argument("path")
++    p_insert.add_argument("--anchor", required=True, help="Anchor substring to find")
++    p_insert.add_argument("--insert", required=True, help="Text to insert")
++    grp = p_insert.add_mutually_exclusive_group(required=True)
++    grp.add_argument("--before", action="store_true")
++    grp.add_argument("--after", action="store_true")
++    p_insert.add_argument("--last", action="store_true", help="Use last occurrence of anchor")
++    p_insert.set_defaults(func=cmd_insert)
++
++    p_between = sub.add_parser("between", help="Replace content between start and end markers")
++    p_between.add_argument("path")
++    p_between.add_argument("--start", required=True)
++    p_between.add_argument("--end", required=True)
++    p_between.add_argument("--insert", required=True)
++    p_between.add_argument("--include-markers", action="store_true")
++    p_between.set_defaults(func=cmd_replace_between)
++
++    args = parser.parse_args()
++    args.func(args)
++
++if __name__ == "__main__":
++    main()

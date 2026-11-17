@@ -1,0 +1,143 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..96a41f535a
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,5 @@
++Argument invariance of codegen.ast String
++Currently, the codegen.ast String class does not support argument invariance like:
++expr.func(*expr.args) == expr, but instead uses the invariance expr.func(**expr.kwargs()) == expr.
++The former should hold for any Basic subclass, which String is.
++
+diff --git a/dev_edit.py b/dev_edit.py
+new file mode 100644
+index 0000000000..38ea174f90
+--- /dev/null
++++ b/dev_edit.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++import sys
++import argparse
++import io
++import os
++
++def insert_after(filepath, pattern, insert_text, occur=1):
++    with open(filepath, 'r', encoding='utf-8') as f:
++        lines = f.readlines()
++    count = 0
++    new_lines = []
++    inserted = False
++    for i, line in enumerate(lines):
++        new_lines.append(line)
++        if pattern in line:
++            count += 1
++            if count == occur:
++                # ensure correct indentation if possible
++                # we'll preserve indentation level of the following line
++                new_lines.append(insert_text)
++                inserted = True
++    if not inserted:
++        raise RuntimeError(f"Pattern not found sufficient times: {pattern!r} in {filepath}")
++    with open(filepath, 'w', encoding='utf-8') as f:
++        f.writelines(new_lines)
++
++def replace_between(filepath, start_pattern, end_pattern, replacement, include_markers=False):
++    with open(filepath, 'r', encoding='utf-8') as f:
++        content = f.read()
++    start_idx = content.find(start_pattern)
++    if start_idx == -1:
++        raise RuntimeError(f"Start pattern not found: {start_pattern!r}")
++    end_idx = content.find(end_pattern, start_idx + len(start_pattern))
++    if end_idx == -1:
++        raise RuntimeError(f"End pattern not found after start: {end_pattern!r}")
++    if include_markers:
++        new_content = content[:start_idx] + replacement + content[end_idx+len(end_pattern):]
++    else:
++        new_content = content[:start_idx+len(start_pattern)] + replacement + content[end_idx:]
++    with open(filepath, 'w', encoding='utf-8') as f:
++        f.write(new_content)
++
++def main():
++    parser = argparse.ArgumentParser(description="Simple file edit helper")
++    sub = parser.add_subparsers(dest='cmd', required=True)
++
++    ia = sub.add_parser('insert_after', help='Insert text after first/ith occurrence of a pattern')
++    ia.add_argument('filepath')
++    ia.add_argument('pattern')
++    ia.add_argument('--occur', type=int, default=1, help='which occurrence to insert after (1-based)')
++
++    rb = sub.add_parser('replace_between', help='Replace text between two patterns')
++    rb.add_argument('filepath')
++    rb.add_argument('start_pattern')
++    rb.add_argument('end_pattern')
++    rb.add_argument('--include_markers', action='store_true', help='whether to also replace the markers')
++
++    args = parser.parse_args()
++
++    if args.cmd == 'insert_after':
++        insert_text = sys.stdin.read()
++        if not insert_text.endswith('\n'):
++            insert_text += '\n'
++        insert_after(args.filepath, args.pattern, insert_text, occur=args.occur)
++    elif args.cmd == 'replace_between':
++        replacement = sys.stdin.read()
++        replace_between(args.filepath, args.start_pattern, args.end_pattern, replacement, include_markers=args.include_markers)
++    else:
++        parser.error("Unknown command")
++
++if __name__ == '__main__':
++    main()
+diff --git a/sympy/codegen/ast.py b/sympy/codegen/ast.py
+index a02714b174..269aa129c1 100644
+--- a/sympy/codegen/ast.py
++++ b/sympy/codegen/ast.py
+@@ -897,6 +897,42 @@ class String(Token):
+     __slots__ = ('text',)
+     not_in_args = ['text']
+     is_Atom = True
++    def __new__(cls, *args, **kwargs):
++        # Allow pass-through of existing instances when given as sole argument
++        if len(args) == 1 and not kwargs and isinstance(args[0], cls):
++            return args[0]
++
++        # Extract 'text' from positional or keyword arguments
++        if args and 'text' in kwargs:
++            raise TypeError("Got multiple values for attribute 'text'")
++        if args:
++            if len(args) > 1:
++                raise ValueError("Too many arguments (%d), expected at most 1" % len(args))
++            text = args[0]
++        elif 'text' in kwargs:
++            text = kwargs.pop('text')
++            if kwargs:
++                raise ValueError("Unknown keyword arguments: %s" % ' '.join(kwargs))
++        else:
++            raise TypeError("No value for 'text' given and attribute has no default")
++
++        # Accept SymPy Str or Python str
++        from sympy.core.symbol import Str as _Str
++        if isinstance(text, _Str):
++            s = text.name
++            str_arg = text
++        elif isinstance(text, str):
++            s = text
++            str_arg = _Str(text)
++        else:
++            raise TypeError("Argument text is not a string type.")
++
++        # Create Basic with positional arg as SymPy Str for args-invariance
++        obj = CodegenAST.__new__(cls, str_arg)
++
++        # Maintain existing API: attribute remains a plain Python string
++        obj.text = s
++        return obj
+ 
+     @classmethod
+     def _construct_text(cls, text):

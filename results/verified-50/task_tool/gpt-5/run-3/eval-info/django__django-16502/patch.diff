@@ -1,0 +1,130 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..38a47aa14a 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,6 +143,14 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        # Suppress response body for HEAD requests to comply with RFC 2616/7231.
++        if self.environ.get('REQUEST_METHOD') == 'HEAD':
++            if not self.headers_sent:
++                self.send_headers()
++            return
++        super().write(data)
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..bb20044fca
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,8 @@
++Insights: This is the Django source tree. The issue concerns the dev server (runserver) returning a body for HTTP HEAD requests starting in Django 1.10. The likely fix location is django/core/servers/basehttp.py (WSGI server/handler). Plan: Modify server handler to suppress response body on HEAD to comply with RFC 2616.
++Insight: Inspecting ServerHandler around insertion point to confirm write override.
++Change: Added ServerHandler.write() override in django/core/servers/basehttp.py to suppress body for HEAD requests while still sending headers to make runserver RFC compliant.
++Insight: Verifying whether ServerHandler.write() override exists in django/core/servers/basehttp.py.
++Fix: Inserted ServerHandler.write() in django/core/servers/basehttp.py to suppress body for HEAD requests while still sending headers, aligning runserver with RFC 2616/7231.
++Insight: Implemented ServerHandler.write() override to suppress body on HEAD; now searching tests referencing HEAD/basehttp/runserver to decide minimal tests to run.
++Insight: Running validation script to ensure HEAD responses include headers but no body.
++Insight: Verifying presence and placement of ServerHandler.write() override in basehttp.py.
+diff --git a/tools/edit_file.py b/tools/edit_file.py
+new file mode 100644
+index 0000000000..d6b44e6f96
+--- /dev/null
++++ b/tools/edit_file.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++import sys, re
++
++def insert_write_method(path):
++    with open(path, 'r', encoding='utf-8') as f:
++        s = f.read()
++    if 'class ServerHandler' not in s:
++        print('ServerHandler class not found in {}'.format(path), file=sys.stderr)
++        return 1
++    # If write already exists in ServerHandler, do nothing.
++    class_block = re.search(r'class ServerHandler\(.*?\):(.*?)(^\s*class\s|\Z)', s, re.S | re.M)
++    if class_block and re.search(r'^\s*def write\(\s*self\s*,\s*data\s*\)\s*:', class_block.group(1), re.M):
++        print('write method already present; no changes')
++        return 0
++    # Insert before the close() method inside ServerHandler.
++    m = re.search(r'(class ServerHandler\(.*?\):)(.*?)(^\s*def close\()', s, re.S | re.M)
++    if not m:
++        print('Could not find insertion point (def close) in {}'.format(path), file=sys.stderr)
++        return 1
++    insert_at = m.start(3)
++    method = '''
++    def write(self, data):
++        # Suppress response body for HEAD requests to comply with RFC 2616/7231.
++        if self.environ.get('REQUEST_METHOD') == 'HEAD':
++            if not self.headers_sent:
++                self.send_headers()
++            return
++        super().write(data)
++'''
++    new = s[:insert_at] + method + s[insert_at:]
++    with open(path, 'w', encoding='utf-8') as f:
++        f.write(new)
++    print('Inserted write method in', path)
++    return 0
++
++if __name__ == '__main__':
++    sys.exit(insert_write_method(sys.argv[1]))
++PY && python tools/edit_file.py django/core/servers/basehttp.py && printf "%s\n" "Insight: Confirmed ServerHandler lacked write() override; inserted write() to skip body on HEAD while still sending headers." >> task_description.txt && grep -nC3 'def write(.*HEAD' -n django/core/servers/basehttp.py
+diff --git a/tools/test_head_no_body.py b/tools/test_head_no_body.py
+new file mode 100644
+index 0000000000..cd3a37e6ef
+--- /dev/null
++++ b/tools/test_head_no_body.py
+@@ -0,0 +1,40 @@
++import io, sys, types, socketserver
++from django.core.servers.basehttp import ServerHandler
++
++def app(environ, start_response):
++    body = b"Hello World!"
++    headers = [('Content-Type', 'text/plain; charset=utf-8'),
++               ('Content-Length', str(len(body)))]
++    start_response('200 OK', headers)
++    return [body]
++
++stdin = io.BytesIO(b'')
++stdout = io.BytesIO()
++stderr = io.StringIO()
++
++environ = {
++    'REQUEST_METHOD': 'HEAD',
++    'SERVER_PROTOCOL': 'HTTP/1.1',
++    'SERVER_NAME': 'localhost',
++    'SERVER_PORT': '8000',
++    'SCRIPT_NAME': '',
++    'PATH_INFO': '/',
++    'QUERY_STRING': '',
++    'wsgi.url_scheme': 'http',
++}
++
++handler = ServerHandler(stdin, stdout, stderr, environ)
++class DummyServer(socketserver.ThreadingMixIn): pass
++request_handler_stub = types.SimpleNamespace(server=DummyServer(), close_connection=False)
++handler.request_handler = request_handler_stub
++handler.run(app)
++
++data = stdout.getvalue()
++text = data.decode('iso-8859-1', errors='replace')
++ok = ('Hello World!' not in text) and ('Content-Type' in text) and ('200 OK' in text or 'Status:' in text)
++print("TEST_RESULT:", "PASS" if ok else "FAIL")
++if not ok:
++    print("RAW_OUTPUT_START")
++    print(text)
++    print("RAW_OUTPUT_END")
++PY && python3 tools/test_head_no_body.py | tee /tmp/test_out.txt && awk '{print "Insight: HEAD test with ServerHandler:", $0}' /tmp/test_out.txt >> task_description.txt && sed -n '140,160p' django/core/servers/basehttp.py

@@ -1,0 +1,127 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 000000000..8b1378917
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/sklearn/grid_search.py b/sklearn/grid_search.py
+index 6ba673d2f..96091cc11 100644
+--- a/sklearn/grid_search.py
++++ b/sklearn/grid_search.py
+@@ -30,6 +30,8 @@ from .utils.random import sample_without_replacement
+ from .utils.validation import _num_samples, indexable
+ from .utils.metaestimators import if_delegate_has_method
+ from .metrics.scorer import check_scoring
++from time import time
++
+ 
+ 
+ __all__ = ['GridSearchCV', 'ParameterGrid', 'fit_grid_point',
+@@ -616,10 +618,12 @@ class BaseSearchCV(six.with_metaclass(ABCMeta, BaseEstimator,
+             # clone first to work around broken estimators
+             best_estimator = clone(base_estimator).set_params(
+                 **best.parameters)
++            start_time = time()
+             if y is not None:
+                 best_estimator.fit(X, y, **self.fit_params)
+             else:
+                 best_estimator.fit(X, **self.fit_params)
++            self.refit_time_ = time() - start_time
+             self.best_estimator_ = best_estimator
+         return self
+ 
+diff --git a/sklearn/model_selection/_search.py b/sklearn/model_selection/_search.py
+index 99d6096af..5458ecbff 100644
+--- a/sklearn/model_selection/_search.py
++++ b/sklearn/model_selection/_search.py
+@@ -39,6 +39,8 @@ from ..utils.metaestimators import if_delegate_has_method
+ from ..utils.deprecation import DeprecationDict
+ from ..metrics.scorer import _check_multimetric_scoring
+ from ..metrics.scorer import check_scoring
++from time import time
++
+ 
+ 
+ __all__ = ['GridSearchCV', 'ParameterGrid', 'fit_grid_point',
+@@ -764,13 +766,14 @@ class BaseSearchCV(six.with_metaclass(ABCMeta, BaseEstimator,
+                 self.best_index_]
+ 
+         if self.refit:
++            start_time = time()
+             self.best_estimator_ = clone(base_estimator).set_params(
+                 **self.best_params_)
+             if y is not None:
+                 self.best_estimator_.fit(X, y, **fit_params)
+             else:
+                 self.best_estimator_.fit(X, **fit_params)
+-
++            self.refit_time_ = time() - start_time
+         # Store the only scorer not as a dict for single metric evaluation
+         self.scorer_ = scorers if self.multimetric_ else scorers['score']
+ 
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 000000000..9031875a1
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,59 @@
++Retrieving time to refit the estimator in BaseSearchCV
++Basically, I'm trying to figure out how much time it takes to refit the best model on the full data after doing grid/random search. What I can so far do is retrieve the time it takes to fit and score each model:
++
++import sklearn.datasets
++import sklearn.model_selection
++import sklearn.ensemble
++
++X, y = sklearn.datasets.load_iris(return_X_y=True)
++
++rs = sklearn.model_selection.GridSearchCV(
++    estimator=sklearn.ensemble.RandomForestClassifier(),
++    param_grid={'n_estimators': [2, 3, 4, 5]}
++)
++rs.fit(X, y)
++print(rs.cv_results_['mean_fit_time'])
++print(rs.cv_results_['mean_score_time'])
++
++In case I run this on a single core, I could time the whole search procedure and subtract the time it took to fit the single folds during hyperparameter optimization. Nevertheless, this isn't possible any more when setting n_jobs != 1.
++
++Thus, it would be great to have an attribute refit_time_ which is simply the time it took to refit the best model.
++
++Usecase: for [OpenML.org](https://openml.org) we want to support uploading the results of hyperparameter optimization, including the time it takes to do the hyperparameter optimization. 
++
++
++Insights:
++- BaseSearchCV is implemented in sklearn/model_selection/_search.py (modern API) and sklearn/grid_search.py (legacy).
++- We need to add an attribute refit_time_ to record time spent refitting the best estimator on the full dataset after search.
++- Implementation should wrap the refit section in a timing block and store the elapsed seconds in refit_time_.
++
++Update:
++- Implemented refit_time_ in sklearn/model_selection/_search.py by timing the refit of best_estimator_.
++
++Verification:
++REFIT_TIME 0.011535167694091797
++HAS_ATTR True
++BEST_PARAMS {'n_estimators': 2}
++
++Update:
++- Mirrored refit_time_ timing in legacy sklearn/grid_search.py BaseSearchCV.
++
++Legacy Verification:
++
++Legacy Verification:
++LEGACY_HAS_ATTR False
++LEGACY_REFIT_TIME None
++LEGACY_BEST_PARAMS {'n_estimators': 2}
++
++Insight: Legacy GridSearchCV did not expose refit_time_ after initial patch; need to locate actual refit block in sklearn/grid_search.py for proper timing.
++
++Legacy Verification:
++
++Insight: Legacy grid_search.py timing presence -> start_time count: 1; refit_time_ count: 1
++
++Legacy Verification (fixed):
++
++Legacy Verification (final):
++LEGACY_HAS_ATTR True
++LEGACY_REFIT_TIME 0.0060427188873291016
++LEGACY_BEST_PARAMS {'n_estimators': 2}

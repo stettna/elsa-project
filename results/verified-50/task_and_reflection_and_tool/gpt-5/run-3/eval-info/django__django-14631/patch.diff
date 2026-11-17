@@ -1,0 +1,250 @@
+diff --git a/django/forms/boundfield.py b/django/forms/boundfield.py
+index 88adadb37d..36c68d2565 100644
+--- a/django/forms/boundfield.py
++++ b/django/forms/boundfield.py
+@@ -1,5 +1,6 @@
+ import datetime
+ import re
++from django.core.exceptions import ValidationError
+ 
+ from django.forms.utils import flatatt, pretty_name
+ from django.forms.widgets import Textarea, TextInput
+@@ -228,6 +229,29 @@ class BoundField:
+             attrs['disabled'] = True
+         return attrs
+ 
++    def _did_change(self):
++        """
++        Determine if this field's data differs from its initial value, mirroring
++        BaseForm.changed_data logic but scoped to this BoundField.
++        """
++        field = self.field
++        form = self.form
++        data_value = form._field_data_value(field, self.html_name)
++        if not field.show_hidden_initial:
++            # Use the BoundField's initial as this is the value passed to the widget.
++            initial_value = self.initial
++        else:
++            hidden_widget = field.hidden_widget()
++            try:
++                initial_value = field.to_python(
++                    form._widget_data_value(hidden_widget, self.html_initial_name)
++                )
++            except ValidationError:
++                # Always assume data has changed if validation fails.
++                return True
++        return field.has_changed(initial_value, data_value)
++
++
+     @property
+     def widget_type(self):
+         return re.sub(r'widget$|input$', '', self.field.widget.__class__.__name__.lower())
+diff --git a/django/forms/forms.py b/django/forms/forms.py
+index d14037bfe9..7a906e5ccc 100644
+--- a/django/forms/forms.py
++++ b/django/forms/forms.py
+@@ -147,6 +147,12 @@ class BaseForm:
+         for name in self.fields:
+             yield self[name]
+ 
++
++    def _bound_items(self):
++        """Yield (name, BoundField) pairs for all fields on the form."""
++        for name in self.fields:
++            yield name, self[name]
++
+     def __getitem__(self, name):
+         """Return a BoundField with the given name."""
+         try:
+@@ -385,16 +391,16 @@ class BaseForm:
+         self._clean_fields()
+         self._clean_form()
+         self._post_clean()
+-
+     def _clean_fields(self):
+-        for name, field in self.fields.items():
++        for name, bf in self._bound_items():
++            field = bf.field
+             if field.disabled:
+-                value = self.get_initial_for_field(field, name)
++                value = bf.initial
+             else:
+-                value = self._field_data_value(field, self.add_prefix(name))
++                value = bf.data
+             try:
+                 if isinstance(field, FileField):
+-                    initial = self.get_initial_for_field(field, name)
++                    initial = bf.initial
+                     value = field.clean(value, initial)
+                 else:
+                     value = field.clean(value)
+@@ -436,27 +442,7 @@ class BaseForm:
+ 
+     @cached_property
+     def changed_data(self):
+-        data = []
+-        for name, field in self.fields.items():
+-            data_value = self._field_data_value(field, self.add_prefix(name))
+-            if not field.show_hidden_initial:
+-                # Use the BoundField's initial as this is the value passed to
+-                # the widget.
+-                initial_value = self[name].initial
+-            else:
+-                initial_prefixed_name = self.add_initial_prefix(name)
+-                hidden_widget = field.hidden_widget()
+-                try:
+-                    initial_value = field.to_python(
+-                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+-                    )
+-                except ValidationError:
+-                    # Always assume data has changed if validation fails.
+-                    data.append(name)
+-                    continue
+-            if field.has_changed(initial_value, data_value):
+-                data.append(name)
+-        return data
++        return [name for name, bf in self._bound_items() if bf._did_change()]
+ 
+     @property
+     def media(self):
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..ab5988db80
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,15 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++[Update 1 - Plan]
++- Inspect BaseForm._clean_fields and BaseForm.changed_data in django/forms/forms.py.
++- Inspect BoundField in django/forms/boundfield.py to add a _did_change() method encapsulating per-field logic for change detection.
++- Refactor BaseForm.changed_data to: [name for name, bf in self._bound_items() if bf._did_change()].
++- Adjust BaseForm._clean_fields to retrieve values through BoundField to stay consistent with form[name].initial, handling disabled fields and callable initial.
++- After implementing, run tests to catch regressions (e.g., datetime clean initial callable disabled, microseconds handling).
++[Update 2 - Next steps]
++- Run a targeted subset of Django tests focusing on forms changed_data and disabled/initial interactions.
++- If failures occur, compare expected vs. actual logic around bf.data vs. bound_data/prepare_value to ensure correct raw vs. cleaned comparison.
++- Watch for edge cases: MultiValue fields, FileFields, show_hidden_initial, and microseconds normalization via BoundField.initial.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..b61f7ec641
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,32 @@
++BaseForm's _clean_fields() and changed_data should access values via BoundField
++Description
++	 
++		(last modified by Chris Jerdonek)
++	 
++While working on #32917, I noticed that ​BaseForm._clean_fields() and ​BaseForm.changed_data don't currently access their values through a BoundField object. It would be better for consistency if they did, and to reduce the number of code paths.
++One consequence of the current code is that form._clean_fields() can return a different value from form[name].initial when they should be the same. This case is almost, but not quite, covered by ​test_datetime_clean_initial_callable_disabled() (the test can be adjusted to cover this case).
++As part of this ticket and in line with accessing data through the BoundField objects, I noticed that the code would also be simpler if the per-field logic of changed_data() were moved into a method of the BoundField class. It could be called something like bf.did_change(). This would be more appropriate because whether form data changed for a field is a property of its BoundField (as it depends on the underlying form data), as opposed to the unbound field. With this change, the method could change from its current ~20 lines to something like this--
++@cached_property
++def changed_data(self):
++	return [name for name, bf in self._bound_items() if bf._did_change()]
++A similar change could be made to BaseForm._clean_fields().
++
++[Update 1 - Repository insights]
++- BaseForm is implemented in django/forms/forms.py.
++- BaseForm._clean_fields() is defined around lines ~389 in django/forms/forms.py.
++- BaseForm.changed_data property is defined around lines ~435-450 in django/forms/forms.py.
++- BoundField is implemented in django/forms/boundfield.py.
++- Task: Refactor BaseForm._clean_fields() and changed_data to access values via BoundField, and introduce a BoundField._did_change() helper to encapsulate per-field change detection logic. Ensure form._clean_fields() returns the same value as form[name].initial in cases such as callable initial with disabled fields (e.g., datetime clean initial callable disabled).
++[Update 1 - Repository insights]
++- BaseForm is implemented in django/forms/forms.py.
++- BaseForm._clean_fields() is defined in django/forms/forms.py.
++- BaseForm.changed_data property is defined in django/forms/forms.py.
++- BoundField is implemented in django/forms/boundfield.py.
++- Goal: Refactor BaseForm._clean_fields() and changed_data to access values via BoundField, and introduce a BoundField._did_change() helper to encapsulate per-field change detection logic. Ensure form._clean_fields() returns the same value as form[name].initial, including for callable initial with disabled fields.
++[Update 2 - Implementation progress]
++- Confirmed BaseForm had no _bound_items helper; added BaseForm._bound_items() yielding (name, BoundField).
++- Implemented BoundField._did_change() mirroring existing changed_data per-field logic (handling show_hidden_initial and ValidationError cases).
++- Refactored BaseForm.changed_data to: [name for name, bf in self._bound_items() if bf._did_change()].
++- Refactored BaseForm._clean_fields() to use BoundField: bf.initial for disabled fields and bf.data for enabled fields; FileField uses bf.initial for initial.
++- Added import of ValidationError in django/forms/boundfield.py.
++- Next: run targeted tests related to forms changed_data and initial/disabled logic to verify behavior.
+diff --git a/tools/apply_edits.py b/tools/apply_edits.py
+new file mode 100755
+index 0000000000..8e4a797b31
+--- /dev/null
++++ b/tools/apply_edits.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++import sys, re, json, io, os
++
++def apply_replace_regex(text, pattern, repl, flags=0, count=0):
++    rx_flags = 0
++    if isinstance(flags, str):
++        for name in flags.split('|'):
++            name = name.strip().upper()
++            if not name: continue
++            rx_flags |= getattr(re, name)
++    else:
++        rx_flags = flags or 0
++    return re.sub(pattern, repl, text, count=0 if count is None else count, flags=rx_flags)
++
++def apply_insert_after(text, pattern, insert_text, flags=0, count=1):
++    rx_flags = 0
++    if isinstance(flags, str):
++        for name in flags.split('|'):
++            name = name.strip().upper()
++            if not name: continue
++            rx_flags |= getattr(re, name)
++    else:
++        rx_flags = flags or 0
++    def _repl(m):
++        return m.group(0) + insert_text
++    return re.sub(pattern, _repl, text, count=0 if count is None else count, flags=rx_flags)
++
++def apply_insert_before(text, pattern, insert_text, flags=0, count=1):
++    rx_flags = 0
++    if isinstance(flags, str):
++        for name in flags.split('|'):
++            name = name.strip().upper()
++            if not name: continue
++            rx_flags |= getattr(re, name)
++    else:
++        rx_flags = flags or 0
++    def _repl(m):
++        return insert_text + m.group(0)
++    return re.sub(pattern, _repl, text, count=0 if count is None else count, flags=rx_flags)
++
++def ensure_contains(text, snippet):
++    return text if snippet in text else (text + ("\n" if not text.endswith("\n") else "") + snippet)
++
++def apply_ops(filename, ops):
++    with open(filename, "r", encoding="utf-8") as f:
++        text = f.read()
++    original = text
++    for op in ops:
++        t = op.get("type")
++        if t == "replace_regex":
++            text = apply_replace_regex(text, op["pattern"], op["repl"], op.get("flags", 0), op.get("count", 0))
++        elif t == "insert_after":
++            text = apply_insert_after(text, op["pattern"], op["insert_text"], op.get("flags", 0), op.get("count", 1))
++        elif t == "insert_before":
++            text = apply_insert_before(text, op["pattern"], op["insert_text"], op.get("flags", 0), op.get("count", 1))
++        elif t == "ensure_contains":
++            text = ensure_contains(text, op["snippet"])
++        else:
++            raise SystemExit(f"Unsupported op type: {t}")
++    if text != original:
++        with open(filename, "w", encoding="utf-8") as f:
++            f.write(text)
++        print(f"Updated: {filename}")
++    else:
++        print(f"No changes: {filename}")
++
++def main():
++    if sys.stdin.isatty():
++        raise SystemExit("Provide a JSON payload on stdin with {'edits': [{'file': 'path', 'ops': [...]}]}")
++    payload = json.load(sys.stdin)
++    edits = payload.get("edits") or []
++    for e in edits:
++        apply_ops(e["file"], e["ops"])
++    print("Done.")
++if __name__ == "__main__":
++    main()

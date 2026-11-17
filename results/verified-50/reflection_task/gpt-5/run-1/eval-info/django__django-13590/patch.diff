@@ -1,0 +1,124 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..653508f653 100755
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1077,6 +1077,11 @@ class Query(BaseExpression):
+         elif isinstance(value, (list, tuple)):
+             # The items of the iterable may be expressions and therefore need
+             # to be resolved independently.
++            if isinstance(value, tuple) and type(value) is not tuple:
++                return type(value)(*(
++                    self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
++                    for sub_value in value
++                ))
+             return type(value)(
+                 self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                 for sub_value in value
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..4da9ff99c1
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,80 @@
++
++- Remember: Update task_description.txt whenever we discover concrete code locations or root causes.
++- For this task, the bug is in django/db/models/sql/query.py::Query.resolve_lookup_value reconstructing tuples via type(value)(iterator), which breaks for namedtuples.
++- Fix strategy: When value is a tuple subclass (i.e., isinstance(value, tuple) and type(value) is not tuple), reconstruct with type(value)(*generator) to pass positional args.
++- After patching, verify with a small runtime check that a namedtuple passes through resolve_lookup_value unchanged and no TypeError is raised.
++EOF && python - <<'PY'
++import io, sys, os
++p = 'django/db/models/sql/query.py'
++with open(p, 'r', encoding='utf-8') as f:
++    s = f.read()
++lines = s.splitlines(True)
++target = "elif isinstance(value, (list, tuple)):"
++idx = None
++for i, l in enumerate(lines):
++    if l.strip() == target:
++        idx = i
++        break
++if idx is None:
++    print('ERROR: target block not found')
++    sys.exit(1)
++j = None
++for k in range(idx + 1, min(idx + 30, len(lines))):
++    if 'return type(value)(' in lines[k]:
++        j = k
++        break
++if j is None:
++    print('ERROR: return constructor line not found')
++    sys.exit(1)
++k_end = None
++for k in range(j + 1, min(j + 15, len(lines))):
++    # Find the closing line of the constructor call based on indentation and ')'
++    if lines[k].lstrip().startswith(')'):
++        k_end = k
++        break
++if k_end is None:
++    k_end = j + 3  # Fallback to the expected structure
++indent = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
++new_block = (
++    f"{indent}if isinstance(value, tuple) and type(value) is not tuple:\n"
++    f"{indent}    return type(value)(*(\n"
++    f"{indent}        self.resolve_lookup_value(sub_value, can_reuse, allow_joins)\n"
++    f"{indent}        for sub_value in value\n"
++    f"{indent}    ))\n"
++    f"{indent}return type(value)(\n"
++    f"{indent}    self.resolve_lookup_value(sub_value, can_reuse, allow_joins)\n"
++    f"{indent}    for sub_value in value\n"
++    f"{indent})\n"
++)
++new_lines = lines[:j] + [new_block] + lines[k_end+1:]
++new_s = ''.join(new_lines)
++if new_s != s:
++    with open(p, 'w', encoding='utf-8') as f:
++        f.write(new_s)
++    print('patched')
++else:
++    print('unchanged')
++PY && cat <<'EOF' >> task_description.txt
++Additional insights and fix details:
++- Located the issue in django/db/models/sql/query.py within Query.resolve_lookup_value.
++- The function reconstructed iterables with: return type(value)(<generator>).
++- For namedtuples (tuple subclasses), this passes a single iterable to the constructor, causing TypeError due to missing positional arguments.
++- Implemented a fix: when value is a tuple subclass (isinstance(value, tuple) and type(value) is not tuple), reconstruct using argument expansion with type(value)(*generator). Lists and plain tuples continue to use the original constructor form.
++- This change preserves type for namedtuples and avoids the iterator-constructor mismatch that regressed between Django 2.2 and 3.0 for __range filters.
++EOF && python - <<'PY'
++from collections import namedtuple
++from django.db.models.sql.query import Query
++Pair = namedtuple('Pair', 'near far')
++q = Query(model=None)
++v = Pair(1, 2)
++# Should not raise and should preserve type and values.
++res = q.resolve_lookup_value(v, can_reuse=set(), allow_joins=False)
++assert isinstance(res, Pair) and res == v, (type(res), res)
++print('namedtuple test ok')
++PY
++- Remember: Update task_description.txt with concrete code locations and root causes we identify.
++- The bug: django/db/models/sql/query.py::Query.resolve_lookup_value reconstructs tuples via type(value)(iterator), breaking namedtuples that expect positional args.
++- Fix: For tuple subclasses (namedtuples), reconstruct with type(value)(*generator). Keep original behavior for list/tuple.
++- Verify with a small runtime check using a namedtuple.
++- Remember: For namedtuple fix, ensure tuple subclasses are reconstructed with *args in resolve_lookup_value.
++- Verify by passing a namedtuple to Query.resolve_lookup_value and assert no TypeError and values preserved.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..1f9e70de96
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,16 @@
++Upgrading 2.2>3.0 causes named tuples used as arguments to __range to error.
++Description
++	
++I noticed this while upgrading a project from 2.2 to 3.0.
++This project passes named 2-tuples as arguments to range queryset filters. This works fine on 2.2. On 3.0 it causes the following error: TypeError: __new__() missing 1 required positional argument: 'far'.
++This happens because django.db.models.sql.query.Query.resolve_lookup_value goes into the tuple elements to resolve lookups and then attempts to reconstitute the tuple with the resolved elements.
++When it attempts to construct the new tuple it preserves the type (the named tuple) but it passes a iterator to it's constructor.
++NamedTuples don't have the code path for copying an iterator, and so it errors on insufficient arguments.
++The fix is to * expand the contents of the iterator into the constructor.
++
++
++Additional insights and fix details:
++- Issue in django/db/models/sql/query.py within Query.resolve_lookup_value.
++- Reconstructing with type(value)(<generator>) breaks for namedtuples expecting positional args.
++- Fix: For tuple subclasses (isinstance(value, tuple) and type(value) is not tuple), reconstruct with type(value)(*generator). Keep original for list/tuple.
++- Restores behavior for __range filters across 2.2 -> 3.0 upgrade.

@@ -1,0 +1,134 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..c4ce64aa47
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,20 @@
++timesince() raises TypeError with USE_TZ=True and >1 month interval.
++Description
++	 
++		(last modified by Sage Abdullah)
++	 
++As of 8d67e16493c903adc9d049141028bc0fff43f8c8, calling timesince() with a datetime object that's one month (or more) in the past and the USE_TZ setting is set to True results in the following crash:
++TypeError: can't subtract offset-naive and offset-aware datetimes
++Test:
++...
++class TimesinceTests(TestCase):
++	...
++	@requires_tz_support
++	@override_settings(USE_TZ=True)
++	def test_long_interval_with_tz(self):
++		now = timezone.now()
++		d = now - datetime.timedelta(days=31)
++		self.assertEqual(timesince(d), 1xa0month)
++I believe this is because the pivot instantiated here: ​https://github.com/django/django/blob/d2310f6473593d28c14b63a72253408b568e100a/django/utils/timesince.py#L93-L100 does not take into account the datetime object's tzinfo. Adding 0, d.tzinfo arguments to the datetime.datetime call seems to fix this.
++Happy to send a PR.
++
+diff --git a/django/utils/timesince.py b/django/utils/timesince.py
+index 701c49bab9..f582d0e4f2 100644
+--- a/django/utils/timesince.py
++++ b/django/utils/timesince.py
+@@ -97,6 +97,7 @@ def timesince(d, now=None, reversed=False, time_strings=None, depth=2):
+             d.hour,
+             d.minute,
+             d.second,
++            tzinfo=d.tzinfo,
+         )
+     else:
+         pivot = d
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..081024b779
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,15 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Create small editing tools to safely patch source files (e.g., insert keyword args into calls) using robust parentheses tracking.
++- Reproduce the bug with a minimal script (timezone-aware datetimes > 1 month) before and after patching.
++- When fixing tz-aware issues, preserve tzinfo on any reconstructed datetime (e.g., pivot) and avoid introducing microsecond drift.
++- Validate both aware and naive datetime paths and reversed=True behavior.
++- Consider DST edge cases around month boundaries.
++
++- Preserve tzinfo when reconstructing datetimes (e.g., pivot) to avoid aware/naive subtraction errors.
++- Reproduce the bug with timezone-aware datetimes over month boundaries before and after patching.
++- Validate behavior for both aware and naive inputs, including reversed=True and DST boundary cases.
++- Keep microseconds ignored to match existing since/total_seconds behavior.
+diff --git a/tools/insert_kwarg_in_call.py b/tools/insert_kwarg_in_call.py
+new file mode 100644
+index 0000000000..adecccc3c7
+--- /dev/null
++++ b/tools/insert_kwarg_in_call.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++import re
++import sys
++from typing import List
++
++def insert_kwarg_in_call_block(lines: List[str], start_pattern: str, kwarg_line: str) -> (List[str], bool):
++    pat = re.compile(rf'^\s*{start_pattern}')
++    i = 0
++    out = []
++    modified = False
++    n = len(lines)
++    while i < n:
++        line = lines[i]
++        if not modified and pat.match(line):
++            # Begin capturing the call block and track parentheses depth.
++            block = [line]
++            level = line.count('(') - line.count(')')
++            i += 1
++            has_tz = False
++            arg_indent = None
++            # Determine default arg indent from first argument line.
++            while i < n:
++                l = lines[i]
++                block.append(l)
++                # track arg indent (first non-empty, non-space-only line after start)
++                if arg_indent is None:
++                    m = re.match(r'^(\s+)\S', l)
++                    if m:
++                        arg_indent = m.group(1)
++                if 'tzinfo=' in l:
++                    has_tz = True
++                level += l.count('(') - l.count(')')
++                if level == 0:
++                    break
++                i += 1
++            if not has_tz:
++                if arg_indent is None:
++                    # Fallback to 4 spaces beyond the indentation of the start line.
++                    start_indent = re.match(r'^(\s*)', block[0]).group(1)
++                    arg_indent = start_indent + ' ' * 4
++                # Insert kwarg line before the last line of the block (the closing paren).
++                block.insert(-1, f"{arg_indent}{kwarg_line},\n")
++                modified = True
++            out.extend(block)
++            i += 1
++        else:
++            out.append(line)
++            i += 1
++    return out, modified
++
++def main():
++    if len(sys.argv) < 4:
++        print("Usage: insert_kwarg_in_call.py <file> <start_regex> <kwarg_line>", file=sys.stderr)
++        sys.exit(2)
++    path = sys.argv[1]
++    start_regex = sys.argv[2]
++    kwarg_line = sys.argv[3]
++    with open(path, 'r', encoding='utf-8') as f:
++        lines = f.readlines()
++    new_lines, modified = insert_kwarg_in_call_block(lines, start_regex, kwarg_line)
++    if modified:
++        with open(path, 'w', encoding='utf-8') as f:
++            f.writelines(new_lines)
++        print(f"Patched {path}: inserted '{kwarg_line}'")
++    else:
++        print(f"No changes made to {path} (pattern not found or already present)")
++
++if __name__ == "__main__":
++    main()

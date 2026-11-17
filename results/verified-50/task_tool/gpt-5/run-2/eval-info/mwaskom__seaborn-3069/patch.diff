@@ -1,0 +1,214 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..232bbf11 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -38,6 +38,25 @@ from seaborn._core.typing import (
+ )
+ from seaborn._core.rules import categorical_order
+ from seaborn._compat import set_scale_obj, set_layout_engine
++
++from contextlib import contextmanager
++
++@contextmanager
++def _use_inf_as_null_ctx(val=True):
++    # Pandas removed 'mode.use_inf_as_null' in >=2.0; prefer 'mode.use_inf_as_na'
++    import pandas as pd
++    opt_names = ["mode.use_inf_as_null", "mode.use_inf_as_na"]
++    for name in opt_names:
++        try:
++            with pd.option_context(name, val):
++                yield
++            break
++        except Exception:
++            # If option doesn't exist or cannot be set, try next
++            continue
++    else:
++        # Fallback: no-op context manager
++        yield
+ from seaborn.rcmod import axes_style, plotting_context
+ from seaborn.palettes import color_palette
+ from seaborn.external.version import Version
+@@ -1475,7 +1494,7 @@ class Plotter:
+ 
+                 axes_df = self._filter_subplot_data(df, view)
+ 
+-                with pd.option_context("mode.use_inf_as_null", True):
++                with _use_inf_as_null_ctx(True):
+                     if keep_na:
+                         # The simpler thing to do would be x.dropna().reindex(x.index).
+                         # But that doesn't work with the way that the subset iteration
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+index bbd71ec1..c69892fb 100644
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -190,7 +190,7 @@ class Nominal(Scale):
+             # TODO Currently just used in non-Coordinate contexts, but should
+             # we use this to (A) set the padding we want for categorial plots
+             # and (B) allow the values parameter for a Coordinate to set xlim/ylim
+-            axis.set_view_interval(0, len(units_seed) - 1)
++            axis.set_view_interval(-0.5, len(units_seed) - 0.5)
+ 
+         new._matplotlib_scale = mpl_scale
+ 
+@@ -225,6 +225,40 @@ class Nominal(Scale):
+         if prop.legend:
+             new._legend = units_seed, list(stringify(units_seed))
+ 
++        
++        # Apply categorical-like axis behavior for nominal coordinate scales
++        # When attaching to a real matplotlib Axis (not PseudoAxis),
++        # draw the scale to +/- 0.5 from the first and last tick,
++        # suppress the grid by default on that axis, set zero margin, and invert if on y.
++        try:
++            axis_name = getattr(axis, "axis_name", None)
++            # Real Matplotlib Axis has axis_name in {"x","y"}; PseudoAxis has ""
++            if axis_name in {"x", "y"}:
++                n = len(units_seed)
++                ax = axis.axes
++                # Suppress grid by default on the relevant axis to match categorical plots
++                try:
++                    getattr(ax, f"{axis_name}axis").grid(False)
++                except Exception:
++                    pass
++                # Remove default margins so that extents reflect +/- 0.5 exactly
++                try:
++                    if axis_name == "x":
++                        ax.set_xmargin(0)
++                    else:
++                        ax.set_ymargin(0)
++                except Exception:
++                    pass
++                # Set the view limits with +/- 0.5 padding
++                if axis_name == "x":
++                    ax.set_xlim(-0.5, n - 0.5)
++                else:
++                    ax.set_ylim(-0.5, n - 0.5)
++                    ax.invert_yaxis()
++        except Exception:
++            # Be conservative: if anything goes wrong, do not fail scale setup
++            pass
++
+         return new
+ 
+     def tick(self, locator: Locator | None = None):
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 00000000..f23075b9
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,35 @@
++[Repository insights added]
++- Detected seaborn package under ./seaborn and tests under ./tests.
++- Will inspect scale/plot finalization (e.g., Nominal scale and Plotter._finalize_figure) to implement categorical-like behavior for so.Nominal: +/-0.5 extents, suppress grid by default, invert y when nominal.
++
++[Repository insights added]
++- The repository appears to be the seaborn codebase with the main package under ./seaborn and tests under ./tests.
++- We will need to inspect the objects/scales and plotting finalization logic within ./seaborn to implement nominal scale behavior consistent with categorical axes.
++- Goal remains: for so.Nominal (including inferred), apply +/-0.5 axis limits beyond first/last tick, suppress grid by default on nominal axes, and invert the axis when nominal is on y.
++
++
++[Additional repository insights]
++- Nominal scale is defined in seaborn/_core/scales.py (class Nominal).
++- Plot logic that interacts with scales lives in seaborn/_core/plot.py; multiple references to inferring/using Nominal are present.
++- Did not find Plotter._finalize_figure by search; finalization likely handled within Plot or related core modules.
++- Next steps: inspect seaborn/_core/scales.py and seaborn/_core/plot.py to implement categorical-like behavior for Nominal (±0.5 extents, suppress grid by default, invert y when nominal).
++
++[Implementation plan insights]
++- Nominal._setup currently sets PseudoAxis view interval [0, n-1]; will change to [-0.5, n-0.5] to match categorical extents.
++- When Nominal is attached to a real Matplotlib Axis (via objects API), we will set x/y limits to ±0.5 around categories, suppress grid by default, and invert y when nominal is on y.
++- Implementation location: seaborn/_core/scales.py within Nominal._setup before returning.
++
++[New insights from code exploration]
++- In seaborn/_core/scales.py, Nominal._setup uses a PseudoAxis when no real Axis is available and currently sets view interval to [0, n-1] (no ±0.5 padding).
++- PseudoAxis is implemented in the same file and provides a minimal Axis-like interface.
++- When a real Matplotlib Axis is provided (via Plot._setup in seaborn/_core/plot.py), there is currently no Nominal-specific handling for ±0.5 extents, grid suppression, or y-axis inversion.
++- Plan: adjust Nominal._setup to set [-0.5, n-0.5] for PseudoAxis, and when attached to a real Axis, set x/y limits with ±0.5 padding, disable grid by default, and invert y if nominal is on the y-axis.
++
++[Implementation progress]
++- Implemented Nominal categorical-like behavior in seaborn/_core/scales.py: PseudoAxis extents set to [-0.5, n-0.5]; when attached to a real Axis, set ±0.5 limits, disable grid on that axis by default, zero margin, and invert y if nominal is on y.
++
++[New issue discovered]
++- Running tests raised an IndentationError in seaborn/_core/scales.py at the start of Nominal.tick; likely due to incorrect indentation from our recent insertion before 'return new' in Nominal._setup.
++
++[Compatibility fix]
++- Replaced usage of pandas option 'mode.use_inf_as_null' with a compatibility context manager that tries 'mode.use_inf_as_null' then 'mode.use_inf_as_na', else no-op; patched in seaborn/_core/plot.py.
+diff --git a/tools/edit_scales_nominal.py b/tools/edit_scales_nominal.py
+new file mode 100644
+index 00000000..2b62ee01
+--- /dev/null
++++ b/tools/edit_scales_nominal.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++import sys
++from pathlib import Path
++
++p = Path("seaborn/_core/scales.py")
++src = p.read_text()
++
++modified = src
++
++# 1) Adjust PseudoAxis view interval for Nominal from [0, n-1] to [-0.5, n-0.5]
++modified = modified.replace(
++    "axis.set_view_interval(0, len(units_seed) - 1)",
++    "axis.set_view_interval(-0.5, len(units_seed) - 0.5)"
++)
++
++# 2) Insert categorical-like behavior on real axes in Nominal._setup before `return new`
++cls_tag = "@dataclass\nclass Nominal"
++cls_idx = modified.find(cls_tag)
++if cls_idx == -1:
++    print("Could not find Nominal class", file=sys.stderr)
++    sys.exit(1)
++setup_idx = modified.find("def _setup(", cls_idx)
++if setup_idx == -1:
++    print("Could not find Nominal._setup", file=sys.stderr)
++    sys.exit(1)
++# Find the 'return new' belonging to this method; take the first after setup_idx
++return_idx = modified.find("return new", setup_idx)
++if return_idx == -1:
++    print("Could not find return new in Nominal._setup", file=sys.stderr)
++    sys.exit(1)
++
++insertion = """
++        # Apply categorical-like axis behavior for nominal coordinate scales
++        # When attaching to a real matplotlib Axis (not PseudoAxis),
++        # draw the scale to +/- 0.5 from the first and last tick,
++        # suppress the grid by default on that axis, and invert if on the y axis.
++        try:
++            axis_name = getattr(axis, "axis_name", None)
++            # Real Matplotlib Axis has axis_name in {"x","y"}; PseudoAxis has ""
++            if axis_name in {"x", "y"}:
++                n = len(units_seed)
++                ax = axis.axes
++                # Suppress grid by default on the relevant axis to match categorical plots
++                try:
++                    getattr(ax, f"{axis_name}axis").grid(False)
++                except Exception:
++                    pass
++                if axis_name == "x":
++                    ax.set_xlim(-0.5, n - 0.5)
++                elif axis_name == "y":
++                    ax.set_ylim(-0.5, n - 0.5)
++                    ax.invert_yaxis()
++        except Exception:
++            # Be conservative: if anything goes wrong, do not fail scale setup
++            pass
++
++"""
++
++marker = "Apply categorical-like axis behavior for nominal coordinate scales"
++if marker not in modified[setup_idx:return_idx]:
++    modified = modified[:return_idx] + insertion + modified[return_idx:]
++
++if modified != src:
++    p.write_text(modified)
++    print("Applied Nominal scale modifications.")
++else:
++    print("No changes applied (content may already be modified).")

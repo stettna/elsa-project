@@ -1,0 +1,280 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..d5e1a2dd0f
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,17 @@
++MigrationRecorder does not obey db_router allow_migrate rules
++Description
++	
++Hi,
++We have a multi-db setup. We have one connection that is for the django project, and several connections that talk to other dbs for information (ie models with managed = False). Django should only create tables in the first connection, never in any of the other connections. We have a simple router that does the following: 
++class Router(object):
++	def allow_migrate(self, db, model):
++		if db == 'default':
++			return True
++		return False
++Current Behaviour
++We run our functional tests and the migrate command is called against each connection when the test databases are created (see django/test/runner.py, setup_databases, line 300-ish, which calls django/db/backends/creation.py, create_test_db, line 377-ish)
++When this migrate runs, it tries to apply our migrations, which tries to record that a migration has been applied (see django/db/migrations/executor.py, apply_migration, which has several calls to self.recorder.record_applied). 
++The first thing that record_applied does is a call to self.ensure_schema() (see django/db/migrations/recorder.py, record_applied, lien 66-ish). 
++ensure_schema checks to see if the Migration model is in the tables in the connection. If it does not find the table then it tries to create the table. 
++I believe that this is incorrect behaviour when a db_router has been provided. If using the router above, my expectation would be that the table is not created on any connection other than the 'default' connection. Looking at the other methods on the MigrationRecorder, I would expect that there will be similar issues with applied_migrations and record_unapplied.
++
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..035c4e0eae 100755
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -1,5 +1,5 @@
+-from django.apps.registry import Apps
+-from django.db import DatabaseError, models
++from django.apps.registry import Apps, apps as global_apps
++from django.db import DatabaseError, models, router
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
+ 
+@@ -45,6 +45,18 @@ class MigrationRecorder:
+ 
+     def __init__(self, connection):
+         self.connection = connection
++    def _any_model_allowed_on_db(self):
++        """Return True if any installed model is allowed to migrate on this DB."""
++        try:
++            app_configs = list(global_apps.get_app_configs())
++        except Exception:
++            # If the app registry isn't ready, default to allowing creation.
++            return True
++        for app_config in app_configs:
++            for model in app_config.get_models(include_auto_created=False):
++                if router.allow_migrate_model(self.connection.alias, model):
++                    return True
++        return False
+ 
+     @property
+     def migration_qs(self):
+@@ -57,17 +69,20 @@ class MigrationRecorder:
+         return self.Migration._meta.db_table in tables
+ 
+     def ensure_schema(self):
+-        """Ensure the table exists and has the correct schema."""
+-        # If the table's there, that's fine - we've never changed its schema
+-        # in the codebase.
++        """Ensure the table exists and has the correct schema. Return True if it exists/created."""
++        # If routers don't allow any model to migrate on this DB, don't create the table.
++        if not self._any_model_allowed_on_db():
++            return False
++        # If the table's there, we've never changed its schema in the codebase.
+         if self.has_table():
+-            return
++            return True
+         # Make the table
+         try:
+             with self.connection.schema_editor() as editor:
+                 editor.create_model(self.Migration)
+         except DatabaseError as exc:
+             raise MigrationSchemaMissing("Unable to create the django_migrations table (%s)" % exc)
++        return True
+ 
+     def applied_migrations(self):
+         """
+@@ -83,14 +98,18 @@ class MigrationRecorder:
+ 
+     def record_applied(self, app, name):
+         """Record that a migration was applied."""
+-        self.ensure_schema()
++        if not self.ensure_schema():
++            return
+         self.migration_qs.create(app=app, name=name)
+ 
+     def record_unapplied(self, app, name):
+         """Record that a migration was unapplied."""
+-        self.ensure_schema()
++        if not self.has_table():
++            return
+         self.migration_qs.filter(app=app, name=name).delete()
+ 
+     def flush(self):
+         """Delete all migration records. Useful for testing migrations."""
++        if not self.has_table():
++            return
+         self.migration_qs.all().delete()
+diff --git a/scripts/edit.py b/scripts/edit.py
+new file mode 100644
+index 0000000000..8efd7afbff
+--- /dev/null
++++ b/scripts/edit.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from pathlib import Path
++from typing import Optional
++
++def read_text(path: Path) -> str:
++    try:
++        return path.read_text(encoding="utf-8")
++    except FileNotFoundError:
++        sys.exit(f"ERROR: File not found: {path}")
++    except Exception as e:
++        sys.exit(f"ERROR: Could not read {path}: {e}")
++
++def write_text(path: Path, content: str):
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content, encoding="utf-8")
++    except Exception as e:
++        sys.exit(f"ERROR: Could not write {path}: {e}")
++
++def cmd_read(args):
++    path = Path(args.file)
++    text = read_text(path)
++    if args.number:
++        for i, line in enumerate(text.splitlines(keepends=True), start=1):
++            sys.stdout.write(f"{i:6d}  {line}")
++        if not text.endswith("\n"):
++            sys.stdout.write("\n")
++    else:
++        sys.stdout.write(text)
++
++def cmd_write(args):
++    path = Path(args.file)
++    content = sys.stdin.read()
++    write_text(path, content)
++
++def cmd_append(args):
++    path = Path(args.file)
++    existing = read_text(path) if path.exists() else ""
++    addition = sys.stdin.read()
++    if existing and not existing.endswith("\n") and not addition.startswith("\n"):
++        existing = existing + "\n"
++    write_text(path, existing + addition)
++
++def cmd_replace(args):
++    path = Path(args.file)
++    text = read_text(path)
++    count_before = text.count(args.find)
++    if count_before == 0:
++        if args.require_match:
++            sys.exit(f"ERROR: No occurrences found for plain replace in {path}")
++        else:
++            print(f"WARN: No occurrences found for plain replace in {path}", file=sys.stderr)
++    new_text = text.replace(args.find, args.repl, args.count if args.count is not None else -1)
++    write_text(path, new_text)
++
++def cmd_regex(args):
++    path = Path(args.file)
++    text = read_text(path)
++    flags = 0
++    if args.ignore_case:
++        flags |= re.IGNORECASE
++    pattern = re.compile(args.pattern, flags)
++    if not pattern.search(text):
++        if args.require_match:
++            sys.exit(f"ERROR: Regex pattern not found in {path}")
++        else:
++            print(f"WARN: Regex pattern not found in {path}", file=sys.stderr)
++    new_text, n = pattern.subn(args.repl, text, count=0 if args.count is None else args.count)
++    write_text(path, new_text)
++
++def _insert_common(path: Path, text: str, match: str, payload: str, where: str, regex: bool, before: bool, occurrence: Optional[int]):
++    lines = text.splitlines(keepends=True)
++    indices = []
++    if regex:
++        pat = re.compile(match)
++        for i, line in enumerate(lines):
++            if pat.search(line):
++                indices.append(i)
++    else:
++        for i, line in enumerate(lines):
++            if match in line:
++                indices.append(i)
++
++    if not indices:
++        sys.exit(f"ERROR: No matching line found in {path} for pattern: {match!r}")
++
++    idx = indices[0] if occurrence in (None, 1) else (indices[occurrence-1] if 1 <= occurrence <= len(indices) else indices[-1])
++
++    insert_at = idx if before else idx + 1
++    insert_block = payload
++    if not insert_block.endswith("\n"):
++        insert_block += "\n"
++    new_lines = lines[:insert_at] + [insert_block] + lines[insert_at:]
++    write_text(path, "".join(new_lines))
++
++def cmd_insert_before(args):
++    path = Path(args.file)
++    text = read_text(path)
++    payload = sys.stdin.read()
++    _insert_common(path, text, args.match, payload, "before", args.regex, True, args.occurrence)
++
++def cmd_insert_after(args):
++    path = Path(args.file)
++    text = read_text(path)
++    payload = sys.stdin.read()
++    _insert_common(path, text, args.match, payload, "after", args.regex, False, args.occurrence)
++
++def build_parser():
++    p = argparse.ArgumentParser(description="Simple, scriptable file edit utility.")
++    sub = p.add_subparsers(dest="cmd", required=True)
++
++    pr = sub.add_parser("read", help="Print file content (optionally with line numbers).")
++    pr.add_argument("file")
++    pr.add_argument("-n", "--number", action="store_true", help="Show line numbers.")
++    pr.set_defaults(func=cmd_read)
++
++    pw = sub.add_parser("write", help="Write stdin to file (overwrite).")
++    pw.add_argument("file")
++    pw.set_defaults(func=cmd_write)
++
++    pa = sub.add_parser("append", help="Append stdin to file.")
++    pa.add_argument("file")
++    pa.set_defaults(func=cmd_append)
++
++    pre = sub.add_parser("replace", help="Plain string replace.")
++    pre.add_argument("file")
++    pre.add_argument("find")
++    pre.add_argument("repl")
++    pre.add_argument("-c", "--count", type=int, default=None, help="Max replacements.")
++    pre.add_argument("--require-match", action="store_true", help="Error if nothing replaced.")
++    pre.set_defaults(func=cmd_replace)
++
++    px = sub.add_parser("regex", help="Regex replace.")
++    px.add_argument("file")
++    px.add_argument("pattern")
++    px.add_argument("repl")
++    px.add_argument("-c", "--count", type=int, default=None, help="Max replacements.")
++    px.add_argument("-i", "--ignore-case", action="store_true")
++    px.add_argument("--require-match", action="store_true", help="Error if no match.")
++    px.set_defaults(func=cmd_regex)
++
++    pib = sub.add_parser("insert_before", help="Insert stdin before line matching text/regex.")
++    pib.add_argument("file")
++    pib.add_argument("match", help="Text or regex to match a line.")
++    pib.add_argument("-r", "--regex", action="store_true", help="Treat match as regex.")
++    pib.add_argument("-o", "--occurrence", type=int, default=None, help="1-based occurrence index.")
++    pib.set_defaults(func=cmd_insert_before)
++
++    pia = sub.add_parser("insert_after", help="Insert stdin after line matching text/regex.")
++    pia.add_argument("file")
++    pia.add_argument("match", help="Text or regex to match a line.")
++    pia.add_argument("-r", "--regex", action="store_true", help="Treat match as regex.")
++    pia.add_argument("-o", "--occurrence", type=int, default=None, help="1-based occurrence index.")
++    pia.set_defaults(func=cmd_insert_after)
++
++    return p
++
++def main():
++    parser = build_parser()
++    args = parser.parse_args()
++    args.func(args)
++
++if __name__ == "__main__":
++    main()

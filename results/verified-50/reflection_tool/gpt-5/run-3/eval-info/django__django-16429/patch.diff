@@ -1,0 +1,157 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..c4ce64aa47
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,20 @@
++timesince() raises TypeError with USE_TZ=True and >1 month interval.
++Description
++	 
++		(last modified by Sage Abdullah)
++	 
++As of 8d67e16493c903adc9d049141028bc0fff43f8c8, calling timesince() with a datetime object that's one month (or more) in the past and the USE_TZ setting is set to True results in the following crash:
++TypeError: can't subtract offset-naive and offset-aware datetimes
++Test:
++...
++class TimesinceTests(TestCase):
++	...
++	@requires_tz_support
++	@override_settings(USE_TZ=True)
++	def test_long_interval_with_tz(self):
++		now = timezone.now()
++		d = now - datetime.timedelta(days=31)
++		self.assertEqual(timesince(d), 1xa0month)
++I believe this is because the pivot instantiated here: ​https://github.com/django/django/blob/d2310f6473593d28c14b63a72253408b568e100a/django/utils/timesince.py#L93-L100 does not take into account the datetime object's tzinfo. Adding 0, d.tzinfo arguments to the datetime.datetime call seems to fix this.
++Happy to send a PR.
++
+diff --git a/django/utils/timesince.py b/django/utils/timesince.py
+index 701c49bab9..f7f5884b66 100644
+--- a/django/utils/timesince.py
++++ b/django/utils/timesince.py
+@@ -97,6 +97,7 @@ def timesince(d, now=None, reversed=False, time_strings=None, depth=2):
+             d.hour,
+             d.minute,
+             d.second,
++                tzinfo=d.tzinfo,
+         )
+     else:
+         pivot = d
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..3f88d7db0f
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,12 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++[Added by assistant on 2026-11-16]
++- Always create a minimal reproduction script before changing code; verify the bug exists.
++- Only modify non-test source files under /testbed; never change tests or config.
++- For safe, targeted edits, consider creating and using a small editing tool (e.g., tools/edit_file.py) for exact or regex replacements with --dry-run and --show-diff first.
++- After implementing a fix, re-run the reproduction to confirm; cover edge cases (tz-aware vs tz-naive datetimes, month boundaries, DST).
++- For timezone-related fixes, ensure any constructed datetime preserves tzinfo from inputs; avoid mixing aware and naive datetimes.
++- If deviating from plan or encountering blockers, update this prompt with the new strategy before proceeding.
+diff --git a/tools/edit_file.py b/tools/edit_file.py
+new file mode 100644
+index 0000000000..5d4c3a5c70
+--- /dev/null
++++ b/tools/edit_file.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++import argparse
++import io
++import os
++import re
++import sys
++import difflib
++
++def parse_args():
++    p = argparse.ArgumentParser(description="Safe file editor: replace exact text or regex with optional count, dry-run, and diff.")
++    p.add_argument("filepath", help="Path to the file to edit")
++    group = p.add_mutually_exclusive_group(required=True)
++    group.add_argument("--replace", nargs=2, metavar=("OLD", "NEW"), help="Exact string replacement")
++    group.add_argument("--regex", nargs=2, metavar=("PATTERN", "REPL"), help="Regex replacement (uses Python re.sub)")
++    p.add_argument("--count", type=int, default=0, help="Max number of replacements; 0 means replace all")
++    p.add_argument("--encoding", default="utf-8", help="File encoding (default: utf-8)")
++    p.add_argument("--dry-run", action="store_true", help="Do not write changes; just report/diff")
++    p.add_argument("--show-diff", action="store_true", help="Show unified diff of changes")
++    return p.parse_args()
++
++def main():
++    args = parse_args()
++    path = args.filepath
++    if not os.path.exists(path):
++        print(f"ERROR: File not found: {path}", file=sys.stderr)
++        sys.exit(2)
++    try:
++        with io.open(path, "r", encoding=args.encoding) as f:
++            original = f.read()
++    except Exception as e:
++        print(f"ERROR: Could not read file {path}: {e}", file=sys.stderr)
++        sys.exit(2)
++
++    changed = original
++    num_applied = 0
++
++    if args.replace:
++        old, new = args.replace
++        if old == "":
++            print("ERROR: --replace OLD cannot be empty string", file=sys.stderr)
++            sys.exit(2)
++        count_arg = args.count if args.count > 0 else -1
++        changed = original.replace(old, new, count_arg)
++        # Accurate count when count_arg != -1
++        if count_arg == -1:
++            num_applied = original.count(old)
++        else:
++            # Count occurrences in a progressive manner to be exact
++            occ = 0
++            start = 0
++            while True:
++                idx = original.find(old, start)
++                if idx == -1 or occ >= count_arg:
++                    break
++                occ += 1
++                start = idx + len(old)
++            num_applied = occ
++    elif args.regex:
++        pattern, repl = args.regex
++        flags = re.MULTILINE | re.DOTALL
++        count_arg = args.count if args.count > 0 else 0  # re.subn: 0 means replace all
++        try:
++            changed, num_applied = re.subn(pattern, repl, original, count=count_arg, flags=flags)
++        except re.error as e:
++            print(f"ERROR: Invalid regex: {e}", file=sys.stderr)
++            sys.exit(2)
++
++    if changed == original:
++        print(f"No changes applied to {path}. Matches found/applied: {num_applied}")
++        sys.exit(0)
++
++    if args.show-diff:
++        diff = difflib.unified_diff(
++            original.splitlines(keepends=True),
++            changed.splitlines(keepends=True),
++            fromfile=f"{path} (original)",
++            tofile=f"{path} (modified)"
++        )
++        sys.stdout.writelines(diff)
++
++    if args.dry-run:
++        print(f"Dry run: {num_applied} replacement(s) would be applied to {path}.")
++        sys.exit(0)
++
++    try:
++        with io.open(path, "w", encoding=args.encoding, newline="") as f:
++            f.write(changed)
++    except Exception as e:
++        print(f"ERROR: Could not write file {path}: {e}", file=sys.stderr)
++        sys.exit(2)
++
++    print(f"Applied {num_applied} replacement(s) to {path} successfully.")
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,100 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..f06bf19459 100755
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -1,5 +1,5 @@
+ from django.apps.registry import Apps
+-from django.db import DatabaseError, models
++from django.db import DatabaseError, models, router
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
+ 
+@@ -62,6 +62,10 @@ class MigrationRecorder:
+         # in the codebase.
+         if self.has_table():
+             return
++        # Respect database routers: don't create the migrations table on
++        # databases where migrations aren't allowed.
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++            return
+         # Make the table
+         try:
+             with self.connection.schema_editor() as editor:
+@@ -83,14 +87,23 @@ class MigrationRecorder:
+ 
+     def record_applied(self, app, name):
+         """Record that a migration was applied."""
+-        self.ensure_schema()
+-        self.migration_qs.create(app=app, name=name)
++        # Only record if migrations are allowed on this database.
++        if router.allow_migrate_model(self.connection.alias, self.Migration):
++            self.ensure_schema()
++            # It's possible that ensure_schema() returned without creating the
++            # table due to router denial; guard against that by re-checking.
++            if self.has_table():
++                self.migration_qs.create(app=app, name=name)
+ 
+     def record_unapplied(self, app, name):
+         """Record that a migration was unapplied."""
+-        self.ensure_schema()
+-        self.migration_qs.filter(app=app, name=name).delete()
++        # Only record if migrations are allowed on this database.
++        if router.allow_migrate_model(self.connection.alias, self.Migration):
++            self.ensure_schema()
++            if self.has_table():
++                self.migration_qs.filter(app=app, name=name).delete()
+ 
+     def flush(self):
+         """Delete all migration records. Useful for testing migrations."""
+-        self.migration_qs.all().delete()
++        if router.allow_migrate_model(self.connection.alias, self.Migration) and self.has_table():
++            self.migration_qs.all().delete()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..044832830d
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,25 @@
++MigrationRecorder does not obey db_router allow_migrate rules
++Description
++	
++Hi,
++We have a multi-db setup. We have one connection that is for the django project, and several connections that talk to other dbs for information (ie models with managed = False). Django should only create tables in the first connection, never in any of the other connections. We have a simple router that does the following: 
++class Router(object):
++	def allow_migrate(self, db, model):
++		if db == 'default':
++			return True
++		return False
++Current Behaviour
++We run our functional tests and the migrate command is called against each connection when the test databases are created (see django/test/runner.py, setup_databases, line 300-ish, which calls django/db/backends/creation.py, create_test_db, line 377-ish)
++When this migrate runs, it tries to apply our migrations, which tries to record that a migration has been applied (see django/db/migrations/executor.py, apply_migration, which has several calls to self.recorder.record_applied). 
++The first thing that record_applied does is a call to self.ensure_schema() (see django/db/migrations/recorder.py, record_applied, lien 66-ish). 
++ensure_schema checks to see if the Migration model is in the tables in the connection. If it does not find the table then it tries to create the table. 
++I believe that this is incorrect behaviour when a db_router has been provided. If using the router above, my expectation would be that the table is not created on any connection other than the 'default' connection. Looking at the other methods on the MigrationRecorder, I would expect that there will be similar issues with applied_migrations and record_unapplied.
++
++
++Additional Notes (automated update):
++- In django/db/migrations/recorder.py, ensure_schema() previously created the django_migrations table unconditionally if absent. It now respects database routers via router.allow_migrate_model(connection.alias, Migration) and skips creation when disallowed.
++- record_applied() and record_unapplied() are now guarded to avoid implicitly creating the migrations table or touching it on disallowed databases.
++- flush() now also respects routers and only deletes records when allowed and when the table exists.
++- Router API confirmed in django/db/utils.py: allow_migrate(db, app_label, **hints) and allow_migrate_model(db, model) wrappers are used consistently across the codebase; recorder now uses the same pattern.
++
++Note: Corrected accidental escaped docstrings in recorder.py from earlier automated edit.
+diff --git a/test_router.py b/test_router.py
+new file mode 100644
+index 0000000000..75e6e303ac
+--- /dev/null
++++ b/test_router.py
+@@ -0,0 +1,5 @@
++
++class Router:
++    def allow_migrate(self, db, app_label, **hints):
++        # Only allow migrations on the 'default' database.
++        return db == "default"

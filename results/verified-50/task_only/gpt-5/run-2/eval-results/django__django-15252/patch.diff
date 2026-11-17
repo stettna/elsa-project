@@ -1,0 +1,109 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..933d7d7ec9 100755
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -1,5 +1,6 @@
+ from django.apps.registry import Apps
+-from django.db import DatabaseError, models
++from django.apps import apps as global_apps
++from django.db import DatabaseError, models, router, router
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
+ 
+@@ -50,6 +51,33 @@ class MigrationRecorder:
+     def migration_qs(self):
+         return self.Migration.objects.using(self.connection.alias)
+ 
++    
++    def _should_create_table(self):
++        """Return True if this connection should have a django_migrations table.
++
++        Create the table only if there is at least one model that is allowed to
++        be migrated on this database according to routers. This avoids creating
++        the migrations table on databases that are never used for migrations.
++        """
++        # If routers explicitly allow the Migration model, that's sufficient.
++        try:
++            if router.allow_migrate_model(self.connection.alias, self.Migration):
++                return True
++        except Exception:
++            # Be conservative if routers/apps aren't ready.
++            return False
++        # Otherwise, create the table only if any installed model is migratable
++        # on this database.
++        try:
++            for app_config in global_apps.get_app_configs():
++                for model in app_config.get_models(include_auto_created=True):
++                    if router.allow_migrate_model(self.connection.alias, model):
++                        return True
++        except Exception:
++            # If apps registry isn't ready, don't create the table.
++            return False
++        return False
++
+     def has_table(self):
+         """Return True if the django_migrations table exists."""
+         with self.connection.cursor() as cursor:
+@@ -62,6 +90,9 @@ class MigrationRecorder:
+         # in the codebase.
+         if self.has_table():
+             return
++        # Only create the table if there is at least one migratable model on this DB.
++        if not self._should_create_table():
++            return
+         # Make the table
+         try:
+             with self.connection.schema_editor() as editor:
+@@ -93,4 +124,5 @@ class MigrationRecorder:
+ 
+     def flush(self):
+         """Delete all migration records. Useful for testing migrations."""
+-        self.migration_qs.all().delete()
++        if self.has_table():
++            self.migration_qs.all().delete()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..b81ad11ee4
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,33 @@
++MigrationRecorder does not obey db_router allow_migrate rules
++Description
++	
++Hi,
++We have a multi-db setup. We have one connection that is for the django project, and several connections that talk to other dbs for information (ie models with managed = False). Django should only create tables in the first connection, never in any of the other connections. We have a simple router that does the following: 
++class Router(object):
++	def allow_migrate(self, db, model):
++		if db == 'default':
++			return True
++		return False
++Current Behaviour
++We run our functional tests and the migrate command is called against each connection when the test databases are created (see django/test/runner.py, setup_databases, line 300-ish, which calls django/db/backends/creation.py, create_test_db, line 377-ish)
++When this migrate runs, it tries to apply our migrations, which tries to record that a migration has been applied (see django/db/migrations/executor.py, apply_migration, which has several calls to self.recorder.record_applied). 
++The first thing that record_applied does is a call to self.ensure_schema() (see django/db/migrations/recorder.py, record_applied, lien 66-ish). 
++ensure_schema checks to see if the Migration model is in the tables in the connection. If it does not find the table then it tries to create the table. 
++I believe that this is incorrect behaviour when a db_router has been provided. If using the router above, my expectation would be that the table is not created on any connection other than the 'default' connection. Looking at the other methods on the MigrationRecorder, I would expect that there will be similar issues with applied_migrations and record_unapplied.
++
++
++Additional insights added:
++- MigrationRecorder.ensure_schema() unconditionally created the django_migrations table before; this ignored database routers.
++- The router API is available via django.db.router with allow_migrate(db, app_label, **hints) and allow_migrate_model(db, model).
++- Updated MigrationRecorder to:
++  - Import and consult router.allow_migrate_model(self.connection.alias, self.Migration).
++  - Skip table creation in ensure_schema() if router disallows.
++  - Return {} in applied_migrations() if router disallows.
++  - Make record_applied()/record_unapplied() no-ops when router disallows.
++  - Make flush() conditional on router allowing and table existing.
++
++Refined implementation details:
++- ensure_schema() now creates the django_migrations table only if at least one installed model is migratable on the target DB per routers (or if routers explicitly allow the Migration model). This prevents creating the table on databases with no migratable models, while still allowing it on DBs like 'other' where some models (e.g., Tribble) are routed.
++- applied_migrations() reads from the table if it exists, regardless of router rules for the Migration model, ensuring state is tracked where present.
++- record_applied()/record_unapplied() always operate; ensure_schema() internally decides whether to create the table.
++- flush() deletes records only if the table exists.

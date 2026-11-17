@@ -1,0 +1,85 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..bc28063427 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -393,6 +393,31 @@ class Query(BaseExpression):
+         if not self.alias_cols:
+             alias = None
+         return target.get_col(alias, field)
++    def _expr_requires_agg_subquery(self, expr):
++        """
++        Return True if the given expression requires aggregate() to wrap the
++        current query in a subquery, e.g., when it or any of its children
++        contain a window function (contains_over_clause) or are explicit
++        subqueries (subquery=True).
++        """
++        if getattr(expr, "subquery", False) or getattr(expr, "contains_over_clause", False):
++            return True
++        get_children = getattr(expr, "get_source_expressions", None)
++        if not callable(get_children):
++            return False
++        try:
++            children = get_children()
++        except Exception:
++            children = None
++        if not children:
++            return False
++        for child in children:
++            if child is None:
++                continue
++            if self._expr_requires_agg_subquery(child):
++                return True
++        return False
++
+ 
+     def get_aggregation(self, using, aggregate_exprs):
+         """
+@@ -416,7 +441,7 @@ class Query(BaseExpression):
+             # members of `aggregates` to resolve against each others.
+             self.append_annotation_mask([alias])
+             refs_subquery |= any(
+-                getattr(self.annotations[ref], "subquery", False)
++                self._expr_requires_agg_subquery(self.annotations[ref])
+                 for ref in aggregate.get_refs()
+             )
+             aggregate = aggregate.replace_expressions(replacements)
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..b96f82f58b
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,7 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Remember to consider nested expressions: when aggregating over annotations, recursively detect window functions (contains_over_clause) or subquery-requiring expressions, not just top-level 'subquery' flags. This ensures aggregate() wraps in a subquery when needed.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..29bf200e58
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,21 @@
++Cannot use aggregate over window functions since 4.2
++Description
++	 
++		(last modified by younes-chaoui)
++	 
++After upgrading to Django 4.2, I encountered an exception when executing ORM queries that involve aggregates over Window functions. The specific error was psycopg2.errors.GroupingError: aggregate function calls cannot contain window function calls
++Dependencies :
++psycopg2 version: 2.9.3
++django version: 4.2.3
++PostgreSQL version: 13.4
++Example Code:
++queryset = queryset.annotate(
++	cumul_DJR=Coalesce(Window(Sum(DJR), order_by=F(date).asc()), 0.0)
++)
++aggregate = queryset.aggregate(
++	DJR_total=Sum(DJR),
++	cumul_DJR_total=Sum(cumul_DJR)
++)
++
++
++[Insight 2026-11-15] In django/db/models/sql/query.py, get_aggregation() only wrapped in a subquery when referenced annotations had subquery=True. Window expressions (contains_over_clause=True) wrapped inside other expressions (e.g., Coalesce(Window(...))) didn't set subquery=True on the top-level annotation, so aggregates over them weren't wrapped, causing PostgreSQL GroupingError: 'aggregate function calls cannot contain window function calls'. Fix: make get_aggregation() detect nested window functions or subqueries recursively via a new helper Query._expr_requires_agg_subquery().

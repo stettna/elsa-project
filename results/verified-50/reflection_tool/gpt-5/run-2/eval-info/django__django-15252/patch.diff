@@ -1,0 +1,432 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..d5e1a2dd0f
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,17 @@
++MigrationRecorder does not obey db_router allow_migrate rules
++Description
++	
++Hi,
++We have a multi-db setup. We have one connection that is for the django project, and several connections that talk to other dbs for information (ie models with managed = False). Django should only create tables in the first connection, never in any of the other connections. We have a simple router that does the following: 
++class Router(object):
++	def allow_migrate(self, db, model):
++		if db == 'default':
++			return True
++		return False
++Current Behaviour
++We run our functional tests and the migrate command is called against each connection when the test databases are created (see django/test/runner.py, setup_databases, line 300-ish, which calls django/db/backends/creation.py, create_test_db, line 377-ish)
++When this migrate runs, it tries to apply our migrations, which tries to record that a migration has been applied (see django/db/migrations/executor.py, apply_migration, which has several calls to self.recorder.record_applied). 
++The first thing that record_applied does is a call to self.ensure_schema() (see django/db/migrations/recorder.py, record_applied, lien 66-ish). 
++ensure_schema checks to see if the Migration model is in the tables in the connection. If it does not find the table then it tries to create the table. 
++I believe that this is incorrect behaviour when a db_router has been provided. If using the router above, my expectation would be that the table is not created on any connection other than the 'default' connection. Looking at the other methods on the MigrationRecorder, I would expect that there will be similar issues with applied_migrations and record_unapplied.
++
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..1feadb6187 100755
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -1,5 +1,5 @@
+ from django.apps.registry import Apps
+-from django.db import DatabaseError, models
++from django.db import DatabaseError, models, router
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
+ 
+@@ -57,6 +57,12 @@ class MigrationRecorder:
+         return self.Migration._meta.db_table in tables
+ 
+     def ensure_schema(self):
++
++        # Respect database routers; skip creating the migrations table if disallowed.
++
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++
++            return
+         """Ensure the table exists and has the correct schema."""
+         # If the table's there, that's fine - we've never changed its schema
+         # in the codebase.
+@@ -70,6 +76,12 @@ class MigrationRecorder:
+             raise MigrationSchemaMissing("Unable to create the django_migrations table (%s)" % exc)
+ 
+     def applied_migrations(self):
++
++        # If migrations aren't allowed on this database, behave as if none are applied.
++
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++
++            return {}
+         """
+         Return a dict mapping (app_name, migration_name) to Migration instances
+         for all applied migrations.
+@@ -82,15 +94,33 @@ class MigrationRecorder:
+             return {}
+ 
+     def record_applied(self, app, name):
++
++        # Skip recording if migrations aren't allowed on this database.
++
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++
++            return
+         """Record that a migration was applied."""
+         self.ensure_schema()
+         self.migration_qs.create(app=app, name=name)
+ 
+     def record_unapplied(self, app, name):
++
++        # Skip unrecording if migrations aren't allowed on this database.
++
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++
++            return
+         """Record that a migration was unapplied."""
+         self.ensure_schema()
+         self.migration_qs.filter(app=app, name=name).delete()
+ 
+     def flush(self):
++
++        # Skip flush if migrations aren't allowed on this database.
++
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++
++            return
+         """Delete all migration records. Useful for testing migrations."""
+         self.migration_qs.all().delete()
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..521104a4f8
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,45 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++[Added by assistant on this run]
++- Always create or update helper tools early (e.g., tools/edit_file.py) to make precise, idempotent edits to source files without manual errors.
++- For this PR: "MigrationRecorder does not obey db_router allow_migrate rules"
++  - Locate and study:
++    - django/db/migrations/recorder.py (ensure_schema, applied_migrations, record_applied, record_unapplied)
++    - db router integration points and existing router API used in this codebase (signature may be allow_migrate(db, model) in this version).
++  - Expected behavior:
++    - If router disallows migrations for a DB alias, MigrationRecorder should NOT create its table there.
++    - On disallowed DBs, operations like applied_migrations should likely behave as empty/no-op without raising unnecessary schema creation.
++    - Ensure executor paths that call recorder.* do not inadvertently force table creation on disallowed DBs.
++  - Implementation options:
++    - In ensure_schema(), first consult the router; if disallowed, skip table creation and mark internal state so other methods become safe no-ops/empties on that connection.
++    - Alternatively, return a "null" recorder behavior when disallowed.
++  - Testing plan:
++    - Search tests referencing MigrationRecorder, routers, allow_migrate, or multi-db.
++    - Run targeted tests before/after fix (e.g., pytest -q -k "recorder or router or allow_migrate").
++    - Validate that no tables are created for non-default DBs during test DB setup.
++- General reminders:
++  - Prefer minimal, well-contained changes consistent with the project’s coding style.
++  - Be mindful of compatibility with router API version used in this codebase (older Django may pass a model, not app_label).
++  - When in doubt, add guards to avoid side effects on disallowed databases and return sensible defaults (e.g., empty sets).
++
++[Added by assistant on this run]
++- Add and use tools/find_in_repo.py to quickly locate references with context:
++  - Examples:
++    - tools/find_in_repo.py MigrationRecorder --ext .py
++    - tools/find_in_repo.py allow_migrate --ext .py
++    - tools/find_in_repo.py '^class MigrationRecorder' --regex --ext .py
++  - Use --context 3 for more lines, and --ignore-case when appropriate.
++- Before editing, confirm the router API signature in this Django version:
++  - Look for allow_migrate definitions and calls to ensure correct parameters (db, model) vs newer signatures.
++- Plan minimal changes:
++  - In recorder.ensure_schema(), consult router first; if disallowed, avoid creating the migration table and set an internal flag to make other methods act as no-ops/empties on that DB.
++  - Ensure applied_migrations(), record_applied(), and record_unapplied() don’t force schema creation on disallowed DBs.
++- Validate with targeted tests:
++  - Run pytest -q -k "recorder or router or allow_migrate or MigrationRecorder"
++  - Then run full suite if runtime permits.
++- Keep compatibility and style:
++  - Match existing import patterns, logging/exception styles, and error handling found in nearby modules.
++  - Add concise docstrings/comments for any behavior affected by routers.
+diff --git a/tools/edit_file.py b/tools/edit_file.py
+new file mode 100755
+index 0000000000..475fe849c7
+--- /dev/null
++++ b/tools/edit_file.py
+@@ -0,0 +1,172 @@
++#!/usr/bin/env python3
++import sys
++import argparse
++import re
++import os
++
++def read_file(path: str) -> str:
++    with open(path, 'r', encoding='utf-8') as f:
++        return f.read()
++
++def write_file(path: str, content: str):
++    with open(path, 'w', encoding='utf-8') as f:
++        f.write(content)
++
++def cmd_replace(args):
++    s = read_file(args.file)
++    original = s
++    if args.regex:
++        flags = re.MULTILINE
++        if args.ignore_case:
++            flags |= re.IGNORECASE
++        count = 0 if args.count is None else args.count
++        s, n = re.subn(args.old, args.new, s, count=count, flags=flags)
++    else:
++        count = args.count
++        if count is None:
++            # replace all occurrences
++            n = s.count(args.old)
++            s = s.replace(args.old, args.new)
++        else:
++            n = min(s.count(args.old), count)
++            s = s.replace(args.old, args.new, count)
++    changed = (s != original)
++    if changed:
++        write_file(args.file, s)
++    print(f"replace: file={args.file} changed={changed} replacements={n}", file=sys.stderr)
++
++def _insert(linewise: bool, content: str, pattern: str, text: str, before: bool, regex: bool, ignore_case: bool) -> str:
++    flags = re.MULTILINE | (re.IGNORECASE if ignore_case else 0)
++    if linewise:
++        lines = content.splitlines(keepends=True)
++        prog = re.compile(pattern, flags) if regex else None
++        for i, ln in enumerate(lines):
++            if (prog.search(ln) if regex else (pattern in ln)):
++                insert_idx = i if before else i + 1
++                ins = text if text.endswith('\\n') else text + '\\n'
++                lines.insert(insert_idx, ins)
++                return ''.join(lines)
++        # If no match, append
++        ins = text if text.endswith('\\n') else text + '\\n'
++        return ''.join(lines) + ins
++    else:
++        prog = re.compile(pattern, flags)
++        m = prog.search(content) if regex else None
++        if not regex:
++            idx = content.find(pattern)
++            if idx == -1:
++                return content + (text if text.endswith('\\n') else text + '\\n')
++            return content[:idx] + (text if before else '') + pattern + (text if not before else '') + content[idx+len(pattern):]
++        else:
++            if not m:
++                return content + (text if text.endswith('\\n') else text + '\\n')
++            start, end = m.span()
++            if before:
++                return content[:start] + text + content[start:]
++            else:
++                return content[:end] + text + content[end:]
++
++def cmd_insert(args, before: bool):
++    s = read_file(args.file)
++    original = s
++    new_s = _insert(True, s, args.pattern, args.text, before, args.regex, args.ignore_case)
++    changed = (new_s != original)
++    if changed:
++        write_file(args.file, new_s)
++    when = "before" if before else "after"
++    print(f"insert_{when}: file={args.file} changed={changed}", file=sys.stderr)
++
++def cmd_append(args):
++    s = read_file(args.file)
++    to_add = args.text
++    if not to_add.endswith('\\n'):
++        to_add += '\\n'
++    if s.endswith(to_add):
++        print(f"append: file={args.file} changed=False (already ends with text)", file=sys.stderr)
++        return
++    write_file(args.file, s + to_add)
++    print(f"append: file={args.file} changed=True", file=sys.stderr)
++
++def cmd_ensure_contains(args):
++    s = read_file(args.file)
++    if args.text in s:
++        print(f"ensure_contains: file={args.file} present=True changed=False", file=sys.stderr)
++        return
++    sep = '' if s.endswith('\\n') else '\\n'
++    write_file(args.file, s + sep + (args.text if args.text.endswith('\\n') else args.text + '\\n'))
++    print(f"ensure_contains: file={args.file} present=False changed=True", file=sys.stderr)
++
++def cmd_delete_lines_matching(args):
++    s = read_file(args.file)
++    lines = s.splitlines(keepends=True)
++    flags = re.IGNORECASE if args.ignore_case else 0
++    prog = re.compile(args.pattern, flags) if args.regex else None
++    kept = []
++    removed = 0
++    for ln in lines:
++        match = (prog.search(ln) if args.regex else (args.pattern in ln))
++        if match:
++            removed += 1
++            continue
++        kept.append(ln)
++    new_s = ''.join(kept)
++    changed = (new_s != s)
++    if changed:
++        write_file(args.file, new_s)
++    print(f"delete_lines_matching: file={args.file} removed={removed} changed={changed}", file=sys.stderr)
++
++def build_parser():
++    p = argparse.ArgumentParser(description="Safe file edit helper")
++    sub = p.add_subparsers(dest='cmd', required=True)
++
++    pr = sub.add_parser('replace', help='Replace text (string or regex)')
++    pr.add_argument('file')
++    pr.add_argument('old')
++    pr.add_argument('new')
++    pr.add_argument('--regex', action='store_true')
++    pr.add_argument('--ignore-case', action='store_true')
++    pr.add_argument('--count', type=int, default=None)
++    pr.set_defaults(func=cmd_replace)
++
++    pib = sub.add_parser('insert_before', help='Insert text before first matching line (fallback to append)')
++    pib.add_argument('file')
++    pib.add_argument('pattern')
++    pib.add_argument('text')
++    pib.add_argument('--regex', action='store_true')
++    pib.add_argument('--ignore-case', action='store_true')
++    pib.set_defaults(func=lambda a: cmd_insert(a, before=True))
++
++    pia = sub.add_parser('insert_after', help='Insert text after first matching line (fallback to append)')
++    pia.add_argument('file')
++    pia.add_argument('pattern')
++    pia.add_argument('text')
++    pia.add_argument('--regex', action='store_true')
++    pia.add_argument('--ignore-case', action='store_true')
++    pia.set_defaults(func=lambda a: cmd_insert(a, before=False))
++
++    pa = sub.add_parser('append', help='Append text to file (ensures trailing newline)')
++    pa.add_argument('file')
++    pa.add_argument('text')
++    pa.set_defaults(func=cmd_append)
++
++    pec = sub.add_parser('ensure_contains', help='Ensure file contains given text (append if missing)')
++    pec.add_argument('file')
++    pec.add_argument('text')
++    pec.set_defaults(func=cmd_ensure_contains)
++
++    pdel = sub.add_parser('delete_lines_matching', help='Delete lines containing pattern')
++    pdel.add_argument('file')
++    pdel.add_argument('pattern')
++    pdel.add_argument('--regex', action='store_true')
++    pdel.add_argument('--ignore-case', action='store_true')
++    pdel.set_defaults(func=cmd_delete_lines_matching)
++
++    return p
++
++def main():
++    parser = build_parser()
++    args = parser.parse_args()
++    args.func(args)
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/find_in_repo.py b/tools/find_in_repo.py
+new file mode 100755
+index 0000000000..e76a3580ee
+--- /dev/null
++++ b/tools/find_in_repo.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++import os
++import re
++import sys
++import argparse
++
++DEFAULT_EXCLUDES = {'.git', '.hg', '.svn', '.tox', 'node_modules', '__pycache__', 'Django.egg-info'}
++
++def iter_files(root, include_ext=None, exclude_dirs=None):
++    exclude_dirs = set(exclude_dirs or [])
++    for dirpath, dirnames, filenames in os.walk(root):
++        dirnames[:] = [d for d in dirnames if d not in exclude_dirs and not d.startswith('.')]
++        for fn in filenames:
++            if include_ext:
++                if not any(fn.endswith(ext) for ext in include_ext):
++                    continue
++            yield os.path.join(dirpath, fn)
++
++def search_file(path, pattern, regex=False, ignore_case=False):
++    try:
++        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
++            lines = f.readlines()
++    except Exception:
++        return []
++    flags = re.IGNORECASE if ignore_case else 0
++    prog = re.compile(pattern, flags) if regex else None
++    matches = []
++    for i, line in enumerate(lines, 1):
++        if regex:
++            for m in prog.finditer(line):
++                matches.append((i, m.start()+1, line.rstrip('\n')))
++        else:
++            idx = 0
++            ln = line
++            pos = ln.lower().find(pattern.lower()) if ignore_case else ln.find(pattern)
++            while pos != -1:
++                matches.append((i, pos+1, line.rstrip('\n')))
++                idx = pos + 1
++                ln = line[idx:]
++                pos = ln.lower().find(pattern.lower()) if ignore_case else ln.find(pattern)
++                if pos != -1:
++                    pos += idx
++    return matches
++
++def print_results(path, matches, context, color):
++    def colorize(s, code):
++        return f"\033[{code}m{s}\033[0m" if color else s
++    try:
++        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
++            lines = [ln.rstrip('\n') for ln in f]
++    except Exception:
++        lines = []
++    for (lineno, col, text) in matches:
++        header = f"{path}:{lineno}:{col}"
++        print(colorize(header, '1;34'))
++        start = max(1, lineno - context)
++        end = min(len(lines), lineno + context)
++        for ln in range(start, end+1):
++            prefix = ">" if ln == lineno else " "
++            out = f"{prefix} {ln:6d} | {lines[ln-1]}"
++            if ln == lineno:
++                # underline caret at col
++                caret = " " * (col + 9) + "^"
++                print(colorize(out, '1;31'))
++                print(colorize(caret, '0;33'))
++            else:
++                print(out)
++        print()
++
++def main():
++    ap = argparse.ArgumentParser(description="Recursive code search with context and exclusions.")
++    ap.add_argument('pattern', help='Pattern to search (string or regex)')
++    ap.add_argument('-r', '--root', default='.', help='Root directory (default .)')
++    ap.add_argument('--regex', action='store_true', help='Interpret pattern as regex')
++    ap.add_argument('-i', '--ignore-case', action='store_true', help='Case-insensitive search')
++    ap.add_argument('-C', '--context', type=int, default=1, help='Context lines (default 1)')
++    ap.add_argument('--ext', action='append', help='Restrict to these file extensions, e.g., --ext .py --ext .txt')
++    ap.add_argument('--exclude-dir', action='append', help='Directories to exclude (can repeat)')
++    ap.add_argument('--no-default-excludes', action='store_true', help='Do not exclude default VCS/build dirs')
++    ap.add_argument('--no-color', action='store_true', help='Disable ANSI colors')
++    # argparse doesn't have is_true; emulate:
++    for a in ap._actions:
++        if hasattr(a, 'action') and a.action == 'is_true':
++            a.const = True
++            a.default = False
++            a.action = 'store_const'
++    args = ap.parse_args()
++
++    exclude_dirs = set(args.exclude_dir or [])
++    if not args.no_default_excludes:
++        exclude_dirs |= DEFAULT_EXCLUDES
++
++    total = 0
++    for path in iter_files(args.root, include_ext=args.ext, exclude_dirs=exclude_dirs):
++        ms = search_file(path, args.pattern, regex=args.regex, ignore_case=args.ignore_case)
++        if ms:
++            print_results(path, ms, args.context, color=not args.no_color and sys.stdout.isatty())
++            total += len(ms)
++    if total == 0:
++        print("No matches found.", file=sys.stderr)
++
++if __name__ == '__main__':
++    main()

@@ -1,0 +1,143 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/backends/base/creation.py b/django/db/backends/base/creation.py
+index 81cb34bd9f..c8f3f4e99f 100755
+--- a/django/db/backends/base/creation.py
++++ b/django/db/backends/base/creation.py
+@@ -71,13 +71,19 @@ class BaseDatabaseCreation:
+             # We report migrate messages at one level lower than that
+             # requested. This ensures we don't get flooded with messages during
+             # testing (unless you really ask to be flooded).
+-            call_command(
+-                'migrate',
+-                verbosity=max(verbosity - 1, 0),
+-                interactive=False,
+-                database=self.connection.alias,
+-                run_syncdb=True,
++            from django.apps import apps as _apps
++            allowed_any = any(
++                router.get_migratable_models(app_config, self.connection.alias)
++                for app_config in _apps.get_app_configs()
+             )
++            if allowed_any:
++                            call_command(
++                                'migrate',
++                                verbosity=max(verbosity - 1, 0),
++                                interactive=False,
++                                database=self.connection.alias,
++                                run_syncdb=True,
++                            )
+         finally:
+             if self.connection.settings_dict['TEST']['MIGRATE'] is False:
+                 settings.MIGRATION_MODULES = old_migration_modules
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..ad4abe14ca 100755
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -51,13 +51,15 @@ class MigrationRecorder:
+         return self.Migration.objects.using(self.connection.alias)
+ 
+     def has_table(self):
+-        """Return True if the django_migrations table exists."""
++        """Return True if the django_migrations table exists."
++        """
+         with self.connection.cursor() as cursor:
+             tables = self.connection.introspection.table_names(cursor)
+         return self.Migration._meta.db_table in tables
+ 
+     def ensure_schema(self):
+-        """Ensure the table exists and has the correct schema."""
++        """Ensure the table exists and has the correct schema."
++        """
+         # If the table's there, that's fine - we've never changed its schema
+         # in the codebase.
+         if self.has_table():
+@@ -82,15 +84,18 @@ class MigrationRecorder:
+             return {}
+ 
+     def record_applied(self, app, name):
+-        """Record that a migration was applied."""
++        """Record that a migration was applied."
++        """
+         self.ensure_schema()
+         self.migration_qs.create(app=app, name=name)
+ 
+     def record_unapplied(self, app, name):
+-        """Record that a migration was unapplied."""
++        """Record that a migration was unapplied."
++        """
+         self.ensure_schema()
+         self.migration_qs.filter(app=app, name=name).delete()
+ 
+     def flush(self):
+-        """Delete all migration records. Useful for testing migrations."""
++        """Delete all migration records. Useful for testing migrations."
++        """
+         self.migration_qs.all().delete()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..8668806aa9
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,56 @@
++MigrationRecorder does not obey db_router allow_migrate rules
++Description
++	
++Hi,
++We have a multi-db setup. We have one connection that is for the django project, and several connections that talk to other dbs for information (ie models with managed = False). Django should only create tables in the first connection, never in any of the other connections. We have a simple router that does the following: 
++class Router(object):
++	def allow_migrate(self, db, model):
++		if db == 'default':
++			return True
++		return False
++Current Behaviour
++We run our functional tests and the migrate command is called against each connection when the test databases are created (see django/test/runner.py, setup_databases, line 300-ish, which calls django/db/backends/creation.py, create_test_db, line 377-ish)
++When this migrate runs, it tries to apply our migrations, which tries to record that a migration has been applied (see django/db/migrations/executor.py, apply_migration, which has several calls to self.recorder.record_applied). 
++The first thing that record_applied does is a call to self.ensure_schema() (see django/db/migrations/recorder.py, record_applied, lien 66-ish). 
++ensure_schema checks to see if the Migration model is in the tables in the connection. If it does not find the table then it tries to create the table. 
++I believe that this is incorrect behaviour when a db_router has been provided. If using the router above, my expectation would be that the table is not created on any connection other than the 'default' connection. Looking at the other methods on the MigrationRecorder, I would expect that there will be similar issues with applied_migrations and record_unapplied.
++
++
++[Investigation Insights]
++- MigrationRecorder implementation located at: django/db/migrations/recorder.py.
++- Current behavior:
++  * ensure_schema() unconditionally creates the django_migrations table if missing (no router checks).
++  * applied_migrations() queries if table exists; otherwise returns {} (no router checks).
++  * record_applied()/record_unapplied() call ensure_schema() and then write/delete records (no router checks).
++  * flush() deletes all records unconditionally via migration_qs (no router checks).
++- Router API observed in django/db/utils.py:
++  * router.allow_migrate(db, app_label, **hints) and router.allow_migrate_model(db, model) are the canonical checks.
++  * Default allow_migrate if no router says otherwise is True.
++[Planned Fix]
++- Import django.db.router in MigrationRecorder and guard operations with router.allow_migrate_model(self.connection.alias, self.Migration):
++  * ensure_schema(): if disallowed, return early (do not create table).
++  * applied_migrations(): if disallowed, return {} without querying.
++  * record_applied()/record_unapplied(): if disallowed, no-op (skip ensure_schema and skip DB writes/deletes).
++  * flush(): only delete if allowed and table exists; otherwise, no-op.
++
++
++[Test Execution Insights]
++- The Django test runner in this environment doesn't accept the -q flag; use -v to control verbosity.
++- Ran migrations.test_multidb and migrations.test_executor (33 tests): all passed (OK). This indicates MigrationRecorder respecting routers doesn't break basic multi-DB and executor behaviors.
++
++
++[Additional Test Execution Insights]
++- Router guards in MigrationRecorder caused migrations.test_commands::MigrateTests.test_migrate_fake_initial to fail.
++- Reason: recorder skipped recording on the 'other' DB, so later a normal migrate tried to re-apply the initial migration, causing "table ... already exists".
++- Conclusion: MigrationRecorder must record on databases where migrate is invoked; adding router guards in ensure_schema/record_* breaks this expectation.
++- Action: Reverted MigrationRecorder to original behavior (no router checks); further router-related behavior should be handled at the migration planning/operation level, not in the recorder.
++
++
++[Design Adjustment]
++- Instead of adding router checks in MigrationRecorder (which breaks cases where some app models migrate on a DB but routers disallow the recorder model), respect routers during test DB setup.
++- Change: In BaseDatabaseCreation.create_test_db(), before calling 'migrate', detect if any models are migratable for the current alias via router.get_migratable_models() across all apps. If none, skip calling 'migrate' for that alias.
++- Outcome: Prevents creating django_migrations table on databases where routers disallow all migrations (matching the PR expectation) while preserving correct behavior where some migrations are allowed.
++
++
++[Implementation]
++- Updated BaseDatabaseCreation.create_test_db() to conditionally run 'migrate' only if routers allow any migratable models on the current database (using router.get_migratable_models() across all apps). This prevents creating the django_migrations table on databases where routers disallow migrations, without altering MigrationRecorder behavior.

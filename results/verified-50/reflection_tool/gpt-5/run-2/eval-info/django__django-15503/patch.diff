@@ -1,0 +1,228 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..fadf998fb6
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,47 @@
++has_key, has_keys, and has_any_keys JSONField() lookups don't handle numeric keys on SQLite, MySQL, and Oracle.
++Description
++	 
++		(last modified by TheTerrasque)
++	 
++Problem
++When using models.​JSONField() ​has_key lookup with numerical keys on SQLite database it fails to find the keys.
++Versions:
++Django: 4.0.3
++Python: 3.9.6 (tags/v3.9.6:db3ff76, Jun 28 2021, 15:26:21) [MSC v.1929 64 bit (AMD64)] on win32
++sqlite3.version: '2.6.0'
++sqlite3.sqlite_version: '3.35.5'
++Example:
++Database
++DATABASES = {
++	'default': {
++		'ENGINE': 'django.db.backends.sqlite3',
++		'NAME': 'db.sqlite3',
++	}
++}
++Model
++class JsonFieldHasKeyTest(models.Model):
++	data = models.JSONField()
++Test
++from django.test import TestCase
++from .models import JsonFieldHasKeyTest
++class JsonFieldHasKeyTestCase(TestCase):
++	def setUp(self) -> None:
++		test = JsonFieldHasKeyTest(data={'foo': 'bar'})
++		test2 = JsonFieldHasKeyTest(data={'1111': 'bar'})
++		test.save()
++		test2.save()
++	def test_json_field_has_key(self):
++		c1 = JsonFieldHasKeyTest.objects.filter(data__has_key='foo').count()
++		c2 = JsonFieldHasKeyTest.objects.filter(data__has_key='1111').count()
++		self.assertEqual(c1, 1, Should have found 1 entry with key foo)
++		self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++Result
++FAIL: test_json_field_has_key (markers.tests.JsonFieldHasKeyTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++ File H:FilesProjectsElectacoWebserviceelecservemarkerstests.py, line 16, in test_json_field_has_key	 
++	self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++AssertionError: 0 != 1 : Should have found 1 entry with key '1111'
++Additional info
++This has been tested on SQLite and Postgresql backend, it works on postgresql but fails on sqlite.
++
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..80651061fc 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -138,6 +138,26 @@ def compile_json_path(key_transforms, include_root=True):
+             path.append("[%s]" % num)
+     return "".join(path)
+ 
++def compile_json_path_for_key(key_transforms):
++    """
++    Build a JSON path for has_key/has_keys/has_any_keys RHS where the final
++    segment must be treated as an object key even if it is numeric-like.
++    Intermediate segments still follow normal rules (arrays vs objects).
++    """
++    if not key_transforms:
++        return ""
++    head = key_transforms[:-1]
++    tail = key_transforms[-1]
++    # Build the head using normal semantics (include_root=False).
++    parts = []
++    if head:
++        parts.append(compile_json_path(head, include_root=False))
++    # Always treat the tail as an object key, quoting appropriately.
++    parts.append(".")
++    # Ensure tail is a string for json.dumps; this preserves escaping.
++    parts.append(json.dumps(str(tail)))
++    return "".join(parts)
++
+ 
+ class DataContains(PostgresOperatorLookup):
+     lookup_name = "contains"
+@@ -197,7 +217,7 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 "%s%s"
+                 % (
+                     lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
++                    compile_json_path_for_key(rhs_key_transforms),
+                 )
+             )
+         # Add condition for each key.
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..d74cc3f99c
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- When fixing JSONField lookups (has_key, has_keys, has_any_keys) for SQLite/MySQL/Oracle, ensure JSON path segments for object keys are correctly quoted if they are not simple identifiers. Numeric-looking keys like "1111" must be referenced as $."1111" rather than $.1111.
++- Identify the backend-specific JSON path/exists builders (e.g., DatabaseOperations helpers for sqlite, mysql, oracle) and centralize a safe "quote_json_key" utility if possible.
++- Verify that the change applies consistently to has_key, has_keys, and has_any_keys, not just one of them.
++- Add/adjust code only in non-test files and ensure tests (including any existing ones for JSON lookups) pass across backends in CI.
++- Create or use a small tool to make repeatable file edits (tools/edit_file.py has replace/insert helpers).
++- Build a minimal reproduction script locally before/after changes to validate behavior matches PostgreSQL semantics.
+diff --git a/tools/edit_file.py b/tools/edit_file.py
+new file mode 100755
+index 0000000000..88e27b948d
+--- /dev/null
++++ b/tools/edit_file.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++import sys, re, argparse, pathlib
++
++def replace(args):
++    p = pathlib.Path(args.file)
++    s = p.read_text(encoding='utf-8')
++    flags = 0
++    if args.ignore_case:
++        flags |= re.IGNORECASE
++    new, n = re.subn(args.pattern, args.repl, s, count=0 if args.count is None else int(args.count), flags=flags)
++    if n == 0 and not args.allow_zero:
++        sys.stderr.write(f"[edit_file] No replacements made for pattern: {args.pattern}\n")
++        sys.exit(2)
++    p.write_text(new, encoding='utf-8')
++    print(f"[edit_file] Replaced {n} occurrence(s) in {args.file}")
++
++def insert_after(args):
++    p = pathlib.Path(args.file)
++    s = p.read_text(encoding='utf-8')
++    m = re.search(args.pattern, s, re.IGNORECASE if args.ignore_case else 0)
++    if not m:
++        sys.stderr.write(f"[edit_file] Pattern not found for insert_after: {args.pattern}\n")
++        sys.exit(2)
++    pos = m.end()
++    new = s[:pos] + args.text + s[pos:]
++    p.write_text(new, encoding='utf-8')
++    print(f"[edit_file] Inserted after first match in {args.file}")
++
++def insert_before(args):
++    p = pathlib.Path(args.file)
++    s = p.read_text(encoding='utf-8')
++    m = re.search(args.pattern, s, re.IGNORECASE if args.ignore_case else 0)
++    if not m:
++        sys.stderr.write(f"[edit_file] Pattern not found for insert_before: {args.pattern}\n")
++        sys.exit(2)
++    pos = m.start()
++    new = s[:pos] + args.text + s[pos:]
++    p.write_text(new, encoding='utf-8')
++    print(f"[edit_file] Inserted before first match in {args.file}")
++
++def append_text(args):
++    p = pathlib.Path(args.file)
++    s = p.read_text(encoding='utf-8')
++    s += args.text
++    p.write_text(s, encoding='utf-8')
++    print(f"[edit_file] Appended to {args.file}")
++
++def prepend_text(args):
++    p = pathlib.Path(args.file)
++    s = p.read_text(encoding='utf-8')
++    s = args.text + s
++    p.write_text(s, encoding='utf-8')
++    print(f"[edit_file] Prepended to {args.file}")
++
++def assert_contains(args):
++    p = pathlib.Path(args.file)
++    s = p.read_text(encoding='utf-8')
++    if re.search(args.pattern, s, re.IGNORECASE if args.ignore_case else 0):
++        print(f"[edit_file] Pattern found in {args.file}")
++    else:
++        sys.stderr.write(f"[edit_file] Pattern not found in {args.file}\n")
++        sys.exit(3)
++
++def main():
++    import argparse
++    ap = argparse.ArgumentParser(description="Simple file editor tool for repeatable modifications.")
++    sub = ap.add_subparsers(dest='cmd', required=True)
++
++    ap_rep = sub.add_parser('replace')
++    ap_rep.add_argument('file')
++    ap_rep.add_argument('pattern')
++    ap_rep.add_argument('repl')
++    ap_rep.add_argument('--count', type=int, default=None)
++    ap_rep.add_argument('--ignore-case', action='store_true')
++    ap_rep.add_argument('--allow-zero', action='store_true', help='Do not error if zero replacements made')
++    ap_rep.set_defaults(func=replace)
++
++    ap_after = sub.add_parser('insert_after')
++    ap_after.add_argument('file')
++    ap_after.add_argument('pattern')
++    ap_after.add_argument('text')
++    ap_after.add_argument('--ignore-case', action='store_true')
++    ap_after.set_defaults(func=insert_after)
++
++    ap_before = sub.add_parser('insert_before')
++    ap_before.add_argument('file')
++    ap_before.add_argument('pattern')
++    ap_before.add_argument('text')
++    ap_before.add_argument('--ignore-case', action='store_true')
++    ap_before.set_defaults(func=insert_before)
++
++    ap_app = sub.add_parser('append')
++    ap_app.add_argument('file')
++    ap_app.add_argument('text')
++    ap_app.set_defaults(func=append_text)
++
++    ap_pre = sub.add_parser('prepend')
++    ap_pre.add_argument('file')
++    ap_pre.add_argument('text')
++    ap_pre.set_defaults(func=prepend_text)
++
++    ap_assert = sub.add_parser('assert')
++    ap_assert.add_argument('file')
++    ap_assert.add_argument('pattern')
++    ap_assert.add_argument('--ignore-case', action='store_true')
++    ap_assert.set_defaults(func=assert_contains)
++
++    args = ap.parse_args()
++    args.func(args)
++
++if __name__ == "__main__":
++    main()

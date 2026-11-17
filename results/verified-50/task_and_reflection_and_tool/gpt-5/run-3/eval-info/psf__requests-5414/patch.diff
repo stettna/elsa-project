@@ -1,0 +1,187 @@
+diff --git a/edit_inplace.py b/edit_inplace.py
+new file mode 100644
+index 00000000..4b4c3f07
+--- /dev/null
++++ b/edit_inplace.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++import re, sys
++
++def main():
++    p = 'requests/models.py'
++    try:
++        s = open(p, 'r', encoding='utf-8').read()
++    except Exception as e:
++        print(f"Failed to read {p}: {e}", file=sys.stderr)
++        sys.exit(1)
++
++    # Replace:
++    #   elif host.startswith(u'*'):
++    #       raise InvalidURL('URL has an invalid label.')
++    # with an else: block that includes ASCII host validation.
++    pattern = re.compile(r"(\n\s*)elif host\.startswith\(u'\*'\):\n\s*raise InvalidURL\('URL has an invalid label\.'\)\n")
++    if not pattern.search(s):
++        print("Pattern not found or already patched", file=sys.stderr)
++        sys.exit(0)
++    repl = (
++        r"\1else:\n"
++        r"\1    # For ASCII-only hosts, ensure there are no invalid/empty labels.\n"
++        r"\1    # Examples such as '.example.com' or 'example..com' should raise InvalidURL\n"
++        r"\1    # instead of allowing a UnicodeError to surface from lower layers.\n"
++        r"\1    # Skip this validation for IPv6 literals or hosts containing colons.\n"
++        r"\1    if host.startswith(u'*'):\n"
++        r"\1        raise InvalidURL('URL has an invalid label.')\n"
++        r"\1    # Check for empty labels created by leading or consecutive dots, e.g.:\n"
++        r"\1    # '.example.com', 'example..com'. We intentionally avoid rejecting\n"
++        r"\1    # IPv6 addresses (which may contain ':') by foregoing this check if\n"
++        r"\1    # a colon is present.\n"
++        r"\1    if u':' not in host:\n"
++        r"\1        if host.startswith(u'.') or u'..' in host:\n"
++        r"\1            raise InvalidURL('URL has an invalid label.')\n"
++        r"\n"
++    )
++    s2 = pattern.sub(repl, s, count=1)
++    if s2 == s:
++        print("No changes made", file=sys.stderr)
++        sys.exit(1)
++    try:
++        with open(p, 'w', encoding='utf-8') as f:
++            f.write(s2)
++    except Exception as e:
++        print(f"Failed to write {p}: {e}", file=sys.stderr)
++        sys.exit(1)
++    print(f"Patched {p}")
++
++if __name__ == "__main__":
++    main()
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 00000000..60086e9b
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++Workflow Notes:
++- Add ASCII host validation in prepare_url: if host is ASCII and not IPv6 (no ':'), then reject leading '.' or consecutive '..' with InvalidURL('URL has an invalid label.').
++- Keep existing non-ASCII IDNA path intact and the wildcard '*' check.
++- After implementing, create a quick reproduction to ensure requests.get('http://.example.com') raises InvalidURL instead of UnicodeError.
++- Consider edge cases like 'example.com.' (trailing dot) and IPv6 '[::1]': do not over-restrict.
+diff --git a/requests/models.py b/requests/models.py
+index e7d292d5..047657ad 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -403,8 +403,34 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+                 host = self._get_idna_encoded_host(host)
+             except UnicodeError:
+                 raise InvalidURL('URL has an invalid label.')
+-        elif host.startswith(u'*'):
+-            raise InvalidURL('URL has an invalid label.')
++        else:
++
++            # For ASCII-only hosts, ensure there are no invalid/empty labels.
++
++            # Examples such as '.example.com' or 'example..com' should raise InvalidURL
++
++            # instead of allowing a UnicodeError to surface from lower layers.
++
++            # Skip this validation for IPv6 literals or hosts containing colons.
++
++            if host.startswith(u'*'):
++
++                raise InvalidURL('URL has an invalid label.')
++
++            # Check for empty labels created by leading or consecutive dots, e.g.:
++
++            # '.example.com', 'example..com'. We intentionally avoid rejecting
++
++            # IPv6 addresses (which may contain ':') by foregoing this check if
++
++            # a colon is present.
++
++            if u':' not in host:
++
++                if host.startswith(u'.') or u'..' in host:
++
++                    raise InvalidURL('URL has an invalid label.')
++
+ 
+         # Carefully reconstruct the network location
+         netloc = auth or ''
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 00000000..4fcf371b
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,67 @@
++Getting http://.example.com raises UnicodeError
++Attempting to get e.g. http://.example.com results in a UnicodeError. It seems like the intention so far has been to raise InvalidUrl instead (see e.g. [this line](https://github.com/psf/requests/blob/ca6f9af5dba09591007b15a7368bc0f006b7cc50/requests/models.py#L401)).
++
++I see there was some hesitation in fixing a similar issue (#4168) and would like to add that even catching the error just to rethrow as a requests exception would be beneficial.
++
++## Expected Result
++
++Based on PR #774: InvalidUrl: URL has an invalid label.
++
++## Actual Result
++
++UnicodeError: encoding with 'idna' codec failed (UnicodeError: label empty or too long)
++
++## Reproduction Steps
++
++python3
++import requests
++requests.get(http://.example.com)
++
++
++## System Information
++
++    $ python -m requests.help
++
++
++{
++  chardet: {
++    version: 3.0.4
++  },
++  cryptography: {
++    version: 2.8
++  },
++  idna: {
++    version: 2.8
++  },
++  implementation: {
++    name: CPython,
++    version: 3.8.0
++  },
++  platform: {
++    release: 5.3.0-40-generic,
++    system: Linux
++  },
++  pyOpenSSL: {
++    openssl_version: 1010104f,
++    version: 19.1.0
++  },
++  requests: {
++    version: 2.23.0
++  },
++  system_ssl: {
++    version: 1010103f
++  },
++  urllib3: {
++    version: 1.25.8
++  },
++  using_pyopenssl: true
++}
++
++
++
++Additional Insights:
++- In requests/models.py, prepare_url only IDNA-encodes non-ASCII hosts and raises InvalidURL on IDNA errors.
++- ASCII hosts bypass this and only check for leading '*' wildcard, so invalid labels like leading or consecutive dots (e.g., '.example.com', 'foo..bar') are not rejected early.
++- This can result in a UnicodeError later in the stack. We should add ASCII host validation to raise InvalidURL('URL has an invalid label.') for empty labels without affecting IPv6 literals.
++Planned Fix:
++- In prepare_url, for ASCII hosts that are not IPv6, detect invalid labels (leading '.' or '..' anywhere) and raise InvalidURL with the expected message.

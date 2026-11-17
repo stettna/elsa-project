@@ -1,0 +1,213 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..198600e9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,60 @@
++Getting http://.example.com raises UnicodeError
++Attempting to get e.g. http://.example.com results in a UnicodeError. It seems like the intention so far has been to raise InvalidUrl instead (see e.g. [this line](https://github.com/psf/requests/blob/ca6f9af5dba09591007b15a7368bc0f006b7cc50/requests/models.py#L401)).
++
++I see there was some hesitation in fixing a similar issue (#4168) and would like to add that even catching the error just to rethrow as a requests exception would be beneficial.
++
++## Expected Result
++
++Based on PR #774: InvalidUrl: URL has an invalid label.
++
++## Actual Result
++
++UnicodeError: encoding with 'idna' codec failed (UnicodeError: label empty or too long)
++
++## Reproduction Steps
++
++python3
++import requests
++requests.get(http://.example.com)
++
++
++## System Information
++
++    $ python -m requests.help
++
++
++{
++  chardet: {
++    version: 3.0.4
++  },
++  cryptography: {
++    version: 2.8
++  },
++  idna: {
++    version: 2.8
++  },
++  implementation: {
++    name: CPython,
++    version: 3.8.0
++  },
++  platform: {
++    release: 5.3.0-40-generic,
++    system: Linux
++  },
++  pyOpenSSL: {
++    openssl_version: 1010104f,
++    version: 19.1.0
++  },
++  requests: {
++    version: 2.23.0
++  },
++  system_ssl: {
++    version: 1010103f
++  },
++  urllib3: {
++    version: 1.25.8
++  },
++  using_pyopenssl: true
++}
++
++
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 00000000..602558f1
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,12 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++[Added on this iteration]
++- Before coding, create a minimal reproduction script for the failing input (e.g., requests.get("http://.example.com")) and confirm actual vs expected exceptions.
++- Search the codebase for URL preparation and IDNA handling (likely in requests/models.py, requests/utils.py). Identify any places where UnicodeError can escape instead of raising requests.exceptions.InvalidURL.
++- Implement a try/except around IDNA encoding/decoding to convert UnicodeError (or idna-related exceptions) into InvalidURL with the message: "URL has an invalid label." Do not mask unrelated exceptions.
++- Do not modify tests or configs; only change non-test source files.
++- After changes, re-run the reproduction and test additional edge cases (e.g., leading dot, double dots in labels).
++- Use tools/edit.py for safe, reproducible file edits (supports replace, insert_before/after, append, prepend via JSON ops).
+diff --git a/requests/models.py b/requests/models.py
+index e7d292d5..c7a3cacd 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -405,6 +405,13 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+                 raise InvalidURL('URL has an invalid label.')
+         elif host.startswith(u'*'):
+             raise InvalidURL('URL has an invalid label.')
++        # Validate ASCII hostnames for empty labels (e.g., leading dot or consecutive dots).
++        # Allow a trailing dot to represent a fully qualified domain name.
++        if unicode_is_ascii(host):
++            core = host[:-1] if host.endswith(u'.') else host
++            if any(label == u'' for label in core.split(u'.')):
++                raise InvalidURL('URL has an invalid label.')
++
+ 
+         # Carefully reconstruct the network location
+         netloc = auth or ''
+diff --git a/tools/edit.py b/tools/edit.py
+new file mode 100755
+index 00000000..ef0ebfd2
+--- /dev/null
++++ b/tools/edit.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++import sys, re, json
++
++def apply_ops(path, ops):
++    with open(path, 'r', encoding='utf-8') as f:
++        content = f.read()
++    orig = content
++    for i, op in enumerate(ops, 1):
++        t = op.get('type')
++        if t == 'replace':
++            pattern = op['pattern']
++            repl = op['repl']
++            flags = op.get('flags', '')
++            count = int(op.get('count', 0))
++            fval = 0
++            if isinstance(flags, str):
++                for fl in flags.split('|'):
++                    fl = fl.strip()
++                    if fl:
++                        fval |= getattr(re, fl, 0)
++            content, n = re.subn(pattern, repl, content, count=0 if count <= 0 else count, flags=fval)
++            print(f"op{i}: replace {n} occurrence(s)")
++        elif t in ('insert_before', 'insert_after'):
++            pattern = op['pattern']
++            text = op['text']
++            flags = op.get('flags', '')
++            fval = 0
++            if isinstance(flags, str):
++                for fl in flags.split('|'):
++                    fl = fl.strip()
++                    if fl:
++                        fval |= getattr(re, fl, 0)
++            m = re.search(pattern, content, flags=fval)
++            if not m:
++                print(f"op{i}: {t} pattern not found", file=sys.stderr)
++                continue
++            pos = m.start() if t == 'insert_before' else m.end()
++            content = content[:pos] + text + content[pos:]
++            print(f"op{i}: {t} inserted {len(text)} chars")
++        elif t == 'append':
++            text = op['text']
++            content += text
++            print(f"op{i}: appended {len(text)} chars")
++        elif t == 'prepend':
++            text = op['text']
++            content = text + content
++            print(f"op{i}: prepended {len(text)} chars")
++        else:
++            print(f"op{i}: unknown op type {t}", file=sys.stderr)
++    if content != orig:
++        with open(path, 'w', encoding='utf-8') as f:
++            f.write(content)
++        print(f"Wrote changes to {path}")
++    else:
++        print("No changes to write.")
++    return 0
++
++def parse_stdin(text):
++    text = text.strip()
++    if not text:
++        return []
++    try:
++        return json.loads(text)
++    except Exception:
++        ops = []
++        for line in text.splitlines():
++            if not line.strip() or line.strip().startswith('#'):
++                continue
++            parts = line.split('|')
++            cmd = parts[0].strip()
++            if cmd == 'replace' and len(parts) >= 3:
++                ops.append({
++                    'type': 'replace',
++                    'pattern': parts[1],
++                    'repl': parts[2],
++                    'flags': parts[3] if len(parts) > 3 else '',
++                    'count': int(parts[4]) if len(parts) > 4 and parts[4].strip() else 0
++                })
++            elif cmd in ('insert_before', 'insert_after') and len(parts) >= 3:
++                ops.append({
++                    'type': cmd,
++                    'pattern': parts[1],
++                    'text': parts[2],
++                    'flags': parts[3] if len(parts) > 3 else ''
++                })
++            elif cmd in ('append', 'prepend') and len(parts) >= 2:
++                ops.append({'type': cmd, 'text': parts[1]})
++            else:
++                print(f"Skipping invalid line: {line}", file=sys.stderr)
++        return ops
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: edit.py <file> < <ops as JSON or pipe-separated commands>", file=sys.stderr)
++        sys.exit(2)
++    path = sys.argv[1]
++    data = sys.stdin.read()
++    ops = parse_stdin(data)
++    if not ops:
++        print("No operations provided on stdin.", file=sys.stderr)
++        sys.exit(1)
++    sys.exit(apply_ops(path, ops))
++
++if __name__ == "__main__":
++    main()

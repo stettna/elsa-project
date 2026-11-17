@@ -1,0 +1,114 @@
+diff --git a/django/db/models/functions/datetime.py b/django/db/models/functions/datetime.py
+index 90e6f41be0..3e140bfa84 100644
+--- a/django/db/models/functions/datetime.py
++++ b/django/db/models/functions/datetime.py
+@@ -164,11 +164,6 @@ ExtractYear.register_lookup(YearGte)
+ ExtractYear.register_lookup(YearLt)
+ ExtractYear.register_lookup(YearLte)
+ 
+-ExtractIsoYear.register_lookup(YearExact)
+-ExtractIsoYear.register_lookup(YearGt)
+-ExtractIsoYear.register_lookup(YearGte)
+-ExtractIsoYear.register_lookup(YearLt)
+-ExtractIsoYear.register_lookup(YearLte)
+ 
+ 
+ class Now(Func):
+diff --git a/myapp/__init__.py b/myapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/myapp/apps.py b/myapp/apps.py
+new file mode 100644
+index 0000000000..48d9057e26
+--- /dev/null
++++ b/myapp/apps.py
+@@ -0,0 +1,7 @@
++from django.apps import AppConfig
++import os
++
++class MyAppConfig(AppConfig):
++    name = 'myapp'
++    label = 'myapp'
++    path = os.path.dirname(os.path.abspath(__file__))
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..1d2326f044
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,7 @@
++
++
++- Do not apply YearLookup/BETWEEN optimization to iso_year; ensure ExtractIsoYear uses EXTRACT-based comparisons.
++- After changes, verify SQL generation for __iso_year no longer contains BETWEEN.
++
++- Ensure no YearLookup/BETWEEN optimization is registered for ExtractIsoYear.
++- After modifications, verify SQL generation for filters using __iso_year or annotated ExtractIsoYear does not contain BETWEEN and instead uses extraction/equality.
+diff --git a/reproduce_iso_year.py b/reproduce_iso_year.py
+new file mode 100644
+index 0000000000..684cca8920
+--- /dev/null
++++ b/reproduce_iso_year.py
+@@ -0,0 +1,26 @@
++from django.conf import settings
++settings.configure(
++    INSTALLED_APPS=['django.contrib.contenttypes', 'myapp.apps.MyAppConfig'],
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    TIME_ZONE='UTC',
++    USE_TZ=False,
++)
++import django
++django.setup()
++from django.db import models
++from django.db.models.functions import ExtractIsoYear
++
++class DTModel(models.Model):
++    start_date = models.DateField()
++    class Meta:
++        app_label = 'myapp'
++        managed = False
++        db_table = 'db_functions_dtmodel'
++
++qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++print("-- Annotate ExtractIsoYear --")
++print(qs.query)
++print("\n-- Filter on annotated extracted (should NOT use BETWEEN) --")
++print(qs.filter(extracted=2020).query)
++print("\n-- Implicit lookup start_date__iso_year=2020 (should NOT use BETWEEN) --")
++print(DTModel.objects.filter(start_date__iso_year=2020).only('id').query)
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..79e9fd22af
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,31 @@
++Query optimization in YearLookup breaks filtering by __iso_year
++Description
++	 
++		(last modified by Florian Demmer)
++	 
++The optimization to use BETWEEN instead of the EXTRACT operation in ​YearLookup is also registered for the ​__iso_year lookup, which breaks the functionality provided by ​ExtractIsoYear when used via the lookup.
++This has unfortunately been broken ever since ExtractIsoYear was introduced in ​Django 2.2 via #28649 and wasn't easy to track down since ExtractIsoYear when used by itself eg. in an annotation works perfectly fine. Just when using the lookup in a filter, the optimization is used (even when explicitly using an annotation):
++# annotation works
++>>> qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++>>> print(qs.query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel
++# explicit annotation used in filter does not use extracted and adds BETWEEN
++>>> print(qs.filter(extracted=2020).query)
++SELECT db_functions_dtmodel.id, EXTRACT('isoyear' FROM db_functions_dtmodel.start_date) AS extracted FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++# implicit lookup uses BETWEEN
++>>> print(DTModel.objects.filter(start_date__iso_year=2020).only('id').query)
++SELECT db_functions_dtmodel.id FROM db_functions_dtmodel WHERE db_functions_dtmodel.start_date BETWEEN 2020-01-01 AND 2020-12-31
++This results in the wrong data being returned by filters using iso_year.
++This PR fixes the behaviour, reverts the invalid changes to the tests and extends one test to catch this problem: ​https://github.com/django/django/pull/14157
++
++
++
++Additional findings:
++- ExtractIsoYear in django/db/models/functions/datetime.py registers YearLookup-based lookups (YearExact/YearGt/YearGte/YearLt/YearLte).
++- This causes BETWEEN optimization to be applied to __iso_year filters and when filtering on an ExtractIsoYear annotation, leading to incorrect results.
++- Fix: Remove these registrations so lookups on ExtractIsoYear use standard integer comparisons on the extracted value, avoiding BETWEEN on the original field.
++
++
++Additional findings:
++- Root cause: ExtractIsoYear registered YearLookup-based lookups (YearExact/YearGt/YearGte/YearLt/YearLte) in django/db/models/functions/datetime.py, which triggers BETWEEN optimization on filters using __iso_year and on annotated filters, producing incorrect results around ISO week-year boundaries.
++- Fix applied: Removed these registrations so lookups on ExtractIsoYear use standard integer comparisons against EXTRACT('isoyear' ...) instead of BETWEEN on the base date/datetime field.

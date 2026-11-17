@@ -1,0 +1,93 @@
+diff --git a/django/core/management/__init__.py b/django/core/management/__init__.py
+index 5f2e64761e..19bc0df057 100644
+--- a/django/core/management/__init__.py
++++ b/django/core/management/__init__.py
+@@ -129,6 +129,14 @@ def call_command(command_name, *args, **options):
+             else:
+                 yield opt
+ 
++    def get_parsers(parser):
++        # Yield the parser and all nested subparsers recursively.
++        yield parser
++        for opt in parser._actions:
++            if isinstance(opt, _SubParsersAction):
++                for sub_opt in opt.choices.values():
++                    yield from get_parsers(sub_opt)
++
+     parser_actions = list(get_actions(parser))
+     # Any required arguments which are passed in via **options must be passed
+     # to parse_args().
+@@ -136,6 +144,23 @@ def call_command(command_name, *args, **options):
+         '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+         for opt in parser_actions if opt.required and opt.dest in options
+     ]
++
++    # Track which required options have already been added (by individual 'required=True').
++    required_opt_dests = {opt.dest for opt in parser_actions if opt.required and opt.dest in options}
++    # Also include options that are part of a required mutually exclusive group.
++    mutex_required_actions = {}
++    for p in get_parsers(parser):
++        for group in getattr(p, '_mutually_exclusive_groups', []):
++            if getattr(group, 'required', False):
++                for action in getattr(group, '_group_actions', []):
++                    if getattr(action, 'dest', None) and getattr(action, 'option_strings', None):
++                        # Prefer the first encountered action for a given dest.
++                        mutex_required_actions.setdefault(action.dest, action)
++    parse_args += [
++        '{}={}'.format(min(action.option_strings), arg_options[dest])
++        for dest, action in mutex_required_actions.items()
++        if dest in options and dest not in required_opt_dests
++    ]
+     defaults = parser.parse_args(args=parse_args)
+     defaults = dict(defaults._get_kwargs(), **arg_options)
+     # Raise an error if any unknown options were passed.
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..86e47f70da
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,10 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Remember to handle required mutually exclusive groups in call_command by scanning parser._mutually_exclusive_groups across all subparsers and adding provided kwargs to parse_args.
++- After changes, validate import of django.core.management and consider edge cases with subparsers.
++
++- Workflow tip: When using here-docs, avoid chaining '&&' immediately after the heredoc block; run file appends (e.g., printf >> file) in a separate command to prevent shell syntax errors.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..19248eef8f
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,28 @@
++call_command fails when argument of required mutually exclusive group is passed in kwargs.
++Description
++	
++This error 
++django.core.management.base.CommandError: Error: one of the arguments --shop-id --shop is required
++is raised when I run 
++call_command('my_command', shop_id=1)
++the argument 'shop_id' is part of a required mutually exclusive group:
++shop = parser.add_mutually_exclusive_group(required=True)
++shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++However, everything is fine when I call this command in this way:
++call_command('my_command, '--shop-id=1')
++In django sources I found that only those keyword arguments of call_command are passed to the parser that are defined as required:
++# Any required arguments which are passed in via '**options' must be passed
++# to parse_args().
++parse_args += [
++	'{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
++	for opt in parser._actions if opt.required and opt.dest in options
++]
++but in this special case both of them individually are not required, they are actually part of a group that is required. And the code of call_command does nothing with groups defined in the parser.
++
++
++
++INSIGHT: call_command in django/core/management/__init__.py lines ~123-139 only adds individually required options to parse_args, ignoring required mutually exclusive groups. We will add logic to include kwargs that belong to any required mutually exclusive group so argparse sees them during parse_args.
++
++
++INSIGHT: Manual verification succeeded. call_command now accepts kwargs for options in a required mutually exclusive group (e.g., shop_id=1), preserves CLI-style behavior, and still enforces mutual exclusion errors when conflicting kwargs are provided.

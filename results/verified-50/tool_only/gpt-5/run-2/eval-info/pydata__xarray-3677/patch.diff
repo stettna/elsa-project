@@ -1,0 +1,174 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..c34af70a
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,41 @@
++Merging dataArray into dataset using dataset method fails
++While it's possible to merge a dataset and a dataarray object using the top-level merge() function, if you try the same thing with the ds.merge() method it fails.
++
++python
++import xarray as xr
++
++ds = xr.Dataset({'a': 0})
++da = xr.DataArray(1, name='b')
++
++expected = xr.merge([ds, da])  # works fine
++print(expected)
++
++ds.merge(da)  # fails
++
++
++Output:
++
++<xarray.Dataset>
++Dimensions:  ()
++Data variables:
++    a        int64 0
++    b        int64 1
++
++Traceback (most recent call last):
++  File mwe.py, line 6, in <module>
++    actual = ds.merge(da)
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/dataset.py, line 3591, in merge
++    fill_value=fill_value,
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 835, in dataset_merge_method
++    objs, compat, join, priority_arg=priority_arg, fill_value=fill_value
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 548, in merge_core
++    coerced = coerce_pandas_values(objects)
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 394, in coerce_pandas_values
++    for k, v in obj.items():
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/common.py, line 233, in __getattr__
++    {!r} object has no attribute {!r}.format(type(self).__name__, name)
++AttributeError: 'DataArray' object has no attribute 'items'
++
++
++
++
+diff --git a/edit_inplace.py b/edit_inplace.py
+new file mode 100644
+index 00000000..3bbf285d
+--- /dev/null
++++ b/edit_inplace.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++import io
++import os
++import sys
++
++PATH = "xarray/core/merge.py"
++
++def main():
++    if not os.path.exists(PATH):
++        print(f"File not found: {PATH}", file=sys.stderr)
++        sys.exit(1)
++
++    with io.open(PATH, "r", encoding="utf-8") as f:
++        lines = f.readlines()
++
++    start = None
++    for i, line in enumerate(lines):
++        if line.lstrip().startswith("def dataset_merge_method("):
++            start = i
++            break
++
++    if start is None:
++        print("dataset_merge_method not found", file=sys.stderr)
++        sys.exit(1)
++
++    # Find end of multi-line function signature (look for a line containing '):' or ') ->')
++    i = start + 1
++    while i < len(lines) and ("):" not in lines[i] and ") ->" not in lines[i]):
++        i += 1
++    if i >= len(lines):
++        print("Could not find end of function signature; aborting.", file=sys.stderr)
++        sys.exit(1)
++    sig_end = i
++
++    # Next non-empty line should be (start of) docstring
++    i = sig_end + 1
++    while i < len(lines) and lines[i].strip() == "":
++        i += 1
++    if i >= len(lines) or '"""' not in lines[i]:
++        print("Docstring not found where expected; aborting to avoid incorrect patch.", file=sys.stderr)
++        sys.exit(1)
++
++    # Find the closing triple quotes of the docstring
++    doc_start = i
++    i += 1
++    while i < len(lines) and '"""' not in lines[i]:
++        i += 1
++    if i >= len(lines):
++        print("Docstring closing not found; aborting.", file=sys.stderr)
++        sys.exit(1)
++    doc_end = i
++
++    insert_index = doc_end + 1
++
++    # Check if the coercion snippet already exists within the next ~100 lines
++    window = "".join(lines[insert_index:insert_index+120])
++    if "other = other.to_dataset()" in window:
++        print("Patch already applied; no changes made.")
++        return
++
++    snippet = [
++        "    # Coerce DataArray to Dataset to ensure mapping-like behavior.\n",
++        "    # This mirrors the top-level merge() function which calls .to_dataset()\n",
++        "    # on any DataArray inputs before delegating to merge_core.\n",
++        "    from .dataarray import DataArray  # local import to avoid cycles\n",
++        "    if isinstance(other, DataArray):\n",
++        "        other = other.to_dataset()\n",
++        "\n",
++    ]
++
++    new_lines = lines[:insert_index] + snippet + lines[insert_index:]
++    with io.open(PATH, "w", encoding="utf-8", newline="") as f:
++        f.writelines(new_lines)
++
++    print("Patch applied successfully.")
++
++if __name__ == "__main__":
++    main()
+diff --git a/repro_merge_issue.py b/repro_merge_issue.py
+new file mode 100644
+index 00000000..f48c8087
+--- /dev/null
++++ b/repro_merge_issue.py
+@@ -0,0 +1,12 @@
++import xarray as xr
++
++print("xarray version:", xr.__version__)
++ds = xr.Dataset({'a': 0})
++da = xr.DataArray(1, name='b')
++
++print("Top-level merge:")
++expected = xr.merge([ds, da])
++print(expected)
++
++print("\nDataset.merge call (should work but currently fails):")
++print(ds.merge(da))
+diff --git a/xarray/core/merge.py b/xarray/core/merge.py
+index 10c7804d..0842ae9e 100644
+--- a/xarray/core/merge.py
++++ b/xarray/core/merge.py
+@@ -805,6 +805,13 @@ def dataset_merge_method(
+ ) -> _MergeResult:
+     """Guts of the Dataset.merge method.
+     """
++    # Coerce DataArray to Dataset to ensure mapping-like behavior.
++    # This mirrors the top-level merge() function which calls .to_dataset()
++    # on any DataArray inputs before delegating to merge_core.
++    from .dataarray import DataArray  # local import to avoid cycles
++    if isinstance(other, DataArray):
++        other = other.to_dataset()
++
+     # we are locked into supporting overwrite_vars for the Dataset.merge
+     # method due for backwards compatibility
+     # TODO: consider deprecating it?

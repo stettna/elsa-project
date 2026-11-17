@@ -1,0 +1,107 @@
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 00000000..952a7185
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++[Reminder]
++- Ensure Dataset.merge handles DataArray by wrapping it into a Dataset/mapping before splitting by overwrite_vars.
++- After each investigation step, append key insights to task_description.txt.
++- Test equivalence of ds.merge(da) and xr.merge([ds, da]) including overwrite_vars and joins.
++- Be mindful of unnamed DataArray behavior; keep consistent with top-level merge behavior.
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 00000000..94499200
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,67 @@
++Merging dataArray into dataset using dataset method fails
++While it's possible to merge a dataset and a dataarray object using the top-level merge() function, if you try the same thing with the ds.merge() method it fails.
++
++python
++import xarray as xr
++
++ds = xr.Dataset({'a': 0})
++da = xr.DataArray(1, name='b')
++
++expected = xr.merge([ds, da])  # works fine
++print(expected)
++
++ds.merge(da)  # fails
++
++
++Output:
++
++<xarray.Dataset>
++Dimensions:  ()
++Data variables:
++    a        int64 0
++    b        int64 1
++
++Traceback (most recent call last):
++  File mwe.py, line 6, in <module>
++    actual = ds.merge(da)
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/dataset.py, line 3591, in merge
++    fill_value=fill_value,
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 835, in dataset_merge_method
++    objs, compat, join, priority_arg=priority_arg, fill_value=fill_value
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 548, in merge_core
++    coerced = coerce_pandas_values(objects)
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/merge.py, line 394, in coerce_pandas_values
++    for k, v in obj.items():
++  File /home/tegn500/Documents/Work/Code/xarray/xarray/core/common.py, line 233, in __getattr__
++    {!r} object has no attribute {!r}.format(type(self).__name__, name)
++AttributeError: 'DataArray' object has no attribute 'items'
++
++
++
++
++[Insight - ds.merge(DataArray) failure root cause]
++- Analyzed xarray/core/merge.py: dataset_merge_method splits `other` by overwrite_vars using `other.items()` when `other` is not a Dataset (lines ~820-833).
++- When `other` is a DataArray, it is not mapping-like, so calling `.items()` raises AttributeError, causing ds.merge(da) to fail.
++- Top-level xr.merge([ds, da]) succeeds because the DataArray is wrapped/coerced into a mapping/Dataset before reaching coerce_pandas_values, so `.items()` is called on a dict instead.
++- Fix direction: Update dataset_merge_method to handle DataArray inputs by converting them into a mapping or Dataset (e.g., `da.to_dataset()` or `{da.name: da}`), matching top-level merge behavior.
++- Considerations: Keep overwrite_vars logic consistent; for unnamed DataArray, behavior should mirror top-level merge (likely error if name is None).
++
++[Plan]
++- Reproduce failure with a small script.
++- Implement handling of DataArray in dataset_merge_method (convert to Dataset/mapping).
++- Verify ds.merge(da) now equals xr.merge([ds, da]) across basic cases.
++
++[Insight - ds.merge(DataArray) failure root cause]
++- ds.merge delegates to dataset_merge_method (xarray/core/merge.py).
++- dataset_merge_method splits `other` by overwrite_vars using `other.items()` in the general branch.
++- When `other` is a DataArray, it is not mapping-like, so calling `.items()` raises AttributeError, causing ds.merge(da) to fail.
++- Top-level xr.merge([ds, da]) succeeds, indicating that DataArray is converted to a mapping/Dataset (e.g., {da.name: da} or da.to_dataset()) before merge_core/coerce_pandas_values are invoked.
++- Fix direction: Update dataset_merge_method to handle DataArray inputs by converting them into a mapping or Dataset (e.g., `da.to_dataset()` if name is set) before any `.items()` access.
++- Considerations: Keep overwrite_vars logic consistent; for unnamed DataArray, mirror top-level behavior (likely raise or require a name). Validate joins/compat params remain honored.
++
++[Validation - 2026-11-15T18:48:20.138186Z]
++- Implemented fix: In xarray/core/merge.py, dataset_merge_method now coerces DataArray `other` to a Dataset via `other.to_dataset()` prior to handling overwrite_vars and iterating over items.
++- Repro script shows:
++  - xr.merge([ds, da]) and ds.merge(da) return identical Datasets for ds=Dataset({'a': 0}), da=DataArray(1, name='b').
++  - Equality check expected.equals(actual) returned True.
++- Conclusion: The original failure (AttributeError: 'DataArray' object has no attribute 'items') is resolved for DataArray inputs to Dataset.merge.
+diff --git a/xarray/core/merge.py b/xarray/core/merge.py
+index 10c7804d..09bcbb76 100644
+--- a/xarray/core/merge.py
++++ b/xarray/core/merge.py
+@@ -805,6 +805,12 @@ def dataset_merge_method(
+ ) -> _MergeResult:
+     """Guts of the Dataset.merge method.
+     """
++    # Accept DataArray in Dataset.merge by converting it to a Dataset first,
++    # mirroring top-level xr.merge behavior to avoid attribute errors when
++    # iterating over mapping-like interfaces.
++    from .dataarray import DataArray
++    if isinstance(other, DataArray):
++        other = other.to_dataset()
+     # we are locked into supporting overwrite_vars for the Dataset.merge
+     # method due for backwards compatibility
+     # TODO: consider deprecating it?

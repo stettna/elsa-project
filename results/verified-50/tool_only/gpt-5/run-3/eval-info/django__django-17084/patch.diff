@@ -1,0 +1,79 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..76f2055a91
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,19 @@
++Cannot use aggregate over window functions since 4.2
++Description
++	 
++		(last modified by younes-chaoui)
++	 
++After upgrading to Django 4.2, I encountered an exception when executing ORM queries that involve aggregates over Window functions. The specific error was psycopg2.errors.GroupingError: aggregate function calls cannot contain window function calls
++Dependencies :
++psycopg2 version: 2.9.3
++django version: 4.2.3
++PostgreSQL version: 13.4
++Example Code:
++queryset = queryset.annotate(
++	cumul_DJR=Coalesce(Window(Sum(DJR), order_by=F(date).asc()), 0.0)
++)
++aggregate = queryset.aggregate(
++	DJR_total=Sum(DJR),
++	cumul_DJR_total=Sum(cumul_DJR)
++)
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..c0d8e9f5a7 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -403,6 +403,9 @@ class Query(BaseExpression):
+         # Store annotation mask prior to temporarily adding aggregations for
+         # resolving purpose to facilitate their subsequent removal.
+         refs_subquery = False
++        # Track if any aggregate references windowed annotations so
++        # aggregation can be pushed to an outer query.
++        refs_window = False
+         replacements = {}
+         annotation_select_mask = self.annotation_select_mask
+         for alias, aggregate_expr in aggregate_exprs.items():
+@@ -419,6 +422,11 @@ class Query(BaseExpression):
+                 getattr(self.annotations[ref], "subquery", False)
+                 for ref in aggregate.get_refs()
+             )
++            # Detect windowed annotations referenced by this aggregate.
++            refs_window |= any(
++                getattr(self.annotations[ref], "contains_over_clause", False)
++                for ref in aggregate.get_refs()
++            )
+             aggregate = aggregate.replace_expressions(replacements)
+             self.annotations[alias] = aggregate
+             replacements[Ref(alias, aggregate)] = aggregate
+@@ -426,6 +434,11 @@ class Query(BaseExpression):
+         # against each other.
+         aggregates = {alias: self.annotations.pop(alias) for alias in aggregate_exprs}
+         self.set_annotation_mask(annotation_select_mask)
++        # Detect window usage directly in aggregate expressions as well.
++        aggs_window = any(
++            getattr(aggregate, "contains_over_clause", False)
++            for aggregate in aggregates.values()
++        )
+         # Existing usage of aggregation can be determined by the presence of
+         # selected aggregates but also by filters against aliased aggregates.
+         _, having, qualify = self.where.split_having_qualify()
+@@ -451,6 +464,8 @@ class Query(BaseExpression):
+             or self.is_sliced
+             or has_existing_aggregation
+             or refs_subquery
++            or refs_window
++            or aggs_window
+             or qualify
+             or self.distinct
+             or self.combinator

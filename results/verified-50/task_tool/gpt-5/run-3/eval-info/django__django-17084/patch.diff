@@ -1,0 +1,176 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..4dd4c7f892 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -426,6 +426,12 @@ class Query(BaseExpression):
+         # against each other.
+         aggregates = {alias: self.annotations.pop(alias) for alias in aggregate_exprs}
+         self.set_annotation_mask(annotation_select_mask)
++        # Detect if any aggregate references annotations with window functions.
++        refs_over_clause = any(
++            getattr(self.annotations.get(ref), 'contains_over_clause', False)
++            for aggregate in aggregates.values()
++            for ref in aggregate.get_refs()
++        )
+         # Existing usage of aggregation can be determined by the presence of
+         # selected aggregates but also by filters against aliased aggregates.
+         _, having, qualify = self.where.split_having_qualify()
+@@ -454,6 +460,7 @@ class Query(BaseExpression):
+             or qualify
+             or self.distinct
+             or self.combinator
++            or refs_over_clause
+         ):
+             from django.db.models.sql.subqueries import AggregateQuery
+ 
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..98a2866232
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,17 @@
++Fix applied (patch details):
++- In django/db/models/sql/query.py:get_aggregation(), added detection of refs_over_clause = any(annotations referenced by aggregates have contains_over_clause=True).
++- Included refs_over_clause in the subquery decision so aggregates over window annotations are evaluated via an inner subquery, avoiding PostgreSQL GroupingError.
++- This preserves behavior for backends without OVER support and only alters paths that would have errored in PostgreSQL.
++
++Additional Analysis (from code inspection):
++- Window expression is implemented in django/db/models/expressions.py and sets contains_over_clause=True to mark OVER (window) usage.
++- QuerySet.aggregate() (django/db/models/query.py) delegates to Query.get_aggregation().
++- Query.get_aggregation() is defined in django/db/models/sql/query.py (around line ~397 in this tree). Likely location to ensure subquery wrapping when aggregates reference annotations that contain window functions.
++- Probable fix: when aggregate expressions reference annotations with contains_over_clause (e.g., Window), evaluate the base queryset as a subquery and then apply the aggregate on top, to avoid PostgreSQL 'aggregate function calls cannot contain window function calls'.
++
++Additional Analysis (from code inspection):
++- Window expression class is implemented in django/db/models/expressions.py and sets contains_over_clause=True; this marks expressions that use OVER clauses (window functions).
++- QuerySet.aggregate() (django/db/models/query.py) calls Query.get_aggregation().
++- Query.get_aggregation() is defined in django/db/models/sql/query.py (found near line 397). This is a likely place to enforce wrapping the query in a subquery when aggregates reference annotations containing window functions to avoid PostgreSQL's 'aggregate function calls cannot contain window function calls' error.
++- Expected fix direction: detect when aggregate expressions reference annotations whose expressions contain_over_clause (e.g., Window) and compute the aggregate on a subquery so the window functions are evaluated first.
++
+diff --git a/task_description.txt.bak b/task_description.txt.bak
+new file mode 100644
+index 0000000000..f8322847fa
+--- /dev/null
++++ b/task_description.txt.bak
+@@ -0,0 +1,12 @@
++Additional Analysis (from code inspection):
++- Window expression is implemented in django/db/models/expressions.py and sets contains_over_clause=True to mark OVER (window) usage.
++- QuerySet.aggregate() (django/db/models/query.py) delegates to Query.get_aggregation().
++- Query.get_aggregation() is defined in django/db/models/sql/query.py (around line ~397 in this tree). Likely location to ensure subquery wrapping when aggregates reference annotations that contain window functions.
++- Probable fix: when aggregate expressions reference annotations with contains_over_clause (e.g., Window), evaluate the base queryset as a subquery and then apply the aggregate on top, to avoid PostgreSQL 'aggregate function calls cannot contain window function calls'.
++
++Additional Analysis (from code inspection):
++- Window expression class is implemented in django/db/models/expressions.py and sets contains_over_clause=True; this marks expressions that use OVER clauses (window functions).
++- QuerySet.aggregate() (django/db/models/query.py) calls Query.get_aggregation().
++- Query.get_aggregation() is defined in django/db/models/sql/query.py (found near line 397). This is a likely place to enforce wrapping the query in a subquery when aggregates reference annotations containing window functions to avoid PostgreSQL's 'aggregate function calls cannot contain window function calls' error.
++- Expected fix direction: detect when aggregate expressions reference annotations whose expressions contain_over_clause (e.g., Window) and compute the aggregate on a subquery so the window functions are evaluated first.
++
+diff --git a/tools/patch_get_aggregation.py b/tools/patch_get_aggregation.py
+new file mode 100644
+index 0000000000..3d791c8faf
+--- /dev/null
++++ b/tools/patch_get_aggregation.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++import re, sys, pathlib
++
++p = pathlib.Path("django/db/models/sql/query.py")
++s = p.read_text()
++
++# Ensure we only patch once.
++if "refs_over_clause" in s and "contains_over_clause" in s:
++    print("Already patched.")
++    sys.exit(0)
++
++lines = s.splitlines(keepends=True)
++
++# Locate get_aggregation function
++start = None
++for i, line in enumerate(lines):
++    if line.startswith("    def get_aggregation(self, using, aggregate_exprs):"):
++        start = i
++        break
++
++if start is None:
++    print("get_aggregation() not found", file=sys.stderr)
++    sys.exit(1)
++
++# Insert refs_over_clause computation after aggregates are stashed.
++insert_done = False
++for i in range(start, min(len(lines), start + 400)):
++    if "aggregates = {alias: self.annotations.pop(alias) for alias in aggregate_exprs}" in lines[i]:
++        # Determine indentation
++        indent = re.match(r"(\s*)", lines[i]).group(1)
++        insertion = [
++            f"{indent}# Detect if any aggregate references annotations with window functions.\n",
++            f"{indent}refs_over_clause = any(\n",
++            f"{indent}    getattr(self.annotations.get(ref), 'contains_over_clause', False)\n",
++            f"{indent}    for aggregate in aggregates.values()\n",
++            f"{indent}    for ref in aggregate.get_refs()\n",
++            f"{indent})\n",
++        ]
++        # Place after the following line if it's set_annotation_mask(annotation_select_mask)
++        ins_at = i + 1
++        if ins_at < len(lines) and "self.set_annotation_mask(annotation_select_mask)" in lines[ins_at]:
++            ins_at = ins_at + 1
++        lines[ins_at:ins_at] = insertion
++        insert_done = True
++        break
++
++if not insert_done:
++    print("Failed to insert refs_over_clause detection", file=sys.stderr)
++    sys.exit(1)
++
++# Add refs_over_clause to the subquery decision condition.
++cond_start = None
++cond_end = None
++for i in range(start, min(len(lines), start + 500)):
++    if re.match(r"\s*if\s*\($", lines[i]):
++        cond_start = i
++        # Find end of condition block (line ending with "):")
++        for j in range(i + 1, min(len(lines), i + 100)):
++            if lines[j].strip().endswith("):"):
++                cond_end = j
++                break
++        break
++
++def add_condition_line(at_idx):
++    indent = re.match(r"(\s*)", lines[at_idx]).group(1)
++    new_line = f"{indent}or refs_over_clause\n"
++    neighborhood = "".join(lines[at_idx-3:at_idx+3])
++    if "refs_over_clause" not in neighborhood:
++        lines.insert(at_idx + 1, new_line)
++
++if cond_start is None or cond_end is None:
++    # Fallback: search for known trailing condition line and insert after it.
++    target_line_idx = None
++    for i in range(start, min(len(lines), start + 500)):
++        if "or self.combinator" in lines[i]:
++            target_line_idx = i
++            break
++    if target_line_idx is None:
++        print("Failed to locate subquery condition to update", file=sys.stderr)
++        sys.exit(1)
++    add_condition_line(target_line_idx)
++else:
++    # Insert before cond_end with the same indentation as other 'or ' lines.
++    or_indent = None
++    for k in range(cond_end - 1, cond_start, -1):
++        if lines[k].lstrip().startswith("or "):
++            or_indent = re.match(r"(\s*)", lines[k]).group(1)
++            break
++    if or_indent is None:
++        or_indent = " " * 12
++    cond_block = "".join(lines[cond_start:cond_end+1])
++    if "refs_over_clause" not in cond_block:
++        lines.insert(cond_end, f"{or_indent}or refs_over_clause\n")
++
++new_s = "".join(lines)
++p.write_text(new_s)
++print("Patched django/db/models/sql/query.py: enforced subquery when aggregates reference window annotations.")

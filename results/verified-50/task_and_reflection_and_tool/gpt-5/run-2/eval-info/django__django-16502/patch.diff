@@ -1,0 +1,478 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..b7bdf47e3d 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,11 +143,35 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        # For compliance with RFC 2616 §4.3, do not return a message body for HEAD requests.
++        # Ensure headers are sent, but swallow any body data.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            return
++        super().write(data)
++
++    def finish_response(self):
++        # For HEAD requests, RFC 2616 §4.3 forbids a message body.
++        # Send headers if needed, consume the iterable without writing, then close.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            try:
++                if getattr(self, "result", None) is not None:
++                    for _ in self.result:
++                        # Intentionally discard body bytes.
++                        pass
++            finally:
++                self.result = None
++            self.close()
++            return
++        return super().finish_response()
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+-
+-
+ class WSGIRequestHandler(simple_server.WSGIRequestHandler):
+     protocol_version = "HTTP/1.1"
+ 
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..1b8aed93c4
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,8 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++Add/verify ServerHandler.write() override to skip body for HEAD; then run targeted tests. If app uses write() callable, ensure headers still sent (call send_headers() if not yet sent).
++Reminders:\n- Implement ServerHandler.write() override: if REQUEST_METHOD == 'HEAD', ensure send_headers() has run, then swallow body.\n- Validate that Content-Length is preserved but no body bytes are written.\n- Verify via a minimal WSGI app and curl -I/HEAD against runserver.\n- Consider apps that use the write() callable; ensure it’s safe (no body written for HEAD).
++Action: Insert ServerHandler.finish_response() override that:\n- If REQUEST_METHOD is HEAD, ensure headers sent (send_headers if needed), consume result iterable without writing, then call close(); otherwise delegate to super().finish_response().
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..3af23549e8
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,8 @@
++Repository appears to be Django core codebase. Goal: Fix runserver to not return a response body for HTTP HEAD requests (RFC 2616 §4.3) as regression after #26052. Likely area: django/core/servers/basehttp.py (dev WSGI server/request handler).
++Insight: basehttp.ServerHandler handles runserver responses. Plan: override write() to suppress body for HEAD while ensuring headers are sent.
++Insight: runserver behavior is implemented in django/core/servers/basehttp.py. Plan: override ServerHandler.write() to suppress response body for HEAD requests while ensuring headers are sent (call send_headers() if not yet sent) to comply with RFC 2616 §4.3.
++Applied fix: inserted ServerHandler.write() override in django/core/servers/basehttp.py to swallow body on HEAD while ensuring headers are sent.
++Insight: Overriding ServerHandler.write() alone did not prevent body output for HEAD in our direct ServerHandler test. New approach: override finish_response() to send headers and skip body writing for HEAD requests.
++Insight: Overriding write() alone didn't prevent body; need to override finish_response() to suppress body on HEAD.
++Insight: Previously inserted write() override was at top-level (outside ServerHandler); must patch methods inside the class with correct indentation.
++Insight: At runtime, django.core.servers.basehttp.ServerHandler.__dict__ lacks write()/finish_response() overrides; need to rewrite class with proper overrides to suppress body for HEAD.
+diff --git a/tools/add_finish_override.py b/tools/add_finish_override.py
+new file mode 100644
+index 0000000000..a5e0f9a1ce
+--- /dev/null
++++ b/tools/add_finish_override.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++import io, re, sys, textwrap
++
++PATH = 'django/core/servers/basehttp.py'
++
++def main():
++    try:
++        with io.open(PATH, 'r', encoding='utf-8') as f:
++            s = f.read()
++    except FileNotFoundError:
++        print("File not found: %s" % PATH, file=sys.stderr)
++        sys.exit(1)
++
++    cls_hdr = "class ServerHandler(simple_server.ServerHandler):"
++    if cls_hdr not in s:
++        print("ServerHandler class not found.", file=sys.stderr)
++        sys.exit(1)
++
++    # Check if finish_response already overridden.
++    cls_start = s.index(cls_hdr)
++    # Find the end of class by next "class " at col 0 or EOF.
++    m_next_class = re.search(r"\nclass\s+\w+\(", s[cls_start+1:])
++    cls_end = (cls_start + 1 + m_next_class.start()) if m_next_class else len(s)
++    class_block = s[cls_start:cls_end]
++
++    if re.search(r"\n\s{4}def\s+finish_response\s*\(", class_block):
++        print("finish_response() override already exists; no changes made.")
++        return
++
++    # Find insertion point before def close within the class.
++    m_close = re.search(r"\n\s{4}def\s+close\s*\(", class_block)
++    if not m_close:
++        print("close() method not found in ServerHandler for insertion point.", file=sys.stderr)
++        sys.exit(1)
++
++    insert_pos = cls_start + m_close.start()
++
++    method = """
++    def finish_response(self):
++        # For HEAD requests, RFC 2616 §4.3 forbids a message body.
++        # Send headers if needed, consume the iterable without writing, then close.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            try:
++                if self.result is not None:
++                    for _ in self.result:
++                        # Intentionally discard body bytes.
++                        pass
++            finally:
++                self.result = None
++            self.close()
++            return
++        return super().finish_response()
++"""
++    method = textwrap.dedent(method)
++
++    new_s = s[:insert_pos] + method + s[insert_pos:]
++    with io.open(PATH, 'w', encoding='utf-8') as f:
++        f.write(new_s)
++
++    print("Inserted finish_response() override into ServerHandler.")
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/head_fix_inserter.py b/tools/head_fix_inserter.py
+new file mode 100644
+index 0000000000..96b52ba29b
+--- /dev/null
++++ b/tools/head_fix_inserter.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++import re, sys, textwrap, io
++
++path = 'django/core/servers/basehttp.py'
++try:
++    with io.open(path, 'r', encoding='utf-8') as f:
++        s = f.read()
++except FileNotFoundError:
++    print("File not found: %s" % path, file=sys.stderr)
++    sys.exit(1)
++
++if "class ServerHandler(simple_server.ServerHandler):" not in s:
++    print("ServerHandler class not found in basehttp.py", file=sys.stderr)
++    sys.exit(1)
++
++if re.search(r"\n\s{4}def write\(self,\s*data\)\s*:", s):
++    print("write() override already exists; no changes made.")
++    sys.exit(0)
++
++cls_start = s.index("class ServerHandler(simple_server.ServerHandler):")
++m = re.search(r"\n\s{4}def close\(self\):", s[cls_start:])
++if not m:
++    print("close() method not found within ServerHandler for insertion point", file=sys.stderr)
++    sys.exit(1)
++
++ins_pos = cls_start + m.start()
++
++method = """
++    def write(self, data):
++        # For compliance with RFC 2616 §4.3, do not return a message body for HEAD requests.
++        # Ensure headers are sent, but swallow any body data.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            return
++        super().write(data)
++"""
++method = textwrap.dedent(method)
++
++new = s[:ins_pos] + method + s[ins_pos:]
++with io.open(path, 'w', encoding='utf-8') as f:
++    f.write(new)
++
++print("Inserted write() override before close() in ServerHandler")
+diff --git a/tools/patch_serverhandler_methods.py b/tools/patch_serverhandler_methods.py
+new file mode 100644
+index 0000000000..c7d682ffe3
+--- /dev/null
++++ b/tools/patch_serverhandler_methods.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++import io, re, sys, textwrap
++
++PATH = 'django/core/servers/basehttp.py'
++
++def find_class_block(s, class_name):
++    # Find "class <class_name>(" at start of line (possibly with leading spaces).
++    m = re.search(r'(?m)^[ \t]*class\s+%s\s*\(' % re.escape(class_name), s)
++    if not m:
++        return None
++    start = m.start()
++    # Determine class indentation (column start of 'class')
++    line_start = s.rfind('\n', 0, start) + 1
++    indent = start - line_start
++    # Find end of class = next "class " at same or lower indentation, or EOF.
++    # Rough heuristic: next line that starts with 0 indentation "class ".
++    m2 = re.search(r'(?m)^\s*class\s+\w+\s*\(', s[start+1:])
++    end = (start + 1 + m2.start()) if m2 else len(s)
++    return (start, end, indent)
++
++def remove_method(block, name):
++    # Remove a method with signature def <name>(...): at 4-space indent inside class.
++    # Match from its def line until next def at same indent or end of block.
++    pattern = re.compile(
++        r'(?ms)^\s{4}def\s+' + re.escape(name) + r'\s*\([^)]*\)\s*:\s*.*?(?=^\s{4}def\s+\w+\s*\(|\Z)'
++    )
++    new_block, n = pattern.subn('', block)
++    return new_block, n
++
++def insert_before_close(block, to_insert):
++    # Insert before the 'def close' method inside class.
++    m = re.search(r'(?m)^\s{4}def\s+close\s*\(', block)
++    if not m:
++        # Fallback: append before class end.
++        return block + to_insert
++    pos = m.start()
++    return block[:pos] + to_insert + block[pos:]
++
++def main():
++    try:
++        s = io.open(PATH, 'r', encoding='utf-8').read()
++    except FileNotFoundError:
++        print("File not found", file=sys.stderr)
++        sys.exit(1)
++
++    cls = find_class_block(s, 'ServerHandler')
++    if not cls:
++        print("ServerHandler class not found", file=sys.stderr)
++        sys.exit(1)
++    cstart, cend, indent = cls
++    before, block, after = s[:cstart], s[cstart:cend], s[cend:]
++
++    # Ensure block starts with class header and includes body
++    # Remove any existing write/finish_response in class.
++    block2, n1 = remove_method(block, 'write')
++    block2, n2 = remove_method(block2, 'finish_response')
++
++    # Also remove any top-level mistakenly inserted methods (just in case).
++    toplvl_pattern = re.compile(r'(?ms)^[ \t]*def\s+(write|finish_response)\s*\([^)]*\)\s*:\s*.*?(?=^[^\s]|^class|\Z)', re.M)
++    after2 = toplvl_pattern.sub('', after)
++    before2 = toplvl_pattern.sub('', before)
++
++    write_method = """
++    def write(self, data):
++        # For compliance with RFC 2616 §4.3, do not return a message body for HEAD requests.
++        # Ensure headers are sent, but swallow any body data.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            return
++        super().write(data)
++"""
++    finish_method = """
++    def finish_response(self):
++        # For HEAD requests, RFC 2616 §4.3 forbids a message body.
++        # Send headers if needed, consume the iterable without writing, then close.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            try:
++                if getattr(self, "result", None) is not None:
++                    for _ in self.result:
++                        # Intentionally discard body bytes.
++                        pass
++            finally:
++                self.result = None
++            self.close()
++            return
++        return super().finish_response()
++"""
++    to_insert = textwrap.dedent(write_method + finish_method)
++    # Ensure inserted methods are correctly indented inside class (4 spaces).
++    to_insert = ''.join('    ' + line if line.strip() != '' else line for line in to_insert.splitlines(True))
++
++    new_block = insert_before_close(block2, to_insert)
++
++    new_s = before2 + new_block + after2
++    io.open(PATH, 'w', encoding='utf-8').write(new_s)
++    print("Patched ServerHandler.write() and finish_response() inside class with correct indentation.")
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/rewrite_serverhandler.py b/tools/rewrite_serverhandler.py
+new file mode 100644
+index 0000000000..48c4bc91f0
+--- /dev/null
++++ b/tools/rewrite_serverhandler.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++import io, re, sys, textwrap
++
++PATH = 'django/core/servers/basehttp.py'
++
++NEW_CLASS = """
++class ServerHandler(simple_server.ServerHandler):
++    http_version = "1.1"
++
++    def __init__(self, stdin, stdout, stderr, environ, **kwargs):
++        """
++        Use a LimitedStream so that unread request data will be ignored at
++        the end of the request. WSGIRequest uses a LimitedStream but it
++        shouldn't discard the data since the upstream servers usually do this.
++        This fix applies only for testserver/runserver.
++        """
++        try:
++            content_length = int(environ.get("CONTENT_LENGTH"))
++        except (ValueError, TypeError):
++            content_length = 0
++        super().__init__(
++            LimitedStream(stdin, content_length), stdout, stderr, environ, **kwargs
++        )
++
++    def cleanup_headers(self):
++        super().cleanup_headers()
++        # HTTP/1.1 requires support for persistent connections. Send 'close' if
++        # the content length is unknown to prevent clients from reusing the
++        # connection.
++        if "Content-Length" not in self.headers:
++            self.headers["Connection"] = "close"
++        # Persistent connections require threading server.
++        elif not isinstance(self.request_handler.server, socketserver.ThreadingMixIn):
++            self.headers["Connection"] = "close"
++        # Mark the connection for closing if it's set as such above or if the
++        # application sent the header.
++        if self.headers.get("Connection") == "close":
++            self.request_handler.close_connection = True
++
++    def write(self, data):
++        # For compliance with RFC 2616 §4.3, do not return a message body for HEAD requests.
++        # Ensure headers are sent, but swallow any body data.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            return
++        super().write(data)
++
++    def finish_response(self):
++        # For HEAD requests, RFC 2616 §4.3 forbids a message body.
++        # Send headers if needed, consume the iterable without writing, then close.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not getattr(self, "headers_sent", False):
++                self.send_headers()
++            try:
++                if getattr(self, "result", None) is not None:
++                    for _ in self.result:
++                        # Intentionally discard body bytes.
++                        pass
++            finally:
++                self.result = None
++            self.close()
++            return
++        return super().finish_response()
++
++    def close(self):
++        self.get_stdin().read()
++        super().close()
++"""
++
++def main():
++    try:
++        s = io.open(PATH, 'r', encoding='utf-8').read()
++    except FileNotFoundError:
++        print("File not found: %s" % PATH, file=sys.stderr)
++        sys.exit(1)
++
++    # Locate start of ServerHandler class (column 0)
++    m_start = re.search(r'(?m)^class\s+ServerHandler\s*\(\s*simple_server\.ServerHandler\s*\)\s*:', s)
++    if not m_start:
++        print("ServerHandler class header not found.", file=sys.stderr)
++        sys.exit(1)
++    start = m_start.start()
++
++    # Locate the next top-level class definition (e.g., WSGIRequestHandler) after ServerHandler
++    m_end = re.search(r'(?m)^class\s+\w+\s*\(', s[m_start.end():])
++    end = (m_start.end() + m_end.start()) if m_end else len(s)
++
++    before = s[:start]
++    after = s[end:]
++
++    # Ensure NEW_CLASS ends with a newline and proper indentation (column 0)
++    new_block = textwrap.dedent(NEW_CLASS).lstrip('\n') + "\n"
++
++    new_content = before + new_block + after
++    io.open(PATH, 'w', encoding='utf-8').write(new_content)
++    print("Rewrote ServerHandler class block with HEAD body suppression.")
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_head_behavior.py b/tools/test_head_behavior.py
+new file mode 100644
+index 0000000000..6a01466c63
+--- /dev/null
++++ b/tools/test_head_behavior.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++import io, sys
++from django.core.servers.basehttp import ServerHandler
++
++def app_with_body(environ, start_response):
++    body = b"OK BODY"
++    headers = [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))]
++    start_response("200 OK", headers)
++    return [body]
++
++def run_request(method):
++    stdout = io.BytesIO()
++    stderr = io.StringIO()
++    stdin = io.BytesIO(b"")
++    environ = {
++        "REQUEST_METHOD": method,
++        "SERVER_NAME": "localhost",
++        "SERVER_PORT": "8000",
++        "SERVER_PROTOCOL": "HTTP/1.1",
++        "SCRIPT_NAME": "",
++        "PATH_INFO": "/",
++        "QUERY_STRING": "",
++        "wsgi.version": (1, 0),
++        "wsgi.url_scheme": "http",
++        "wsgi.input": stdin,
++        "wsgi.errors": sys.stderr,
++        "wsgi.multithread": True,
++        "wsgi.multiprocess": False,
++        "wsgi.run_once": False,
++        "CONTENT_LENGTH": "0",
++    }
++    h = ServerHandler(stdin, stdout, stderr, environ)
++
++    class DummyReq:
++        server = None
++        close_connection = True
++        def log_request(self, code='-', size='-'):
++            # Minimal stub for wsgiref.simple_server.ServerHandler.close()
++            pass
++
++    h.request_handler = DummyReq()
++    h.run(app_with_body)
++    return stdout.getvalue()
++
++def main():
++    head_resp = run_request("HEAD")
++    get_resp = run_request("GET")
++    # Validate headers present and no body for HEAD.
++    if b"200 OK" not in head_resp or b"Content-Length: 7" not in head_resp:
++        print("HEAD response missing expected status/headers:")
++        print(head_resp.decode("iso-8859-1", errors="replace"))
++        sys.exit(2)
++    if b"OK BODY" in head_resp:
++        print("FAIL: HEAD response contains body bytes!")
++        print(head_resp.decode("iso-8859-1", errors="replace"))
++        sys.exit(3)
++    if b"OK BODY" not in get_resp:
++        print("FAIL: GET response missing body!")
++        print(get_resp.decode("iso-8859-1", errors="replace"))
++        sys.exit(4)
++    print("PASS: HEAD has no body and GET has body.")
++    print("HEAD response (headers only):")
++    print(head_resp.split(b"\\r\\n\\r\\n")[0].decode("iso-8859-1", errors="replace"))
++    print("GET response body length:", len(get_resp.split(b'\\r\\n\\r\\n',1)[1]))
++
++if __name__ == "__main__":
++    main()

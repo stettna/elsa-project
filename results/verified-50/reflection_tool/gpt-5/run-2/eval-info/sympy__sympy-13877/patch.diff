@@ -1,0 +1,144 @@
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 000000000..5cf0d3bf0
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,14 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Remember to create small tools (e.g., an edit tool) to streamline multi-file changes.
++- Always reproduce the issue with a minimal script before modifying source.
++- When stack traces reference specific files/lines, open and inspect those exact files first.
++- Prefer local imports (repo's sympy) to ensure we test our changes.
++
++- Remember to create small tools (e.g., an edit tool) to streamline multi-file changes.
++- Always reproduce the issue with a minimal script before modifying source.
++- When stack traces reference specific files/lines, open and inspect those exact files first.
++- Prefer local imports (repo's sympy) to ensure we test our changes.
+diff --git a/scripts/repro.py b/scripts/repro.py
+new file mode 100644
+index 000000000..8cac9857d
+--- /dev/null
++++ b/scripts/repro.py
+@@ -0,0 +1,14 @@
++\
++from sympy import *
++from sympy.abc import a
++
++def f(n):
++    return det(Matrix([[i + a*j for i in range(n)] for j in range(n)]))
++
++for n in range(1, 8):
++    try:
++        print(n, f(n))
++    except Exception as e:
++        import traceback
++        print(f"\nException for n={n}:")
++        traceback.print_exc()
+diff --git a/sympy/core/exprtools.py b/sympy/core/exprtools.py
+index 4e0de9ec1..1a045a734 100644
+--- a/sympy/core/exprtools.py
++++ b/sympy/core/exprtools.py
+@@ -1176,7 +1176,7 @@ def do(expr):
+         if p.is_Add:
+             list_args = [do(a) for a in Add.make_args(p)]
+             # get a common negative (if there) which gcd_terms does not remove
+-            if all(a.as_coeff_Mul()[0] < 0 for a in list_args):
++            if all((a.as_coeff_Mul()[0].is_negative is True) for a in list_args):
+                 cont = -cont
+                 list_args = [-a for a in list_args]
+             # watch out for exp(-(x+2)) which gcd_terms will change to exp(-x-2)
+diff --git a/sympy/matrices/matrices.py b/sympy/matrices/matrices.py
+index 97cde62e2..9f599bab3 100644
+--- a/sympy/matrices/matrices.py
++++ b/sympy/matrices/matrices.py
+@@ -207,8 +207,8 @@ def bareiss(mat, cumm=1):
+ 
+             def entry(i, j):
+                 ret = (pivot_val*tmp_mat[i, j + 1] - mat[pivot_pos, j + 1]*tmp_mat[i, 0]) / cumm
+-                if not ret.is_Atom:
+-                    cancel(ret)
++                # Use cancel's return value to ensure exact cancellation and avoid spurious 0/0 -> nan
++                ret = cancel(ret)
+                 return ret
+ 
+             return sign*bareiss(self._new(mat.rows - 1, mat.cols - 1, entry), pivot_val)
+diff --git a/tools/edit.py b/tools/edit.py
+new file mode 100755
+index 000000000..80777825f
+--- /dev/null
++++ b/tools/edit.py
+@@ -0,0 +1,70 @@
++\
++#!/usr/bin/env python3
++import sys, io, os, re
++
++def usage():
++    print("Usage:\n  edit.py FILE --replace REGEX REPL [--count N]\n  edit.py FILE --insert-after REGEX TEXT\n  edit.py FILE --insert-before REGEX TEXT\n  edit.py FILE --apply-patch <<EOF ... EOF", file=sys.stderr)
++    sys.exit(2)
++
++def main():
++    if len(sys.argv) < 3:
++        usage()
++    path = sys.argv[1]
++    if not os.path.exists(path):
++        print(f"[edit.py] Error: file not found: {path}", file=sys.stderr)
++        sys.exit(1)
++    data = open(path, 'r', encoding='utf-8').read()
++    args = sys.argv[2:]
++    if args[0] == '--replace':
++        if len(args) < 3:
++            usage()
++        pattern, repl = args[1], args[2]
++        count = 0
++        if len(args) >= 5 and args[3] == '--count':
++            try:
++                count = int(args[4])
++            except Exception:
++                print("[edit.py] Invalid count", file=sys.stderr); sys.exit(2)
++        new, n = re.subn(pattern, repl, data, count=0 if count==0 else count, flags=re.M)
++        if n == 0:
++            print("[edit.py] Warning: no replacements made", file=sys.stderr)
++        open(path, 'w', encoding='utf-8').write(new)
++        print(f"[edit.py] Replacements made: {n}")
++    elif args[0] in ('--insert-after','--insert-before'):
++        if len(args) < 3:
++            usage()
++        pattern, text = args[1], args[2]
++        m = re.search(pattern, data, flags=re.M)
++        if not m:
++            print("[edit.py] Error: pattern not found", file=sys.stderr); sys.exit(1)
++        idx = m.end() if args[0]=='--insert-after' else m.start()
++        new = data[:idx] + ("\n" if not text.startswith("\n") else "") + text + data[idx:]
++        open(path, 'w', encoding='utf-8').write(new)
++        print("[edit.py] Inserted text")
++    elif args[0] == '--apply-patch':
++        patch = sys.stdin.read()
++        chunks = re.split(r"^=== FILE:(.+?) ===\s*$", patch, flags=re.M)
++        if len(chunks) < 3:
++            print("[edit.py] Invalid patch format", file=sys.stderr); sys.exit(2)
++        i = 1
++        while i < len(chunks):
++            fpath = chunks[i].strip()
++            body = chunks[i+1]
++            i += 2
++            m2 = re.search(r"(?s)--- BEFORE ---\n(.*?)\n--- AFTER ---\n(.*)", body)
++            if not m2:
++                print(f"[edit.py] Invalid chunk for {fpath}", file=sys.stderr); sys.exit(2)
++            before, after = m2.group(1), m2.group(2)
++            if not os.path.exists(fpath):
++                print(f"[edit.py] Error: file not found: {fpath}", file=sys.stderr); sys.exit(1)
++            content = open(fpath,'r',encoding='utf-8').read()
++            if before not in content:
++                print(f"[edit.py] Error: BEFORE text not found in {fpath}", file=sys.stderr); sys.exit(1)
++            content = content.replace(before, after)
++            open(fpath,'w',encoding='utf-8').write(content)
++            print(f"[edit.py] Patched {fpath}")
++    else:
++        usage()
++
++if __name__ == "__main__":
++    main()

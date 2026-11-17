@@ -1,0 +1,116 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/contrib/admin/sites.py b/django/contrib/admin/sites.py
+index 61be31d890..7598d6e538 100644
+--- a/django/contrib/admin/sites.py
++++ b/django/contrib/admin/sites.py
+@@ -453,7 +453,11 @@ class AdminSite:
+                 pass
+             else:
+                 if getattr(match.func, "should_append_slash", True):
+-                    return HttpResponsePermanentRedirect("%s/" % request.path)
++                    url = "%s/" % request.path
++                    query_string = request.META.get("QUERY_STRING")
++                    if query_string:
++                        url = "%s?%s" % (url, query_string)
++                    return HttpResponsePermanentRedirect(url)
+         raise Http404
+ 
+     def _build_app_dict(self, request, label=None):
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..b1505d1d81
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,86 @@
++AdminSite.catch_all_view() drops query string in redirects
++Description
++	
++#31747 introduced AdminSite.catch_all_view(). However, in the process it broke the ability to redirect with settings.APPEND_SLASH = True when there are query strings.
++Provided URL: ​http://127.0.0.1:8000/admin/auth/foo?id=123
++Expected redirect: ​http://127.0.0.1:8000/admin/auth/foo/?id=123
++Actual redirect: ​http://127.0.0.1:8000/admin/auth/foo/
++This seems to be because the redirect in question does not include the query strings (such as via request.META['QUERY_STRING']):
++return HttpResponsePermanentRedirect(%s/ % request.path)
++​https://github.com/django/django/blob/c57ff9ba5e251cd4c2761105a6046662c08f951e/django/contrib/admin/sites.py#L456
++
++[Investigation Log - 2026-11-15]
++- Confirmed this repository is the Django source tree (django/ directory present).
++- There is no 'testbed' directory; the working directory is the repository root and changes will be made directly under django/.
++- The issue concerns AdminSite.catch_all_view() dropping query strings on redirects when settings.APPEND_SLASH = True.
++- The problematic redirect likely resides in django/contrib/admin/sites.py (around the referenced line ~456) and currently uses request.path only, e.g., return HttpResponsePermanentRedirect("%s/" % request.path), which omits request.META['QUERY_STRING'].
++- Planned fix: Ensure that when adding a trailing slash, the redirect preserves the original query string, e.g., by appending '?' + request.META['QUERY_STRING'] if present, or using a utility that retains the query component.
++[Investigation Log - 2026-11-15 Update]
++- Located catch_all_view definition at django/contrib/admin/sites.py:447.
++- URL pattern wiring includes catch_all_view at django/contrib/admin/sites.py:311.
++- Confirms the target location for the redirect behavior change is in catch_all_view.
++- Next step: modify the redirect to preserve the original query string (e.g., by appending '?' + request.META['QUERY_STRING'] if present, or reconstructing the URL using request.get_full_path() and replacing only the path segment to add a trailing slash).
++[Investigation Log - 2026-11-15 Confirmed]
++- Verified exact line in catch_all_view where query string is dropped:
++  return HttpResponsePermanentRedirect("%s/" % request.path)
++- Implemented fix to preserve QUERY_STRING by building the redirect URL as:
++  url = "%s/" % request.path
++  if request.META.get("QUERY_STRING"): url += "?" + request.META["QUERY_STRING"]
++  return HttpResponsePermanentRedirect(url)
++- This keeps the script prefix (via request.path) and adds the trailing slash while retaining the original query string.
++EOF && python - <<'PY'
++import re
++path = "django/contrib/admin/sites.py"
++with open(path, "r", encoding="utf-8") as f:
++    s = f.read()
++pat = re.compile(r'(?m)^(?P<indent>\s*)return HttpResponsePermanentRedirect\("%s/" % request\.path\)\s*$')
++if not pat.search(s):
++    print("Pattern not found; no changes made.")
++else:
++    def repl(m):
++        ind = m.group('indent')
++        return (
++            f'{ind}url = "%s/" % request.path\n'
++            f'{ind}query_string = request.META.get("QUERY_STRING")\n'
++            f'{ind}if query_string:\n'
++            f'{ind}    url = "%s?%s" % (url, query_string)\n'
++            f'{ind}return HttpResponsePermanentRedirect(url)'
++        )
++    s2 = pat.sub(repl, s, count=1)
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(s2)
++    print("Patched sites.py")
++PY && nl -ba django/contrib/admin/sites.py | sed -n '444,461p'
++[Implementation - 2026-11-15]
++- Applying fix in django/contrib/admin/sites.py to preserve query strings in catch_all_view redirects.
++[Implementation - 2026-11-15]
++- Confirmed the redirect in AdminSite.catch_all_view at django/contrib/admin/sites.py:456 used request.path only, dropping query strings.
++- Applying fix: construct redirect URL as "%s/" % request.path and append "?" + QUERY_STRING if present to preserve the query parameters.
++EOF && python - <<'PY'
++import re, sys
++p = "django/contrib/admin/sites.py"
++s = open(p, "r", encoding="utf-8").read()
++pat = re.compile(r'(?m)^(\s*)return HttpResponsePermanentRedirect\("%s/" % request\.path\)\s*$')
++m = pat.search(s)
++if not m:
++    print("Pattern not found; no changes made.")
++    sys.exit(0)
++ind = m.group(1)
++rep = (
++    f'{ind}url = "%s/" % request.path\n'
++    f'{ind}query_string = request.META.get("QUERY_STRING")\n'
++    f'{ind}if query_string:\n'
++    f'{ind}    url = "%s?%s" % (url, query_string)\n'
++    f'{ind}return HttpResponsePermanentRedirect(url)'
++)
++s = s[:m.start()] + rep + s[m.end():]
++open(p, "w", encoding="utf-8").write(s)
++print("Patched sites.py")
++PY && sed -n '444,461p' django/contrib/admin/sites.py
++[Investigation Log - 2026-11-15 Applied Patch Attempt]
++- Previous patch attempt did not update django/contrib/admin/sites.py (verified unchanged lines 444-461).
++- Proceeding to apply a direct edit to preserve query strings in catch_all_view redirect.
++[Implementation - 2026-11-15 Final Patch]
++- Verified redirect line still uses request.path only and drops query strings.
++- Applying patch to preserve query string in AdminSite.catch_all_view.
++

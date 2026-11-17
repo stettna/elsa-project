@@ -1,0 +1,153 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..4d66ea0235 100755
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1077,10 +1077,17 @@ class Query(BaseExpression):
+         elif isinstance(value, (list, tuple)):
+             # The items of the iterable may be expressions and therefore need
+             # to be resolved independently.
+-            return type(value)(
++            # For namedtuples (tuple subclasses with _fields), passing an iterator
++            # to the constructor fails because they expect positional arguments.
++            # Use star expansion for namedtuples; otherwise, preserve the original
++            # behavior for list/tuple which accept a single iterable.
++            resolved_iter = (
+                 self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                 for sub_value in value
+             )
++            if isinstance(value, tuple) and type(value) is not tuple and hasattr(value, '_fields'):
++                return type(value)(*resolved_iter)
++            return type(value)(resolved_iter)
+         return value
+ 
+     def solve_lookup_type(self, lookup):
+diff --git a/scripts/edit_file.py b/scripts/edit_file.py
+new file mode 100755
+index 0000000000..2289ba7a15
+--- /dev/null
++++ b/scripts/edit_file.py
+@@ -0,0 +1,78 @@
++\
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from pathlib import Path
++from typing import List
++
++def show_matches(path: Path, pattern: str, regex: bool) -> int:
++    flags = re.MULTILINE | re.DOTALL
++    rx = re.compile(pattern, flags) if regex else None
++    count = 0
++    for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=False), start=1):
++        if (rx.search(line) if regex else (pattern in line)):
++            print(f"{path}:{i}: {line.rstrip()}")
++            count += 1
++    return count
++
++def replace_in_file(path: Path, pattern: str, repl: str, count: int, regex: bool, dry_run: bool) -> int:
++    text = path.read_text(encoding="utf-8", errors="replace")
++    if regex:
++        flags = re.MULTILINE | re.DOTALL
++        new_text, n = re.subn(pattern, repl, text, count=0 if count <= 0 else count, flags=flags)
++    else:
++        if count <= 0:
++            n = text.count(pattern)
++            new_text = text.replace(pattern, repl)
++        else:
++            parts: List[str] = []
++            remaining = text
++            n = 0
++            for _ in range(count):
++                idx = remaining.find(pattern)
++                if idx == -1:
++                    break
++                parts.append(remaining[:idx])
++                parts.append(repl)
++                remaining = remaining[idx+len(pattern):]
++                n += 1
++            parts.append(remaining)
++            new_text = "".join(parts)
++    if not dry_run and n > 0:
++        path.write_text(new_text, encoding="utf-8")
++    return n
++
++def main():
++    p = argparse.ArgumentParser(description="Simple file editor: show matches or perform replacements.")
++    p.add_argument("file", help="Path to file to edit")
++    mode = p.add_mutually_exclusive_group(required=True)
++    mode.add_argument("--show", action="store_true", help="Show lines matching the pattern")
++    mode.add_argument("--replace", action="store_true", help="Replace pattern with repl")
++    p.add_argument("--pattern", required=True, help="Pattern to search (regex by default)")
++    p.add_argument("--repl", help="Replacement text (required for --replace)")
++    p.add_argument("--count", type=int, default=0, help="Max number of replacements (0 = all)")
++    p.add_argument("--literal", action="store_true", help="Treat pattern as a literal string (not regex)")
++    p.add_argument("--dry-run", action="store_true", help="Don't write changes, just report")
++    args = p.parse_args()
++
++    path = Path(args.file)
++    if not path.exists():
++        print(f"error: file not found: {path}", file=sys.stderr)
++        sys.exit(2)
++
++    if args.show:
++        n = show_matches(path, args.pattern, regex=not args.literal)
++        print(f"Total matches: {n}", file=sys.stderr)
++        sys.exit(0 if n >= 0 else 1)
++
++    if args.replace:
++        if args.repl is None:
++            print("error: --repl is required for --replace", file=sys.stderr)
++            sys.exit(2)
++        n = replace_in_file(path, args.pattern, args.repl, args.count, regex=not args.literal, dry_run=args.dry_run)
++        print(f"Replacements made: {n}", file=sys.stderr)
++        sys.exit(0)
++
++if __name__ == "__main__":
++    main()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..3792e685a8
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,33 @@
++Upgrading 2.2>3.0 causes named tuples used as arguments to __range to error.
++Description
++	
++I noticed this while upgrading a project from 2.2 to 3.0.
++This project passes named 2-tuples as arguments to range queryset filters. This works fine on 2.2. On 3.0 it causes the following error: TypeError: __new__() missing 1 required positional argument: 'far'.
++This happens because django.db.models.sql.query.Query.resolve_lookup_value goes into the tuple elements to resolve lookups and then attempts to reconstitute the tuple with the resolved elements.
++When it attempts to construct the new tuple it preserves the type (the named tuple) but it passes a iterator to it's constructor.
++NamedTuples don't have the code path for copying an iterator, and so it errors on insufficient arguments.
++The fix is to * expand the contents of the iterator into the constructor.
++
++
++Updates on repository insights and plan:
++- Confirmed this is a Django codebase with the django/ directory and extensive tests.
++- The bug description points to django.db.models.sql.query.Query.resolve_lookup_value as the place where tuple reconstruction happens when resolving lookups.
++- Hypothesis: In Django 3.0, when reconstructing tuples (including namedtuples) after resolving elements, the code preserves the original tuple type but incorrectly passes an iterator to the constructor. NamedTuple constructors require positional args and do not accept an iterator, causing TypeError.
++- Planned fix: When reconstituting the original tuple type, expand the iterator elements via * (i.e., type_( *iterable )) rather than passing the iterable directly (type_(iterable)).
++- Next steps: Inspect django/db/models/sql/query.py for resolve_lookup_value implementation and adjust tuple reconstruction accordingly; then run tests focusing on __range filters with namedtuples.
++
++Insight: Located resolve_lookup_value definition in: django/db/models/sql/query.py 
++
++Applied change: In Query.resolve_lookup_value, detect namedtuples via _fields and use * expansion when reconstructing values, avoiding passing an iterator to namedtuple constructors.
++
++Validation: Invoked Query.resolve_lookup_value with namedtuple Foo(1,2). Outcome: SUCCESS -> OK=True, result=Foo(near=1, far=2), type_preserved=True
++
++Additional validation of resolve_lookup_value on complex structures:
++- namedtuple: SUCCESS -> Foo(near=3, far=4)
++- list_of_namedtuples: SUCCESS -> [Foo(near=1, far=2), Foo(near=5, far=6)]
++- tuple_of_namedtuples: SUCCESS -> (Foo(near=7, far=8), Foo(near=9, far=10))
++- nested_list_tuple_namedtuple: SUCCESS -> [(Foo(near=11, far=12), [Bar(x=13, y=14)])]
++- plain_list: SUCCESS -> [1, 2, 3]
++- plain_tuple: SUCCESS -> (4, 5, 6)
++
++Insight: Found __range occurrences in tests files above.

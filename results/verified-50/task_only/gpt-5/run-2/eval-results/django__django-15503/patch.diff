@@ -1,0 +1,121 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..c44e39cfdc 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -179,9 +179,11 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 compiler, connection
+             )
+             lhs_json_path = compile_json_path(lhs_key_transforms)
++            lhs_is_keytransform = True
+         else:
+             lhs, lhs_params = self.process_lhs(compiler, connection)
+             lhs_json_path = "$"
++            lhs_is_keytransform = False
+         sql = template % lhs
+         # Process JSON path from the right-hand side.
+         rhs = self.rhs
+@@ -191,15 +193,22 @@ class HasKeyLookup(PostgresOperatorLookup):
+         for key in rhs:
+             if isinstance(key, KeyTransform):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+-            else:
+-                rhs_key_transforms = [key]
+-            rhs_params.append(
+-                "%s%s"
+-                % (
++                rhs_path = "%s%s" % (
+                     lhs_json_path,
+                     compile_json_path(rhs_key_transforms, include_root=False),
+                 )
+-            )
++            else:
++                if lhs_is_keytransform:
++                    # When building upon a nested path (LHS is a KeyTransform),
++                    # keep compile_json_path semantics so digit-like keys become indices.
++                    rhs_path = "%s%s" % (
++                        lhs_json_path,
++                        compile_json_path([str(key)], include_root=False),
++                    )
++                else:
++                    # Top-level (LHS is the field), treat literal RHS keys as object members.
++                    rhs_path = "%s.%s" % (lhs_json_path, json.dumps(str(key)))
++            rhs_params.append(rhs_path)
+         # Add condition for each key.
+         if self.logical_operator:
+             sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..a8e381ef5d
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,63 @@
++has_key, has_keys, and has_any_keys JSONField() lookups don't handle numeric keys on SQLite, MySQL, and Oracle.
++Description
++	 
++		(last modified by TheTerrasque)
++	 
++Problem
++When using models.​JSONField() ​has_key lookup with numerical keys on SQLite database it fails to find the keys.
++Versions:
++Django: 4.0.3
++Python: 3.9.6 (tags/v3.9.6:db3ff76, Jun 28 2021, 15:26:21) [MSC v.1929 64 bit (AMD64)] on win32
++sqlite3.version: '2.6.0'
++sqlite3.sqlite_version: '3.35.5'
++Example:
++Database
++DATABASES = {
++	'default': {
++		'ENGINE': 'django.db.backends.sqlite3',
++		'NAME': 'db.sqlite3',
++	}
++}
++Model
++class JsonFieldHasKeyTest(models.Model):
++	data = models.JSONField()
++Test
++from django.test import TestCase
++from .models import JsonFieldHasKeyTest
++class JsonFieldHasKeyTestCase(TestCase):
++	def setUp(self) -> None:
++		test = JsonFieldHasKeyTest(data={'foo': 'bar'})
++		test2 = JsonFieldHasKeyTest(data={'1111': 'bar'})
++		test.save()
++		test2.save()
++	def test_json_field_has_key(self):
++		c1 = JsonFieldHasKeyTest.objects.filter(data__has_key='foo').count()
++		c2 = JsonFieldHasKeyTest.objects.filter(data__has_key='1111').count()
++		self.assertEqual(c1, 1, Should have found 1 entry with key foo)
++		self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++Result
++FAIL: test_json_field_has_key (markers.tests.JsonFieldHasKeyTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++ File H:FilesProjectsElectacoWebserviceelecservemarkerstests.py, line 16, in test_json_field_has_key	 
++	self.assertEqual(c2, 1, Should have found 1 entry with key 1111)
++AssertionError: 0 != 1 : Should have found 1 entry with key '1111'
++Additional info
++This has been tested on SQLite and Postgresql backend, it works on postgresql but fails on sqlite.
++
++
++
++Additional insights added on fix approach:
++- Root cause: compile_json_path() converts digit-only strings to array indices, e.g., '1111' -> [1111].
++- Impact: For JSONField lookups has_key/has_keys/has_any_keys on SQLite/MySQL/Oracle, RHS keys like '1111' are misinterpreted as array positions rather than object member names, causing false negatives.
++- Fix strategy: In HasKeyLookup.as_sql(), when RHS is a literal (not a KeyTransform), build the JSON path by appending .<json.dumps(str(key))> to the LHS path directly, instead of calling compile_json_path() for RHS. This preserves numeric-string keys as object members.
++- Scope: Only affects RHS path construction for these lookups; does not alter compile_json_path() globally to avoid breaking correct array index behavior elsewhere.
++
++- Implemented fix: In HasKeyLookup.as_sql(), RHS literal keys now use dot + json.dumps(str(key)) to ensure numeric-like keys are treated as object member names across SQLite/MySQL/Oracle.
++- Fixed an indentation issue introduced during patching in the RHS loop of HasKeyLookup.as_sql().
++
++- Refinement: Preserve array index semantics when LHS is a KeyTransform by continuing to use compile_json_path for RHS; only use dot + json.dumps(str(key)) when LHS is the field. This avoids breaking KeyTransform-based queries while fixing numeric-string key handling for has_key/has_keys/has_any_keys.
++
++- Fix: normalized indentation of lhs_is_keytransform and simplified condition to use it directly, avoiding locals() check.
++
++- Indentation fix and logic refinement: Normalize lhs_is_keytransform indentation and use it directly in RHS handling. Preserve compile_json_path semantics when LHS is a KeyTransform (so digit-like RHS keys become indices), and only dot-quote numeric-like RHS keys when LHS is the field to fix has_key/has_keys/has_any_keys on SQLite/MySQL/Oracle.

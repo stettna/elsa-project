@@ -1,0 +1,124 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+old mode 100755
+new mode 100644
+index 4648daf395..b16ab278c2
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1077,10 +1077,13 @@ class Query(BaseExpression):
+         elif isinstance(value, (list, tuple)):
+             # The items of the iterable may be expressions and therefore need
+             # to be resolved independently.
+-            return type(value)(
++            resolved_values = [
+                 self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                 for sub_value in value
+-            )
++            ]
++            if isinstance(value, tuple) and type(value) is not tuple:
++                return type(value)(*resolved_values)
++            return type(value)(resolved_values)
+         return value
+ 
+     def solve_lookup_type(self, lookup):
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..6c8cd0df67
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,27 @@
++Upgrading 2.2>3.0 causes named tuples used as arguments to __range to error.
++Description
++	
++I noticed this while upgrading a project from 2.2 to 3.0.
++This project passes named 2-tuples as arguments to range queryset filters. This works fine on 2.2. On 3.0 it causes the following error: TypeError: __new__() missing 1 required positional argument: 'far'.
++This happens because django.db.models.sql.query.Query.resolve_lookup_value goes into the tuple elements to resolve lookups and then attempts to reconstitute the tuple with the resolved elements.
++When it attempts to construct the new tuple it preserves the type (the named tuple) but it passes a iterator to it's constructor.
++NamedTuples don't have the code path for copying an iterator, and so it errors on insufficient arguments.
++The fix is to * expand the contents of the iterator into the constructor.
++
++Additional insights discovered:
++- The function involved, Query.resolve_lookup_value, is located in django/db/models/sql/query.py around line 1072.
++- It is referenced within the same file at lines ~1081 and ~1278.
++- The failure when upgrading 2.2 -> 3.0 is due to reconstructing tuples (including namedtuples) by passing an iterator directly to the tuple's constructor, which namedtuples don't accept as a single iterable argument.
++- Planned fix: when reconstructing the tuple, preserve the type but expand the resolved elements using argument unpacking, e.g., T(*iterator), rather than T(iterator).
++
++Verified code details:
++- In django/db/models/sql/query.py lines ~1077-1083, tuples/lists are reconstructed with: return type(value)(<generator>), which passes a single iterable to constructors.
++- This fails for namedtuples whose constructor expects positional arguments, explaining the TypeError in 3.0 when using __range with namedtuples.
++- Planned change: resolve elements into a list, then if value is a tuple subclass (e.g., namedtuple) use star-unpacking: type(value)(*resolved), else use iterator-based construction: type(value)(resolved).
++
++Implementation details added:
++- Modified django/db/models/sql/query.py in resolve_lookup_value to avoid passing a generator directly to constructors.
++- Now builds a list of resolved_values, and if value is a tuple subclass (type(value) is not tuple), it returns type(value)(*resolved_values); otherwise returns type(value)(resolved_values).
++- This preserves behavior for lists/tuples and fixes namedtuple construction.
++
++Planned validation: Running tests for aggregation, custom_lookups, and timezones apps to cover __range scenarios.
+diff --git a/tools/edit_block.py b/tools/edit_block.py
+new file mode 100644
+index 0000000000..5a78522850
+--- /dev/null
++++ b/tools/edit_block.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++import sys
++from pathlib import Path
++
++def main():
++    if len(sys.argv) != 2:
++        print("Usage: edit_block.py <file>", file=sys.stderr)
++        sys.exit(1)
++    p = Path(sys.argv[1])
++    src = p.read_text()
++    lines = src.splitlines(True)
++
++    # Find the 'return type(value)(' block inside resolve_lookup_value
++    start_idx = None
++    for i, line in enumerate(lines):
++        if "def resolve_lookup_value(" in line:
++            # Search ahead for the return block
++            for j in range(i, min(i + 200, len(lines))):
++                if "return type(value)(" in lines[j]:
++                    start_idx = j
++                    break
++            break
++
++    if start_idx is None:
++        print("Did not find target return block.", file=sys.stderr)
++        sys.exit(2)
++
++    indent = lines[start_idx].split("return", 1)[0]
++    # Find the closing parenthesis line of the generator expression
++    end_idx = None
++    for k in range(start_idx, min(start_idx + 50, len(lines))):
++        if lines[k].strip() == ")":
++            end_idx = k
++            break
++    if end_idx is None:
++        print("Did not find closing ')' of the generator block.", file=sys.stderr)
++        sys.exit(3)
++
++    # Build replacement block preserving indentation
++    new_block = [
++        f"{indent}resolved_values = [\n",
++        f"{indent}    self.resolve_lookup_value(sub_value, can_reuse, allow_joins)\n",
++        f"{indent}    for sub_value in value\n",
++        f"{indent}]\n",
++        f"{indent}# For tuple subclasses (e.g., namedtuples), expand args; otherwise pass iterable.\n",
++        f"{indent}if isinstance(value, tuple) and type(value) is not tuple:\n",
++        f"{indent}    return type(value)(*resolved_values)\n",
++        f"{indent}return type(value)(resolved_values)\n",
++    ]
++
++    new_lines = lines[:start_idx] + new_block + lines[end_idx+1:]
++    p.write_text("".join(new_lines))
++    print(f"Patched {p}:\n- Replaced generator-based reconstruction with list and conditional star-unpack for tuple subclasses.")
++if __name__ == "__main__":
++    main()
++EOF && chmod +x tools/edit_block.py && python tools/edit_block.py django/db/models/sql/query.py && nl -ba django/db/models/sql/query.py | sed -n '1072,1090p'

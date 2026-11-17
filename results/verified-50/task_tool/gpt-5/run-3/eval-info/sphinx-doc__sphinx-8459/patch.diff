@@ -1,0 +1,135 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 000000000..8b1378917
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/sphinx/ext/autodoc/typehints.py b/sphinx/ext/autodoc/typehints.py
+index 70cbc3ba1..7a1f90bdb 100644
+--- a/sphinx/ext/autodoc/typehints.py
++++ b/sphinx/ext/autodoc/typehints.py
+@@ -27,16 +27,33 @@ def record_typehints(app: Sphinx, objtype: str, name: str, obj: Any,
+         if callable(obj):
+             annotations = app.env.temp_data.setdefault('annotations', {})
+             annotation = annotations.setdefault(name, OrderedDict())
+-            sig = inspect.signature(obj)
++            sig = inspect.signature(obj, type_aliases=app.config.autodoc_type_aliases)
++            # original annotations (may contain strings when using from __future__ import annotations)
++            orig_annotations = inspect.safe_getattr(obj, '__annotations__', {})
++            type_aliases = getattr(app.config, 'autodoc_type_aliases', {}) or {}
+             for param in sig.parameters.values():
+                 if param.annotation is not param.empty:
+-                    annotation[param.name] = typing.stringify(param.annotation)
++                    if isinstance(orig_annotations.get(param.name), str):
++                        name_ = orig_annotations.get(param.name)
++                        # strip quotes if present (double ForwardRef case)
++                        if isinstance(name_, str) and len(name_) >= 2 and name_[0] == name_[-1] and name_[0] in ("'", '"'):
++                            name_ = name_[1:-1]
++                        display = type_aliases.get(name_, name_)
++                    else:
++                        display = typing.stringify(param.annotation)
++                    annotation[param.name] = display
+             if sig.return_annotation is not sig.empty:
+-                annotation['return'] = typing.stringify(sig.return_annotation)
++                if isinstance(orig_annotations.get('return'), str):
++                    name_ = orig_annotations.get('return')
++                    if isinstance(name_, str) and len(name_) >= 2 and name_[0] == name_[-1] and name_[0] in ("'", '"'):
++                        name_ = name_[1:-1]
++                    display = type_aliases.get(name_, name_)
++                else:
++                    display = typing.stringify(sig.return_annotation)
++                annotation['return'] = display
+     except (TypeError, ValueError):
+         pass
+ 
+-
+ def merge_typehints(app: Sphinx, domain: str, objtype: str, contentnode: Element) -> None:
+     if domain != 'py':
+         return
+@@ -111,7 +128,7 @@ def modify_field_list(node: nodes.field_list, annotations: Dict[str, str]) -> No
+         if not arg.get('type'):
+             field = nodes.field()
+             field += nodes.field_name('', 'type ' + name)
+-            field += nodes.field_body('', nodes.paragraph('', annotation))
++            field += nodes.field_body('', nodes.paragraph('', annotations['return']))
+             node += field
+         if not arg.get('param'):
+             field = nodes.field()
+@@ -122,7 +139,7 @@ def modify_field_list(node: nodes.field_list, annotations: Dict[str, str]) -> No
+     if 'return' in annotations and 'return' not in arguments:
+         field = nodes.field()
+         field += nodes.field_name('', 'rtype')
+-        field += nodes.field_body('', nodes.paragraph('', annotation))
++        field += nodes.field_body('', nodes.paragraph('', annotations['return']))
+         node += field
+ 
+ 
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 000000000..795a06daf
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,48 @@
++Task: Fix autodoc_type_aliases not being applied when autodoc_typehints is set to "description".
++
++Context:
++- Repository is Sphinx.
++- Bug: With autodoc_typehints='description', types in parameter/return descriptions resolve to raw typing types (e.g., Dict[str, Any]) instead of configured aliases (e.g., types.JSONObject).
++- Expected: Alias mapping from autodoc_type_aliases should be used both in signature and in description rendering.
++
++Environment in PR:
++- OS: Mac Catalina 10.15.7
++- Python: 3.7.9
++- Sphinx: 3.3.1
++- Extensions: sphinx.ext.autodoc, sphinx.ext.napoleon, sphinxarg.ext
++
++Insights added:
++- This repo is the Sphinx codebase. The fix likely resides in sphinx/ext/autodoc, particularly where type hints are formatted for the 'description' mode. The alias application logic may only be applied to function signatures but not to the detailed description fields.
++
++Next steps:
++- Search for references to autodoc_typehints and autodoc_type_aliases to identify where 'description' mode formats types and ensure alias mapping is applied there as well.
++New insights from code search:
++- Description-mode injection code is in sphinx/ext/autodoc/typehints.py (e.g., it checks: if app.config.autodoc_typehints != 'description': ...).
++- Signature building paths in sphinx/ext/autodoc/__init__.py pass type_aliases=self.config.autodoc_type_aliases into sphinx.util.inspect.signature(), so signatures honor aliases.
++- This suggests the description-mode path in typehints.py likely does not use autodoc_type_aliases when rendering types into parameter/return descriptions, causing the reported behavior.
++
++Next steps:
++- Inspect sphinx/ext/autodoc/typehints.py to see how it formats and renders type hints for descriptions and add application of autodoc_type_aliases to that path.
++Additional insights and planned fix:
++- In sphinx/ext/autodoc/typehints.py, record_typehints() records annotations for description mode using inspect.signature(obj) without type_aliases, so autodoc_type_aliases are ignored in descriptions.
++- Signatures in sphinx/ext/autodoc/__init__.py use sphinx.util.inspect.signature(..., type_aliases=config.autodoc_type_aliases), so they honor aliases.
++- Plan: Update record_typehints() to use inspect.signature(obj, type_aliases=app.config.autodoc_type_aliases) and keep using typing.stringify() to produce strings; with aliases applied, stringify should yield the desired alias names.
++- Also noticed a bug in modify_field_list(): for rtype it uses an undefined variable 'annotation' instead of annotations['return']; will correct this to ensure the return type is inserted properly.
++Additional insights and planned fix:
++- In sphinx/ext/autodoc/typehints.py, record_typehints() records annotations for description mode using inspect.signature(obj) without type_aliases, so autodoc_type_aliases are ignored in descriptions.
++- Signatures in sphinx/ext/autodoc/__init__.py use sphinx.util.inspect.signature(..., type_aliases=config.autodoc_type_aliases), so they honor aliases.
++- Plan: Update record_typehints() to use inspect.signature(obj, type_aliases=app.config.autodoc_type_aliases) so recorded annotations used in descriptions honor aliases.
++- Also noticed a bug in modify_field_list(): for rtype it uses an undefined variable 'annotation' instead of annotations['return']; this should be corrected so return type is inserted properly.
++Implementation status:
++- Updated sphinx/ext/autodoc/typehints.py: record_typehints() now calls inspect.signature(obj, type_aliases=app.config.autodoc_type_aliases) so description-mode annotations respect autodoc_type_aliases.
++- Fixed bug in modify_field_list(): replaced use of undefined variable 'annotation' for rtype with annotations['return'] to correctly insert return type.
++
++Next step:
++- Create a small simulation to call record_typehints and verify that annotations recorded in env.temp_data use alias names when autodoc_typehints='description'.
++New finding from simulation:
++- Even after passing type_aliases into inspect.signature() in record_typehints(), the stored annotations stringify to Dict[str, Any]. This indicates that Python typing alias objects are resolved to underlying types by get_type_hints, and alias display requires a later formatting step that maps resolved types back to alias names.
++- In signature mode, Sphinx likely applies alias-aware formatting when rendering signatures (beyond just get_type_hints), so description mode should use the same alias-aware formatter instead of plain typing.stringify() when producing text for fields.
++Planned follow-up:
++- Identify the alias-aware annotation formatter used in signature rendering and reuse it in description mode (either by storing raw annotation objects in env.temp_data and formatting later, or by formatting with alias mapping during record/merge).
++
++Issue encountered: An indentation error was introduced in sphinx/ext/autodoc/typehints.py after patching record_typehints(). Fix by rewriting the function with consistent 4-space indentation.
+diff --git a/tmpmod.py b/tmpmod.py
+new file mode 100644
+index 000000000..8da1046e1
+--- /dev/null
++++ b/tmpmod.py
+@@ -0,0 +1,8 @@
++
++from __future__ import annotations
++from typing import Any, Dict
++
++JSONObject = Dict[str, Any]
++
++def sphinx_doc(data: JSONObject) -> JSONObject:
++    return {}

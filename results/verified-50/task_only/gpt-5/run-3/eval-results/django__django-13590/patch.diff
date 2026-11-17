@@ -1,0 +1,64 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 0000000000..8b13789179
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..679fe07253 100755
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1074,13 +1074,28 @@ class Query(BaseExpression):
+             value = value.resolve_expression(
+                 self, reuse=can_reuse, allow_joins=allow_joins,
+             )
+-        elif isinstance(value, (list, tuple)):
++        elif isinstance(value, list):
+             # The items of the iterable may be expressions and therefore need
+-            # to be resolved independently.
++            # to be resolved independently. For lists, the constructor accepts
++            # a single iterable argument so we pass the generator directly.
+             return type(value)(
+                 self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                 for sub_value in value
+             )
++        elif isinstance(value, tuple):
++            # For tuples, preserve the type. Plain tuples accept a single iterable
++            # argument, while namedtuples (tuple subclasses) expect positional args.
++            if type(value) is tuple:
++                return tuple(
++                    self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
++                    for sub_value in value
++                )
++            # Namedtuples don't have a code path to copy from an iterator, so
++            # expand the generator into positional arguments.
++            return type(value)(*(
++                self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
++                for sub_value in value
++            ))
+         return value
+ 
+     def solve_lookup_type(self, lookup):
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..9a0656135d
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,16 @@
++Upgrading 2.2>3.0 causes named tuples used as arguments to __range to error.
++Description
++	
++I noticed this while upgrading a project from 2.2 to 3.0.
++This project passes named 2-tuples as arguments to range queryset filters. This works fine on 2.2. On 3.0 it causes the following error: TypeError: __new__() missing 1 required positional argument: 'far'.
++This happens because django.db.models.sql.query.Query.resolve_lookup_value goes into the tuple elements to resolve lookups and then attempts to reconstitute the tuple with the resolved elements.
++When it attempts to construct the new tuple it preserves the type (the named tuple) but it passes a iterator to it's constructor.
++NamedTuples don't have the code path for copying an iterator, and so it errors on insufficient arguments.
++The fix is to * expand the contents of the iterator into the constructor.
++
++- Insight: Problem located in django/db/models/sql/query.py within Query.resolve_lookup_value (around lines 1072-1084). It reconstructs tuples with type(value)(generator), which passes a single iterator to namedtuple constructors, causing TypeError in Django 3.0 when named tuples are used (e.g., for __range).
++- Planned fix: Split iterable handling:
++  - Lists: keep passing the generator directly to the list constructor.
++  - Tuples (including namedtuples): expand the generator with * when reconstructing so positional args are supplied and the tuple/namedtuple type is preserved.
++- Verification: A direct runtime check instantiating Query and passing a 2-field namedtuple to resolve_lookup_value returns the same namedtuple type with correct values (no TypeError), confirming the fix.
++- Adjustment: Ensure only tuple subclasses (e.g., namedtuples) use * expansion. Plain tuples are reconstructed via tuple(generator) to avoid TypeError from passing multiple positional args to tuple().

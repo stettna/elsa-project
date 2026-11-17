@@ -1,0 +1,83 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..a32d47d9
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,15 @@
++Nominal scale should be drawn the same way as categorical scales
++Three distinctive things happen on the categorical axis in seaborn's categorical plots:
++
++1. The scale is drawn to +/- 0.5 from the first and last tick, rather than using the normal margin logic
++2. A grid is not shown, even when it otherwise would be with the active style
++3. If on the y axis, the axis is inverted
++
++It probably makes sense to have so.Nominal scales (including inferred ones) do this too. Some comments on implementation:
++
++1. This is actually trickier than you'd think; I may have posted an issue over in matplotlib about this at one point, or just discussed on their gitter. I believe the suggested approach is to add an invisible artist with sticky edges and set the margin to 0. Feels like a hack! I might have looked into setting the sticky edges _on the spine artist_ at one point?
++
++2. Probably straightforward to do in Plotter._finalize_figure. Always a good idea? How do we defer to the theme if the user wants to force a grid? Should the grid be something that is set in the scale object itself
++
++3. Probably straightforward to implement but I am not exactly sure where would be best.
++
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..4952e3d4 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -25,7 +25,7 @@ from seaborn._marks.base import Mark
+ from seaborn._stats.base import Stat
+ from seaborn._core.data import PlotData
+ from seaborn._core.moves import Move
+-from seaborn._core.scales import Scale
++from seaborn._core.scales import Scale, Nominal
+ from seaborn._core.subplots import Subplots
+ from seaborn._core.groupby import GroupBy
+ from seaborn._core.properties import PROPERTIES, Property
+@@ -1274,6 +1274,7 @@ class Plotter:
+                 seed_values = self._get_subplot_data(var_df, var, view, share_state)
+                 view_scale = scale._setup(seed_values, prop, axis=axis_obj)
+                 set_scale_obj(view["ax"], axis, view_scale._matplotlib_scale)
++                view[f"{axis}_scale"] = view_scale
+ 
+                 for layer, new_series in zip(layers, transformed_data):
+                     layer_df = layer["data"].frame
+@@ -1631,6 +1632,20 @@ class Plotter:
+             ax = sub["ax"]
+             for axis in "xy":
+                 axis_key = sub[axis]
++                # Adjust nominal axes to match categorical behavior
++                view_scale = sub.get(f"{axis}_scale")
++                if isinstance(view_scale, Nominal):
++                    # Hide grid on nominal axes
++                    ax.grid(False, axis=axis)
++                    # Invert y-axis when nominal
++                    if axis == "y":
++                        ax.invert_yaxis()
++                    # Set limits to +/- 0.5 around categories unless user provided limits
++                    if axis_key not in p._limits:
++                        cats = getattr(view_scale, "_categories", None)
++                        if cats is not None:
++                            ax.set(**{f"{axis}lim": (-0.5, len(cats) - 0.5)})
++
+ 
+                 # Axis limits
+                 if axis_key in p._limits:
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+index bbd71ec1..935571ab 100644
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -225,6 +225,8 @@ class Nominal(Scale):
+         if prop.legend:
+             new._legend = units_seed, list(stringify(units_seed))
+ 
++        new._categories = list(units_seed)
++
+         return new
+ 
+     def tick(self, locator: Locator | None = None):

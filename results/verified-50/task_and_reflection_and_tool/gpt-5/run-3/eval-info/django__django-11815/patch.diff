@@ -1,0 +1,139 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 27b5cbd379..2884b61896 100755
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -120,9 +120,9 @@ class EnumSerializer(BaseSerializer):
+     def serialize(self):
+         enum_class = self.value.__class__
+         module = enum_class.__module__
+-        v_string, v_imports = serializer_factory(self.value.value).serialize()
+-        imports = {'import %s' % module, *v_imports}
+-        return "%s.%s(%s)" % (module, enum_class.__name__, v_string), imports
++        name_string, name_imports = serializer_factory(self.value.name).serialize()
++        imports = {'import %s' % module, *name_imports}
++        return "%s.%s[%s]" % (module, enum_class.__name__, name_string), imports
+ 
+ 
+ class FloatSerializer(BaseSimpleSerializer):
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..a47e23ac32
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,17 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++
++- Reminder: Ensure migration serializer uses Enum member names, not values.
++- After changes, run relevant tests to confirm serialization output (e.g., for default values on fields).
++- Consider interactions with ChoicesSerializer and different Enum subclasses (Enum, IntEnum).
++- Verify import statements remain correct (module import of enum class).
++
++Additions:
++- Ensure EnumSerializer uses enum member names (self.value.name) not values (self.value.value).
++- Use subscription syntax (EnumClass['NAME']) to avoid failures with translated values.
++- After implementing, run tests covering migration serialization for Enum defaults and verify imports remain correct.
++- Consider interactions with ChoicesSerializer and Enum subclasses (e.g., IntEnum).
+diff --git a/scripts/edit_enum_serializer.py b/scripts/edit_enum_serializer.py
+new file mode 100644
+index 0000000000..40992ccc37
+--- /dev/null
++++ b/scripts/edit_enum_serializer.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++import re, sys, io, os
++
++def main():
++    if len(sys.argv) != 2:
++        print("Usage: edit_enum_serializer.py <path-to-serializer.py>", file=sys.stderr)
++        sys.exit(2)
++    path = sys.argv[1]
++    with io.open(path, 'r', encoding='utf-8') as f:
++        content = f.read()
++
++    # Find EnumSerializer.serialize method block.
++    pattern = re.compile(
++        r'(?ms)^class\s+EnumSerializer\(BaseSerializer\):\s+def\s+serialize\(self\):\s*(.*?)^(?=class\s|\Z)'
++    )
++    m = pattern.search(content)
++    if not m:
++        print("Could not locate EnumSerializer.serialize block.", file=sys.stderr)
++        sys.exit(1)
++
++    block = m.group(0)
++    body = m.group(1)
++
++    new_body = body
++    # Replace use of enum value with enum name.
++    new_body = new_body.replace("self.value.value", "self.value.name")
++    # Replace call-style access with subscription syntax.
++    new_body = new_body.replace('return "%s.%s(%s)" % (module, enum_class.__name__, v_string), imports',
++                                'return "%s.%s[%s]" % (module, enum_class.__name__, v_string), imports')
++
++    if new_body == body:
++        # If nothing changed, warn and continue (idempotent).
++        pass
++
++    new_block = block.replace(body, new_body)
++    new_content = content[:m.start()] + new_block + content[m.end():]
++
++    with io.open(path, 'w', encoding='utf-8') as f:
++        f.write(new_content)
++
++    print("Applied EnumSerializer update to use name-based subscription syntax.", file=sys.stderr)
++
++if __name__ == "__main__":
++    main()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 0000000000..ac387a3828
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,43 @@
++Migrations uses value of enum object instead of its name.
++Description
++	 
++		(last modified by oasl)
++	 
++When using Enum object as a default value for a CharField, the generated migration file uses the value of the Enum object instead of the its name. This causes a problem when using Django translation on the value of the Enum object. 
++The problem is that, when the Enum object value get translated to the users language, the old migration files raise an error stating that the Enum does not have the corresponding value. (because the Enum value is translated to another language)
++Example:
++Let say we have this code in models.py:
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++from django.db import models
++class Status(Enum):
++	GOOD = _('Good') # 'Good' will be translated
++	BAD = _('Bad') # 'Bad' will be translated
++	def __str__(self):
++		return self.name
++class Item(models.Model):
++	status = models.CharField(default=Status.GOOD, max_length=128)
++In the generated migration file, the code will be:
++...
++('status', models.CharField(default=Status('Good'), max_length=128))
++...
++After the translation, 'Good' will be translated to another word and it will not be part of the Status Enum class any more, so the migration file will raise the error on the previous line:
++ValueError: 'Good' is not a valid Status
++Shouldn't the code generated by the migration uses the name of the Status Enum 'GOOD', not the value of it, since it is changeable?
++It should be:
++('status', models.CharField(default=Status['GOOD'], max_length=128))
++This will be correct regardless of the translated word
++
++
++
++Update: Located EnumSerializer in django/db/migrations/serializer.py which serialized enums using their values via "module.EnumClass(value)". This causes breakage when Enum values are localized. Planned fix: serialize by enum member name using subscription syntax "module.EnumClass['NAME']" so migrations are stable regardless of value changes.
++Update (context from code inspection):
++- Located EnumSerializer in django/db/migrations/serializer.py (lines ~118-126).
++- Current behavior: serializes enums using their values via "%(module)s.%(EnumClass)s(%(value)s)".
++- Problem: For translated (localized) Enum values, migrations become unstable because the value may change across locales, leading to ValueError during migration replay.
++- Planned fix: Serialize enums by member name using subscription syntax: "%(module)s.%(EnumClass)s['%(NAME)s']" so that migrations remain stable regardless of value changes.
++
++Update (from code inspection):
++- Found EnumSerializer in django/db/migrations/serializer.py serializes enums using their values via "module.EnumClass(value)".
++- This breaks when Enum values are localized (e.g., gettext), causing migrations to fail on replay due to changed values.
++- Planned fix: Serialize enums by member name using subscription syntax "module.EnumClass['NAME']" to keep migrations stable regardless of value changes.

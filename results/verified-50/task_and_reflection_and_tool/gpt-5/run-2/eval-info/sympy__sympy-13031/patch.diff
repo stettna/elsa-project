@@ -1,0 +1,121 @@
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 000000000..fc5c953f3
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,8 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task, if you have learned any additional information about the task that should be added to the task description, or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Note that the task description can be changed by modifying the task_description.txt file directly. Anytime you execute commands that provide insight into the issue you are solving, you MUST add these insights to the task description before proceeding!
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding!
++
++- Before implementing fixes, write a quick reproduction script to assert expected shapes for hstack/vstack with 0 rows/cols.
++- When editing constructors/_new or classof, ensure no regressions for non-zero shapes.
++- If construction from empty data is used anywhere, ensure rows/cols are explicitly passed so column info is not lost.
+diff --git a/sympy/matrices/sparse.py b/sympy/matrices/sparse.py
+index e6f36cdf3..dcdd698e4 100755
+--- a/sympy/matrices/sparse.py
++++ b/sympy/matrices/sparse.py
+@@ -985,8 +985,9 @@ def col_join(self, other):
+         >>> C == A.row_insert(A.rows, Matrix(B))
+         True
+         """
+-        if not self:
+-            return type(self)(other)
++        # A null matrix can always be stacked (see  #10770)
++        if self.rows == 0 and self.cols != other.cols:
++            return self._new(0, other.cols, {}).col_join(other)
+         A, B = self, other
+         if not A.cols == B.cols:
+             raise ShapeError()
+@@ -1191,8 +1192,9 @@ def row_join(self, other):
+         >>> C == A.col_insert(A.cols, B)
+         True
+         """
+-        if not self:
+-            return type(self)(other)
++        # A null matrix can always be stacked (see  #10770)
++        if self.cols == 0 and self.rows != other.rows:
++            return self._new(other.rows, 0, {}).row_join(other)
+         A, B = self, other
+         if not A.rows == B.rows:
+             raise ShapeError()
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 000000000..b1a0f643d
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,73 @@
++Behavior of Matrix hstack and vstack changed in sympy 1.1
++In sympy 1.0:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns 
++(0, 6)
++
++Now, same in sympy 1.1:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns
++(0, 3)
++
++whereas:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(1, 0)
++M2 = sy.Matrix.zeros(1, 1)
++M3 = sy.Matrix.zeros(1, 2)
++M4 = sy.Matrix.zeros(1, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns
++(1, 6)
++
++
++Additional insights discovered:
++- Matrix.hstack is implemented in sympy/matrices/common.py using reduce(kls.row_join, args).
++- Matrix.vstack is implemented similarly via reduce(kls.col_join, args).
++- row_join delegates to _eval_row_join which constructs a new matrix with shape (self.rows, self.cols + other.cols) via _new and a lambda entry.
++- There is special handling in row_join when self has 0 columns and differing row counts (lines ~478-485), but not for equal zero-row cases.
++- The incorrect shape (0, 3) when hstacking zero-row matrices suggests that during reduction, a join step or constructor may drop column information when data is empty.
++- We should inspect classof(self, other), concrete _new implementations in dense/sparse matrices, and any places that infer shape from empty data, to ensure column counts are preserved.
++- vstack/col_join should be audited similarly for zero-dimension preservation.
++
++Plan next:
++- Inspect classof() and dense/sparse _new behavior for zero-row/zero-col cases.
++- Create a small script to reproduce the exact shapes for hstack/vstack with zero rows/cols and verify fixes.
++
++Verification results (current codebase):
++- Dense hstack zero rows: (0, 6)
++- Dense hstack one row: (1, 6)
++- Dense vstack zero cols: (6, 0)
++- Immutable hstack zero rows: ImmutableDenseMatrix (0, 6)
++- Immutable hstack one row: ImmutableDenseMatrix (1, 6)
++- Sparse hstack zero rows: (0, 3)
++- Sparse hstack one row: (1, 6)
++
++
++Identified root cause:
++- In sympy/matrices/sparse.py, MutableSparseMatrix.row_join uses `if not self:` to short-circuit,
++  which treats zero-row matrices as falsy and causes hstack reduction to drop previously accumulated
++  columns, yielding the last argument's shape (e.g., (0, 3)) instead of summing columns.
++- Fix approach: remove the generic falsy check and handle only the zero-columns + mismatched-rows case
++  (as in dense), so zero-row matrices preserve column counts during joins.
++
++
++Additional fix detail:
++- SparseMatrix.col_join had an incorrect special-case for zero-dimension handling. It must mirror common.py:
++  if self.rows == 0 and self.cols != other.cols: return self._new(0, other.cols, {}).col_join(other)
++  This ensures vstack over zero-column matrices accumulates rows properly (e.g., (6, 0)).

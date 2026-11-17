@@ -1,0 +1,155 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..61b23373b5 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -142,6 +142,22 @@ class ServerHandler(simple_server.ServerHandler):
+         # application sent the header.
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
++    def write(self, data):
++        # Don't send the response body for HEAD requests.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not self.headers_sent:
++                self.send_headers()
++            return
++        super().write(data)
++
++    def sendfile(self):
++        # Suppress file transmission for HEAD requests.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            if not self.headers_sent:
++                self.send_headers()
++            return True
++        return super().sendfile()
++
+ 
+     def close(self):
+         self.get_stdin().read()
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..19a0ea0459
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,11 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++
++- Before implementing fixes, inspect django/core/servers/basehttp.py (and related runserver code) for how HEAD requests are handled post-1.10 refactor. Confirm whether the server layer (wsgiref + Django wrappers) strips bodies for HEAD.
++- Implement the fix in Django’s dev server layer so that for REQUEST_METHOD == 'HEAD', the response body is not written while preserving headers and Content-Length compliance with RFC 2616/7231.
++- Prefer minimally invasive changes: override the handler’s write/finish_response or sendfile logic to suppress body on HEAD, without affecting other methods or middleware behavior.
++- Add targeted, reversible edits using the scripts/smart_edit.py utility (replace/insert) to avoid brittle sed changes and to keep diffs clean.
++- After changes, run relevant tests and, if possible, simulate a HEAD request path to ensure headers-only behavior (no body, correct Content-Length).
++- Be cautious not to alter tests or configs; only modify source files under /testbed/django.
+diff --git a/scripts/smart_edit.py b/scripts/smart_edit.py
+new file mode 100755
+index 0000000000..216a38c330
+--- /dev/null
++++ b/scripts/smart_edit.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++import sys, re, os
++
++HELP = """smart_edit.py - simple file editing utility
++
++Usage:
++  smart_edit.py replace <path> <pattern> <repl> [flags]
++     - Perform regex replacement. Flags: i (IGNORECASE), m (MULTILINE), s (DOTALL)
++  smart_edit.py insert_after <path> <anchor_regex> <insert_text> [flags]
++  smart_edit.py insert_before <path> <anchor_regex> <insert_text> [flags]
++  smart_edit.py assert_contains <path> <regex> [flags]
++  smart_edit.py show <path> [start_line] [end_line]
++
++Notes:
++- Patterns and insert_text are treated as raw strings; backreferences supported in replace.
++- Exits with non-zero on errors. Writes only if changes occur.
++"""
++
++def compile_re(pattern, flags_str):
++    flags = 0
++    if flags_str:
++        for ch in flags_str:
++            if ch == 'i': flags |= re.IGNORECASE
++            elif ch == 'm': flags |= re.MULTILINE
++            elif ch == 's': flags |= re.DOTALL
++            else: raise SystemExit(f"Unknown flag: {ch}")
++    return re.compile(pattern, flags)
++
++def replace(path, pattern, repl, flags_str):
++    rx = compile_re(pattern, flags_str)
++    with open(path, 'r', encoding='utf-8') as f:
++        text = f.read()
++    new = rx.sub(repl, text)
++    if new == text:
++        print("NO_CHANGE")
++        return 0
++    with open(path, 'w', encoding='utf-8') as f:
++        f.write(new)
++    print("CHANGED")
++    return 0
++
++def insert_generic(path, anchor_pattern, insert_text, flags_str, before):
++    rx = compile_re(anchor_pattern, flags_str)
++    with open(path, 'r', encoding='utf-8') as f:
++        text = f.read()
++    m = rx.search(text)
++    if not m:
++        print("ANCHOR_NOT_FOUND")
++        return 2
++    idx = m.start() if before else m.end()
++    new = text[:idx] + insert_text + text[idx:]
++    with open(path, 'w', encoding='utf-8') as f:
++        f.write(new)
++    print("CHANGED")
++    return 0
++
++def assert_contains(path, pattern, flags_str):
++    rx = compile_re(pattern, flags_str)
++    with open(path, 'r', encoding='utf-8') as f:
++        text = f.read()
++    if rx.search(text):
++        print("FOUND")
++        return 0
++    print("NOT_FOUND")
++    return 1
++
++def show(path, start=None, end=None):
++    with open(path, 'r', encoding='utf-8') as f:
++        lines = f.readlines()
++    n = len(lines)
++    s = int(start) if start else 1
++    e = int(end) if end else n
++    s = max(1, s); e = min(n, e)
++    for i in range(s-1, e):
++        print(f"{i+1:6d}: {lines[i].rstrip()}")
++    return 0
++
++def main(argv):
++    if len(argv) < 3:
++        print(HELP)
++        return 1
++    cmd = argv[1]
++    if cmd == 'replace' and len(argv) >= 5:
++        path, pattern, repl = argv[2], argv[3], argv[4]
++        flags = argv[5] if len(argv) > 5 else ""
++        return replace(path, pattern, repl, flags)
++    if cmd in ('insert_after','insert_before') and len(argv) >= 5:
++        path, pattern, insert_text = argv[2], argv[3], argv[4]
++        flags = argv[5] if len(argv) > 5 else ""
++        before = (cmd == 'insert_before')
++        return insert_generic(path, pattern, insert_text, flags, before)
++    if cmd == 'assert_contains' and len(argv) >= 4:
++        path, pattern = argv[2], argv[3]
++        flags = argv[4] if len(argv) > 4 else ""
++        return assert_contains(path, pattern, flags)
++    if cmd == 'show' and len(argv) >= 3:
++        return show(argv[2], argv[3] if len(argv) > 3 else None, argv[4] if len(argv) > 4 else None)
++    print(HELP)
++    return 1
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))

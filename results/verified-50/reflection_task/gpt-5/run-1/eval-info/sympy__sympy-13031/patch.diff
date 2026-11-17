@@ -1,0 +1,213 @@
+diff --git a/_stack_check.out b/_stack_check.out
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/_stack_check2.out b/_stack_check2.out
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/_verify.out b/_verify.out
+new file mode 100644
+index 000000000..6c2a8db68
+--- /dev/null
++++ b/_verify.out
+@@ -0,0 +1,3 @@
++hstack (0-row): (0, 6)
++hstack (1-row): (1, 6)
++vstack (0-col): (6, 0)
+diff --git a/_verify2.out b/_verify2.out
+new file mode 100644
+index 000000000..31144871d
+--- /dev/null
++++ b/_verify2.out
+@@ -0,0 +1,3 @@
++hstack (0-row) after patch: (0, 3)
++hstack (1-row) after patch: (1, 6)
++vstack (0-col) after patch: (3, 0)
+diff --git a/_verify_stack.out b/_verify_stack.out
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 000000000..8b1378917
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1 @@
++
+diff --git a/sympy/matrices/common.py b/sympy/matrices/common.py
+index 7ef51bc84..302e3fcd6 100755
+--- a/sympy/matrices/common.py
++++ b/sympy/matrices/common.py
+@@ -377,6 +377,14 @@ def hstack(cls, *args):
+         if len(args) == 0:
+             return cls._new()
+ 
++        # When stacking matrices with zero rows, return 0 x max(cols) (SymPy 1.1 behavior)
++        if all(getattr(a, 'rows', 0) == 0 for a in args):
++            maxc = 0
++            for a in args:
++                c = getattr(a, 'cols', 0)
++                if c > maxc:
++                    maxc = c
++            return cls._new(0, maxc, [])
+         kls = type(args[0])
+         return reduce(kls.row_join, args)
+ 
+@@ -600,6 +608,14 @@ def vstack(cls, *args):
+         if len(args) == 0:
+             return cls._new()
+ 
++        # When stacking matrices with zero columns, return max(rows) x 0 (SymPy 1.1 behavior)
++        if all(getattr(a, 'cols', 0) == 0 for a in args):
++            maxr = 0
++            for a in args:
++                r = getattr(a, 'rows', 0)
++                if r > maxr:
++                    maxr = r
++            return cls._new(maxr, 0, [])
+         kls = type(args[0])
+         return reduce(kls.col_join, args)
+ 
+diff --git a/task_description.txt b/task_description.txt
+new file mode 100644
+index 000000000..5efbf7a38
+--- /dev/null
++++ b/task_description.txt
+@@ -0,0 +1,139 @@
++Behavior of Matrix hstack and vstack changed in sympy 1.1
++In sympy 1.0:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns 
++(0, 6)
++
++Now, same in sympy 1.1:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns
++(0, 3)
++
++whereas:
++
++import sympy as sy
++M1 = sy.Matrix.zeros(1, 0)
++M2 = sy.Matrix.zeros(1, 1)
++M3 = sy.Matrix.zeros(1, 2)
++M4 = sy.Matrix.zeros(1, 3)
++sy.Matrix.hstack(M1, M2, M3, M4).shape
++
++returns
++(1, 6)
++
++
++Additional investigation notes:
++- Located Matrix.hstack implementation in sympy/matrices/common.py (around line 364). It returns cls._new() when no args and otherwise reduces over row_join: reduce(type(args[0]).row_join, args).
++- The change in behavior for stacking zero-row/zero-column matrices likely stems from row_join/col_join logic when dealing with empty dimensions. Next steps: inspect row_join, col_join, and vstack implementations in common.py.
++Reproduction insight (local code behavior before fix):
++- hstack with zero-row matrices: shapes (0,0),(0,1),(0,2),(0,3) -> (0, 6)
++- hstack with one-row matrices: (1,0),(1,1),(1,2),(1,3) -> (1, 6)
++- vstack with zero-col matrices: (0,0),(1,0),(2,0),(3,0) -> (6, 0)
++
++Desired (per SymPy 1.1 change mentioned in PR):
++- hstack with all zero-row inputs should yield (0, max(cols)) e.g., (0, 3) instead of summing to (0, 6)
++- vstack with all zero-col inputs should yield (max(rows), 0) e.g., (3, 0) instead of summing to (6, 0)
++EOF && python - <<'PY'
++from pathlib import Path
++
++p = Path("sympy/matrices/common.py")
++s = p.read_text().splitlines()
++out = []
++i = 0
++while i < len(s):
++    line = s[i]
++    out.append(line)
++    # Patch hstack: insert special-case before 'kls = type(args[0])'
++    if line.strip() == "def hstack(cls, *args):":
++        i += 1
++        while i < len(s):
++            out.append(s[i])
++            if s[i].strip().startswith("kls = type(args[0])"):
++                insert = [
++                    "        # Special-case: when all args have 0 rows, adopt max of columns (SymPy 1.1 behavior)",
++                    "        if all(getattr(a, 'rows', None) == 0 for a in args):",
++                    "            maxc = 0",
++                    "            for a in args:",
++                    "                c = getattr(a, 'cols', 0)",
++                    "                if c > maxc:",
++                    "                    maxc = c",
++                    "            return cls._new(0, maxc, [])",
++                ]
++                # Insert only if not already present
++                for ins in insert:
++                    if ins in s[i-20:i+1]:
++                        insert = []
++                        break
++                if insert:
++                    # place before the just-appended 'kls = type(args[0])' line
++                    out = out[:-1] + insert + [s[i]]
++                break
++            i += 1
++    # Patch vstack: insert special-case before 'kls = type(args[0])'
++    elif line.strip() == "def vstack(cls, *args):":
++        i += 1
++        while i < len(s):
++            out.append(s[i])
++            if s[i].strip().startswith("kls = type(args[0])"):
++                insert = [
++                    "        # Special-case: when all args have 0 cols, adopt max of rows (SymPy 1.1 behavior)",
++                    "        if all(getattr(a, 'cols', None) == 0 for a in args):",
++                    "            maxr = 0",
++                    "            for a in args:",
++                    "                r = getattr(a, 'rows', 0)",
++                    "                if r > maxr:",
++                    "                    maxr = r",
++                    "            return cls._new(maxr, 0, [])",
++                ]
++                for ins in insert:
++                    if ins in s[i-20:i+1]:
++                        insert = []
++                        break
++                if insert:
++                    out = out[:-1] + insert + [s[i]]
++                break
++            i += 1
++    i += 1
++
++p.write_text("\n".join(out))
++print("Patched hstack/vstack.")
++PY && PYTHONPATH=. python - <<'PY'
++import sympy as sy
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++print("hstack (0-row) after patch:", sy.Matrix.hstack(M1, M2, M3, M4).shape)
++
++M1b = sy.Matrix.zeros(1, 0)
++M2b = sy.Matrix.zeros(1, 1)
++M3b = sy.Matrix.zeros(1, 2)
++M4b = sy.Matrix.zeros(1, 3)
++print("hstack (1-row) after patch:", sy.Matrix.hstack(M1b, M2b, M3b, M4b).shape)
++
++N1 = sy.Matrix.zeros(0, 0)
++N2 = sy.Matrix.zeros(1, 0)
++N3 = sy.Matrix.zeros(2, 0)
++N4 = sy.Matrix.zeros(3, 0)
++print("vstack (0-col) after patch:", sy.Matrix.vstack(N1, N2, N3, N4).shape)
++PY
++Inspecting hstack/vstack code sections after patch
++Planned change: Adjust Matrix.hstack/vstack to use max dimension when all inputs are empty in the stacking direction (rows==0 for hstack -> (0, max(cols)); cols==0 for vstack -> (max(rows), 0)).
++Verification after patch:
++hstack (0-row) after patch: (0, 3)
++hstack (1-row) after patch: (1, 6)
++vstack (0-col) after patch: (3, 0)

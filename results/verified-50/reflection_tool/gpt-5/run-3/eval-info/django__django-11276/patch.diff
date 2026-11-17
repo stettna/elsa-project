@@ -1,0 +1,176 @@
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 0000000000..81db137f96
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,15 @@
++Use Python stdlib html.escape() to in django.utils.html.escape()
++Description
++	
++The function django.utils.html.escape() partially duplicates the Python stdlib function html.escape(). We can replace this duplication with wider community developed version.
++html.escape() has been available since Python 3.2:
++​https://docs.python.org/3/library/html.html#html.escape
++This function is also faster than Django's. As Python bug ​https://bugs.python.org/issue18020 concludes, using .replace() can be faster than .translate(). This function gets called numerous times when rendering templates. After making the change locally, I saw the following improvement:
++master:
++$ python -m timeit -s 'from django.utils.html import escape' 'escape(copyright)'
++50000 loops, best of 5: 4.03 usec per loop
++branch:
++$ python -m timeit -s 'from django.utils.html import escape' 'escape(copyright)'
++100000 loops, best of 5: 2.45 usec per loop
++One small concern, html.escape() converts ' to &#x27 rather than &#39. These values are functionally equivalent HTML, but I'll mention it as a backwards incompatible change as the literal text has changed
++
+diff --git a/django/utils/html.py b/django/utils/html.py
+index 9c519978f5..63eb06f5d6 100644
+--- a/django/utils/html.py
++++ b/django/utils/html.py
+@@ -3,6 +3,7 @@
+ import json
+ import re
+ from html.parser import HTMLParser
++from html import escape as html_escape
+ from urllib.parse import (
+     parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit,
+ )
+@@ -43,7 +44,7 @@ def escape(text):
+     This may result in double-escaping. If this is a concern, use
+     conditional_escape() instead.
+     """
+-    return mark_safe(str(text).translate(_html_escapes))
++    return mark_safe(html_escape(str(text), quote=True).replace('&#x27;', '&#39;'))
+ 
+ 
+ _js_escapes = {
+diff --git a/reflection_prompt.txt b/reflection_prompt.txt
+new file mode 100644
+index 0000000000..aa3e440fcb
+--- /dev/null
++++ b/reflection_prompt.txt
+@@ -0,0 +1,12 @@
++Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task or if there are any modifications you can make to the reflection prompt to enhance your workflow. 
++Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
++Also note, you can update the reflection prompt by editing reflection_prompt.txt when ever you want. Anytime your ability to solve the task could benefit from deviating from your standard workflow or you identify important steps that you must take to solve the problem, you MUST add these to the reflection prompt before proceeding! 
++
++[Added on this task]
++- Locate django/utils/html.py and the escape() implementation.
++- Replace escaping logic to call Python's stdlib html.escape(value, quote=True) for correctness and performance.
++- Preserve Django's SafeString/SafeText semantics: don't escape SafeString; ensure returned type is SafeString when appropriate.
++- Verify conditional_escape and mark_safe behaviors remain unchanged.
++- Note: stdlib uses &#x27; for apostrophes vs &#39;; expect literal change but equivalent HTML.
++- After code changes, run tests for django.utils.html and template escaping to catch regressions.
++- Use scripts/edit_file.py for safe, repeatable edits (regex replace, ensure import lines, etc.).
+diff --git a/scripts/edit_file.py b/scripts/edit_file.py
+new file mode 100755
+index 0000000000..21a8417a75
+--- /dev/null
++++ b/scripts/edit_file.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++import argparse
++import re
++import sys
++from pathlib import Path
++
++def parse_flags(s: str) -> int:
++    if not s:
++        return 0
++    mapping = {
++        "IGNORECASE": re.IGNORECASE,
++        "MULTILINE": re.MULTILINE,
++        "DOTALL": re.DOTALL,
++        "VERBOSE": re.VERBOSE,
++    }
++    flags = 0
++    for name in s.split(","):
++        name = name.strip().upper()
++        if not name:
++            continue
++        if name not in mapping:
++            print(f"Unknown flag: {name}", file=sys.stderr)
++            sys.exit(2)
++        flags |= mapping[name]
++    return flags
++
++def cmd_replace(args):
++    p = Path(args.file)
++    if not p.exists():
++        print(f"File not found: {p}", file=sys.stderr)
++        sys.exit(2)
++    text = p.read_text(encoding="utf-8")
++    flags = parse_flags(args.flags)
++    try:
++        pattern = re.compile(args.pattern, flags)
++    except re.error as e:
++        print(f"Invalid regex: {e}", file=sys.stderr)
++        sys.exit(2)
++    new_text, n = pattern.subn(args.repl, text, count=0 if args.count is None else args.count)
++    if n == 0:
++        print("No matches found; no changes made.", file=sys.stderr)
++        sys.exit(1)
++    p.write_text(new_text, encoding="utf-8")
++    print(f"Replacements applied: {n}")
++
++def cmd_ensure_line(args):
++    p = Path(args.file)
++    if not p.exists():
++        print(f"File not found: {p}", file=sys.stderr)
++        sys.exit(2)
++    text = p.read_text(encoding="utf-8")
++    line = args.line if args.line.endswith("\n") else args.line + "\n"
++    if line in text.splitlines(keepends=True):
++        print("Line already present; no changes made.")
++        return
++    if args.position == "top":
++        new_text = line + text
++    elif args.position == "bottom":
++        new_text = text + ("" if text.endswith("\n") else "\n") + line
++    elif args.position == "after_regex":
++        flags = parse_flags(args.flags)
++        try:
++            pat = re.compile(args.after_pattern, flags)
++        except re.error as e:
++            print(f"Invalid regex: {e}", file=sys.stderr)
++            sys.exit(2)
++        m = pat.search(text)
++        if not m:
++            print("after_regex pattern not found; no changes made.", file=sys.stderr)
++            sys.exit(1)
++        insert_pos = m.end()
++        nl_pos = text.find("\n", insert_pos)
++        if nl_pos == -1:
++            new_text = text + ("\n" if not text.endswith("\n") else "") + line
++        else:
++            new_text = text[:nl_pos+1] + line + text[nl_pos+1:]
++    else:
++        print(f"Unknown position: {args.position}", file=sys.stderr)
++        sys.exit(2)
++    p.write_text(new_text, encoding="utf-8")
++    print("Line inserted.")
++
++def main():
++    parser = argparse.ArgumentParser(description="Simple file editing utility (regex replace, ensure line).")
++    sub = parser.add_subparsers(dest="cmd")  # compatible with Python 3.6; no 'required' kw
++    p_rep = sub.add_parser("replace", help="Regex-based replacement")
++    p_rep.add_argument("--file", required=True)
++    p_rep.add_argument("--pattern", required=True, help="Python regex pattern")
++    p_rep.add_argument("--repl", required=True, help="Replacement string")
++    p_rep.add_argument("--flags", default="", help="Comma-separated re flags: IGNORECASE,MULTILINE,DOTALL,VERBOSE")
++    p_rep.add_argument("--count", type=int, default=None, help="Max replacements (default: unlimited)")
++    p_rep.set_defaults(func=cmd_replace)
++
++    p_ins = sub.add_parser("ensure_line", help="Ensure a specific line exists in the file")
++    p_ins.add_argument("--file", required=True)
++    p_ins.add_argument("--line", required=True)
++    p_ins.add_argument("--position", choices=["top","bottom","after_regex"], default="top")
++    p_ins.add_argument("--after-pattern", dest="after_pattern", default="", help="Regex to insert after (with --position after_regex)")
++    p_ins.add_argument("--flags", default="", help="Comma-separated re flags for after_regex")
++    p_ins.set_defaults(func=cmd_ensure_line)
++
++    args = parser.parse_args()
++    if not getattr(args, "cmd", None):
++        parser.print_usage(sys.stderr)
++        print("error: a subcommand is required (replace, ensure_line)", file=sys.stderr)
++        sys.exit(2)
++    args.func(args)
++
++if __name__ == "__main__":
++    main()
