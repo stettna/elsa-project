@@ -1,0 +1,673 @@
++ cd /testbed
++ git config --global --add safe.directory /testbed
++ git status
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	REFLECTION_PROMPT_PATH
+	TASK_DESCRIPTION_PATH
+
+no changes added to commit (use "git add" and/or "git commit -a")
++ git show
+commit 3950b00ee410754913122e8104cbc39353b62c0b
+Author: Alex Waygood <Alex.Waygood@Gmail.com>
+Date:   Thu Jan 16 23:48:52 2025 +0000
+
+    [red-knot] Implement disjointness for Instance types where the underlying class is `@final` (#15539)
+    
+    ## Summary
+    
+    Closes https://github.com/astral-sh/ruff/issues/15508
+    
+    For any two instance types `T` and `S`, we know they are disjoint if
+    either `T` is final and `T` is not a subclass of `S` or `S` is final and
+    `S` is not a subclass of `T`.
+    
+    Correspondingly, for any two types `type[T]` and `S` where `S` is an
+    instance type, `type[T]` can be said to be disjoint from `S` if `S` is
+    disjoint from `U`, where `U` is the type that represents all instances
+    of `T`'s metaclass.
+    
+    And a heterogeneous tuple type can be said to be disjoint from an
+    instance type if the instance type is disjoint from `tuple` (a type
+    representing all instances of the `tuple` class at runtime).
+    
+    ## Test Plan
+    
+    - A new mdtest added. Most of our `is_disjoint_from()` tests are not
+    written as mdtests just yet, but it's pretty hard to test some of these
+    edge cases from a Rust unit test!
+    - Ran `QUICKCHECK_TESTS=1000000 cargo test --release -p
+    red_knot_python_semantic -- --ignored types::property_tests::stable`
+    
+    ---------
+    
+    Co-authored-by: Carl Meyer <carl@astral.sh>
+
+diff --git a/crates/red_knot_python_semantic/resources/mdtest/narrow/isinstance.md b/crates/red_knot_python_semantic/resources/mdtest/narrow/isinstance.md
+index 3da4221cf..fd14139ba 100644
+--- a/crates/red_knot_python_semantic/resources/mdtest/narrow/isinstance.md
++++ b/crates/red_knot_python_semantic/resources/mdtest/narrow/isinstance.md
+@@ -199,24 +199,20 @@ def f(
+     if isinstance(a, bool):
+         reveal_type(a)  # revealed: Never
+     else:
+-        # TODO: `bool` is final, so `& ~bool` is redundant here
+-        reveal_type(a)  # revealed: P & AlwaysTruthy & ~bool
++        reveal_type(a)  # revealed: P & AlwaysTruthy
+ 
+     if isinstance(b, bool):
+         reveal_type(b)  # revealed: Never
+     else:
+-        # TODO: `bool` is final, so `& ~bool` is redundant here
+-        reveal_type(b)  # revealed: P & AlwaysFalsy & ~bool
++        reveal_type(b)  # revealed: P & AlwaysFalsy
+ 
+     if isinstance(c, bool):
+         reveal_type(c)  # revealed: Never
+     else:
+-        # TODO: `bool` is final, so `& ~bool` is redundant here
+-        reveal_type(c)  # revealed: P & ~AlwaysTruthy & ~bool
++        reveal_type(c)  # revealed: P & ~AlwaysTruthy
+ 
+     if isinstance(d, bool):
+         reveal_type(d)  # revealed: Never
+     else:
+-        # TODO: `bool` is final, so `& ~bool` is redundant here
+-        reveal_type(d)  # revealed: P & ~AlwaysFalsy & ~bool
++        reveal_type(d)  # revealed: P & ~AlwaysFalsy
+ ```
+diff --git a/crates/red_knot_python_semantic/resources/mdtest/type_properties/is_disjoint_from.md b/crates/red_knot_python_semantic/resources/mdtest/type_properties/is_disjoint_from.md
+new file mode 100644
+index 000000000..b6d85cf5b
+--- /dev/null
++++ b/crates/red_knot_python_semantic/resources/mdtest/type_properties/is_disjoint_from.md
+@@ -0,0 +1,39 @@
++# Tests for disjointness
++
++If two types can be disjoint, it means that it is known that no possible runtime object could ever
++inhabit both types simultaneously.
++
++TODO: Most of our disjointness tests are still Rust tests; they should be moved to this file.
++
++## Instance types versus `type[T]` types
++
++An instance type is disjoint from a `type[T]` type if the instance type is `@final` and the class of
++the instance type is not a subclass of `T`'s metaclass.
++
++```py
++from typing import final
++from knot_extensions import is_disjoint_from, static_assert
++
++@final
++class Foo: ...
++
++static_assert(is_disjoint_from(Foo, type[int]))
++static_assert(is_disjoint_from(type[object], Foo))
++static_assert(is_disjoint_from(type[dict], Foo))
++
++# Instance types can be disjoint from `type[]` types
++# even if the instance type is a subtype of `type`
++
++@final
++class Meta1(type): ...
++
++class UsesMeta1(metaclass=Meta1): ...
++
++static_assert(not is_disjoint_from(Meta1, type[UsesMeta1]))
++
++class Meta2(type): ...
++class UsesMeta2(metaclass=Meta2): ...
++
++static_assert(not is_disjoint_from(Meta2, type[UsesMeta2]))
++static_assert(is_disjoint_from(Meta1, type[UsesMeta2]))
++```
+diff --git a/crates/red_knot_python_semantic/src/types.rs b/crates/red_knot_python_semantic/src/types.rs
+index a0bb4c725..0ce9b0610 100644
+--- a/crates/red_knot_python_semantic/src/types.rs
++++ b/crates/red_knot_python_semantic/src/types.rs
+@@ -1278,14 +1278,17 @@ impl<'db> Type<'db> {
+ 
+             (Type::SubclassOf(_), Type::SubclassOf(_)) => false,
+ 
+-            (Type::SubclassOf(_), Type::Instance(instance))
+-            | (Type::Instance(instance), Type::SubclassOf(_)) => {
+-                // TODO this should be `true` if the instance is of a final type which is not a
+-                // subclass of type. (With non-final types, we never know whether a subclass might
+-                // multiply-inherit `type` or a subclass of it, and thus not be disjoint with
+-                // `type[...]`.) Until we support finality, hardcode None, which is known to be
+-                // final.
+-                instance.class.is_known(db, KnownClass::NoneType)
++            (Type::SubclassOf(subclass_of_ty), instance @ Type::Instance(_))
++            | (instance @ Type::Instance(_), Type::SubclassOf(subclass_of_ty)) => {
++                // `type[T]` is disjoint from `S`, where `S` is an instance type,
++                // if `U` is disjoint from `S`,
++                // where `U` represents all instances of `T`'s metaclass
++                let metaclass_instance = subclass_of_ty
++                    .subclass_of()
++                    .into_class()
++                    .map(|class| class.metaclass(db).to_instance(db))
++                    .unwrap_or_else(|| KnownClass::Type.to_instance(db));
++                instance.is_disjoint_from(db, metaclass_instance)
+             }
+ 
+             (
+@@ -1339,24 +1342,6 @@ impl<'db> Type<'db> {
+                 known_instance_ty.is_disjoint_from(db, KnownClass::Tuple.to_instance(db))
+             }
+ 
+-            (
+-                Type::Instance(InstanceType { class: class_none }),
+-                Type::Instance(InstanceType { class: class_other }),
+-            )
+-            | (
+-                Type::Instance(InstanceType { class: class_other }),
+-                Type::Instance(InstanceType { class: class_none }),
+-            ) if class_none.is_known(db, KnownClass::NoneType) => {
+-                !class_none.is_subclass_of(db, class_other)
+-            }
+-
+-            (Type::Instance(InstanceType { class: class_none }), _)
+-            | (_, Type::Instance(InstanceType { class: class_none }))
+-                if class_none.is_known(db, KnownClass::NoneType) =>
+-            {
+-                true
+-            }
+-
+             (Type::BooleanLiteral(..), Type::Instance(InstanceType { class }))
+             | (Type::Instance(InstanceType { class }), Type::BooleanLiteral(..)) => {
+                 // A `Type::BooleanLiteral()` must be an instance of exactly `bool`
+@@ -1430,15 +1415,12 @@ impl<'db> Type<'db> {
+                 other.is_disjoint_from(db, KnownClass::ModuleType.to_instance(db))
+             }
+ 
+-            (Type::Instance(..), Type::Instance(..)) => {
+-                // TODO: once we have support for `final`, there might be some cases where
+-                // we can determine that two types are disjoint. Once we do this, some cases
+-                // above (e.g. NoneType) can be removed. For non-final classes, we return
+-                // false (multiple inheritance).
+-
+-                // TODO: is there anything specific to do for instances of KnownClass::Type?
+-
+-                false
++            (
++                Type::Instance(InstanceType { class: left_class }),
++                Type::Instance(InstanceType { class: right_class }),
++            ) => {
++                (left_class.is_final(db) && !left_class.is_subclass_of(db, right_class))
++                    || (right_class.is_final(db) && !right_class.is_subclass_of(db, left_class))
+             }
+ 
+             (Type::Tuple(tuple), Type::Tuple(other_tuple)) => {
+@@ -1451,7 +1433,8 @@ impl<'db> Type<'db> {
+                         .any(|(e1, e2)| e1.is_disjoint_from(db, *e2))
+             }
+ 
+-            (Type::Tuple(..), Type::Instance(..)) | (Type::Instance(..), Type::Tuple(..)) => {
++            (Type::Tuple(..), instance @ Type::Instance(_))
++            | (instance @ Type::Instance(_), Type::Tuple(..)) => {
+                 // We cannot be sure if the tuple is disjoint from the instance because:
+                 //   - 'other' might be the homogeneous arbitrary-length tuple type
+                 //     tuple[T, ...] (which we don't have support for yet); if all of
+@@ -1460,7 +1443,7 @@ impl<'db> Type<'db> {
+                 //     over the same or compatible *Ts, would overlap with tuple.
+                 //
+                 // TODO: add checks for the above cases once we support them
+-                false
++                instance.is_disjoint_from(db, KnownClass::Tuple.to_instance(db))
+             }
+         }
+     }
++ git -c core.fileMode=false diff 3950b00ee410754913122e8104cbc39353b62c0b
+diff --git a/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs b/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs
+index 02c96754b..8b3bf346a 100644
+--- a/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs
++++ b/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs
+@@ -114,16 +114,23 @@ pub(crate) fn yield_in_for_loop(checker: &mut Checker, stmt_for: &ast::StmtFor)
+     }
+ 
+     let mut diagnostic = Diagnostic::new(YieldInForLoop, stmt_for.range());
+-    let contents = checker.locator().slice(
+-        parenthesized_range(
+-            iter.as_ref().into(),
+-            stmt_for.into(),
+-            checker.comment_ranges(),
+-            checker.locator().contents(),
+-        )
+-        .unwrap_or(iter.range()),
++    // Determine the source slice for the iterable, including surrounding parentheses if present.
++    let paren_range = parenthesized_range(
++        iter.as_ref().into(),
++        stmt_for.into(),
++        checker.comment_ranges(),
++        checker.locator().contents(),
+     );
+-    let contents = format!("yield from {contents}");
++    let iter_text = checker
++        .locator()
++        .slice(paren_range.unwrap_or(iter.range()));
++    // If the iterable is an unparenthesized tuple (e.g., `x,`), wrap it in parentheses to
++    // avoid producing invalid syntax like `yield from x,`.
++    let contents = if matches!(iter.as_ref(), Expr::Tuple(_)) && paren_range.is_none() {
++        format!("yield from ({iter_text})")
++    } else {
++        format!("yield from {iter_text}")
++    };
+     diagnostic.set_fix(Fix::unsafe_edit(Edit::range_replacement(
+         contents,
+         stmt_for.range(),
++ git checkout 3950b00ee410754913122e8104cbc39353b62c0b crates/ruff_linter/resources/test/fixtures/pyupgrade/UP028_1.py crates/ruff_linter/src/rules/pyupgrade/snapshots/ruff_linter__rules__pyupgrade__tests__UP028_1.py.snap
+Updated 0 paths from cc30611a3
++ git apply -v -
+<stdin>:35: trailing whitespace.
+125 125 | 
+Checking patch crates/ruff_linter/resources/test/fixtures/pyupgrade/UP028_1.py...
+Checking patch crates/ruff_linter/src/rules/pyupgrade/snapshots/ruff_linter__rules__pyupgrade__tests__UP028_1.py.snap...
+Applied patch crates/ruff_linter/resources/test/fixtures/pyupgrade/UP028_1.py cleanly.
+Applied patch crates/ruff_linter/src/rules/pyupgrade/snapshots/ruff_linter__rules__pyupgrade__tests__UP028_1.py.snap cleanly.
+warning: 1 line adds whitespace errors.
++ : '>>>>> Start Test Output'
++ cargo test --package ruff_linter --lib rules::pyupgrade
++ cat
+   Compiling unicode-ident v1.0.14
+   Compiling proc-macro2 v1.0.93
+   Compiling memchr v2.7.4
+   Compiling cfg-if v1.0.0
+   Compiling serde v1.0.217
+   Compiling libc v0.2.169
+   Compiling ppv-lite86 v0.2.17
+   Compiling quote v1.0.38
+   Compiling syn v2.0.96
+   Compiling either v1.11.0
+   Compiling aho-corasick v1.1.3
+   Compiling regex-syntax v0.8.5
+   Compiling stable_deref_trait v1.2.0
+   Compiling siphasher v0.3.11
+   Compiling getrandom v0.2.14
+   Compiling rand_core v0.6.4
+   Compiling regex-automata v0.4.8
+   Compiling itertools v0.14.0
+   Compiling synstructure v0.13.1
+   Compiling rustversion v1.0.15
+   Compiling rand_chacha v0.3.1
+   Compiling log v0.4.22
+   Compiling regex v1.11.1
+   Compiling once_cell v1.20.2
+   Compiling heck v0.5.0
+   Compiling rand v0.8.5
+   Compiling serde_derive v1.0.217
+   Compiling zerofrom-derive v0.1.4
+   Compiling yoke-derive v0.7.4
+   Compiling zerovec-derive v0.10.3
+   Compiling displaydoc v0.2.5
+   Compiling zerofrom v0.1.4
+   Compiling yoke v0.7.4
+   Compiling phf_shared v0.11.2
+   Compiling writeable v0.5.5
+   Compiling thiserror v1.0.67
+   Compiling litemap v0.7.3
+   Compiling ruff_text_size v0.0.0 (/testbed/crates/ruff_text_size)
+   Compiling ruff_source_file v0.0.0 (/testbed/crates/ruff_source_file)
+   Compiling phf_generator v0.11.2
+   Compiling zerovec v0.10.4
+   Compiling icu_provider_macros v1.5.0
+   Compiling thiserror-impl v1.0.67
+   Compiling smallvec v1.13.2
+   Compiling tinystr v0.7.6
+   Compiling ryu v1.0.17
+   Compiling icu_locid v1.5.0
+   Compiling itoa v1.0.11
+   Compiling unicode-width v0.1.13
+   Compiling getopts v0.2.21
+   Compiling ruff_python_trivia v0.0.0 (/testbed/crates/ruff_python_trivia)
+   Compiling icu_provider v1.5.0
+   Compiling phf_codegen v0.11.2
+   Compiling is-macro v0.3.7
+   Compiling bstr v1.11.3
+   Compiling icu_locid_transform_data v1.5.0
+   Compiling rustc-hash v2.1.0
+   Compiling icu_locid_transform v1.5.0
+   Compiling unicode_names2_generator v1.3.0
+   Compiling globset v0.4.15
+   Compiling ruff_macros v0.0.0 (/testbed/crates/ruff_macros)
+   Compiling icu_collections v1.5.0
+   Compiling castaway v0.2.3
+   Compiling filetime v0.2.25
+   Compiling static_assertions v1.1.0
+   Compiling icu_properties_data v1.5.0
+   Compiling glob v0.3.2
+   Compiling seahash v4.1.0
+   Compiling bitflags v2.7.0
+   Compiling ruff_cache v0.0.0 (/testbed/crates/ruff_cache)
+   Compiling icu_properties v1.5.1
+   Compiling compact_str v0.8.1
+   Compiling phf v0.11.2
+   Compiling unicode_names2 v1.3.0
+   Compiling utf16_iter v1.0.5
+   Compiling write16 v1.0.0
+   Compiling hashbrown v0.15.2
+   Compiling utf8_iter v1.0.4
+   Compiling fnv v1.0.7
+   Compiling strsim v0.10.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling equivalent v1.0.1
+   Compiling icu_normalizer_data v1.5.0
+   Compiling ident_case v1.0.1
+   Compiling darling_core v0.20.8
+   Compiling icu_normalizer v1.5.0
+   Compiling ruff_python_ast v0.0.0 (/testbed/crates/ruff_python_ast)
+   Compiling indexmap v2.7.0
+   Compiling tinyvec v1.6.0
+   Compiling autocfg v1.2.0
+   Compiling ucd-trie v0.1.6
+   Compiling darling_macro v0.20.8
+   Compiling pest v2.7.11
+   Compiling num-traits v0.2.18
+   Compiling unicode-normalization v0.1.24
+   Compiling idna_adapter v1.2.0
+   Compiling uuid-macro-internal v1.11.1
+   Compiling thiserror v2.0.11
+   Compiling unicode-width v0.2.0
+   Compiling unic-char-range v0.9.0
+   Compiling anyhow v1.0.95
+   Compiling percent-encoding v2.3.1
+   Compiling unic-common v0.9.0
+   Compiling form_urlencoded v1.2.1
+   Compiling unic-ucd-version v0.9.0
+   Compiling uuid v1.11.1
+   Compiling unic-char-property v0.9.0
+   Compiling idna v1.0.3
+   Compiling pest_meta v2.7.11
+   Compiling ruff_python_parser v0.0.0 (/testbed/crates/ruff_python_parser)
+   Compiling darling v0.20.8
+   Compiling serde_spanned v0.6.7
+   Compiling toml_datetime v0.6.8
+   Compiling version-ranges v0.1.1
+   Compiling thiserror-impl v2.0.11
+   Compiling vte_generate_state_changes v0.1.1
+   Compiling paste v1.0.15
+   Compiling utf8parse v0.2.1
+   Compiling matches v0.1.10
+   Compiling serde_json v1.0.135
+   Compiling newtype-uuid v1.1.3
+   Compiling winnow v0.6.18
+   Compiling unscanny v0.1.0
+   Compiling peg-runtime v0.8.3
+   Compiling pep440_rs v0.7.3
+   Compiling peg-macros v0.8.4
+   Compiling toml_edit v0.22.20
+   Compiling unic-ucd-category v0.9.0
+   Compiling vte v0.11.1
+   Compiling serde_with_macros v3.12.0
+   Compiling pest_generator v2.7.11
+   Compiling url v2.5.4
+   Compiling test-case-core v3.3.1
+   Compiling itertools v0.13.0
+   Compiling iana-time-zone v0.1.60
+   Compiling urlencoding v2.1.3
+   Compiling annotate-snippets v0.6.1
+   Compiling lazy_static v1.4.0
+   Compiling boxcar v0.2.7
+   Compiling console v0.15.8
+   Compiling pep508_rs v0.9.1
+   Compiling peg v0.8.4
+   Compiling chic v1.2.2
+   Compiling chrono v0.4.39
+   Compiling test-case-macros v3.3.1
+   Compiling ruff_diagnostics v0.0.0 (/testbed/crates/ruff_diagnostics)
+   Compiling toml v0.8.19
+   Compiling pest_derive v2.7.11
+   Compiling serde_with v3.12.0
+   Compiling strip-ansi-escapes v0.2.0
+   Compiling ruff_python_literal v0.0.0 (/testbed/crates/ruff_python_literal)
+   Compiling ruff_index v0.0.0 (/testbed/crates/ruff_index)
+   Compiling ruff_python_stdlib v0.0.0 (/testbed/crates/ruff_python_stdlib)
+   Compiling rust-stemmers v1.2.0
+   Compiling strum_macros v0.26.4
+   Compiling libcst_derive v1.6.0
+   Compiling is-docker v0.2.0
+   Compiling path-dedot v3.1.1
+   Compiling quick-xml v0.37.1
+   Compiling anstyle v1.0.10
+   Compiling linked-hash-map v0.5.6
+   Compiling similar v2.6.0
+   Compiling ruff_annotate_snippets v0.1.0 (/testbed/crates/ruff_annotate_snippets)
+   Compiling insta v1.42.0
+   Compiling strum v0.26.3
+   Compiling quick-junit v0.5.1
+   Compiling path-absolutize v3.1.1
+   Compiling libcst v1.6.0
+   Compiling is-wsl v0.4.0
+   Compiling imperative v1.0.6
+   Compiling ruff_python_semantic v0.0.0 (/testbed/crates/ruff_python_semantic)
+   Compiling ruff_python_codegen v0.0.0 (/testbed/crates/ruff_python_codegen)
+   Compiling pyproject-toml v0.13.4
+   Compiling ruff_notebook v0.0.0 (/testbed/crates/ruff_notebook)
+   Compiling test-case v3.3.1
+   Compiling ruff_python_index v0.0.0 (/testbed/crates/ruff_python_index)
+   Compiling fern v0.7.1
+   Compiling natord v1.0.9
+   Compiling pathdiff v0.2.3
+   Compiling typed-arena v2.0.2
+   Compiling colored v3.0.0
+   Compiling ruff_linter v0.9.2 (/testbed/crates/ruff_linter)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 21s
+     Running unittests src/lib.rs (target/debug/deps/ruff_linter-cd098553146c7933)
+
+running 125 tests
+test rules::pyupgrade::fixes::tests::aliased ... ok
+test rules::pyupgrade::fixes::tests::first_import ... ok
+test rules::pyupgrade::fixes::tests::first_two_imports ... ok
+test rules::pyupgrade::fixes::tests::last_import ... ok
+test rules::pyupgrade::fixes::tests::first_two_imports_multiline ... ok
+test rules::pyupgrade::fixes::tests::multiline_once ... ok
+test rules::pyupgrade::fixes::tests::multiline_twice ... ok
+test rules::pyupgrade::fixes::tests::parenthesized ... ok
+test rules::pyupgrade::fixes::tests::twice ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_2_0 ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_2_0_whole ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_0 ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_0_whole ... ok
+test rules::pyupgrade::fixes::tests::once ... ok
+test rules::pyupgrade::fixes::tests::multiline_comment ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_5 ... ok
+test rules::pyupgrade::fixes::tests::multi_comment_first_import ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_1 ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_11 ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_7 ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_7_not_equal ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_8 ... ok
+test rules::pyupgrade::rules::outdated_version_block::tests::test_compare_version::compare_3_9 ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::preserve_space ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::complex_format ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::preserve_blanks ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::test_percent_to_format::simple_string ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::test_percent_to_format::formatting_in_string ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::test_percent_to_format::format_an_a ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::test_percent_to_format::format_an_r ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::test_percent_to_format::word_in_string ... ok
+test rules::pyupgrade::rules::printf_string_formatting::tests::test_percent_to_format::three_percents ... ok
+test rules::pyupgrade::tests::datetime_utc_alias_py311 ... ok
+test rules::pyupgrade::tests::async_timeout_error_alias_not_applied_py310 ... ok
+test rules::pyupgrade::tests::future_annotations_keep_runtime_typing_p37 ... ok
+test rules::pyupgrade::tests::future_annotations_keep_runtime_typing_p310 ... ok
+test rules::pyupgrade::tests::future_annotations_pep_604_p37 ... ok
+test rules::pyupgrade::tests::non_pep695_type_alias_not_applied_py311 ... ok
+test rules::pyupgrade::tests::future_annotations_pep_585_py310 ... ok
+test rules::pyupgrade::tests::future_annotations_pep_604_py310 ... ok
+test rules::pyupgrade::tests::future_annotations_pep_585_p37 ... ok
+test rules::pyupgrade::tests::rules::rule_convertnamedtuplefunctionaltoclass_path_new_up014_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_deprecatedcelementtree_path_new_up023_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_converttypeddictfunctionaltoclass_path_new_up013_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_deprecatedunittestalias_path_new_up005_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_extraneousparentheses_path_new_up034_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_formatliterals_path_new_up030_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_deprecatedmockimport_path_new_up026_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_fstring_path_new_up032_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_fstring_path_new_up032_2_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_fstring_path_new_up032_3_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_lrucachewithmaxsizenone_path_new_up033_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_deprecatedimport_path_new_up035_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_lrucachewithoutparameters_path_new_up011_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_lrucachewithmaxsizenone_path_new_up033_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_formatliterals_path_new_up030_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep585annotation_path_new_up006_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nativeliterals_path_new_up018_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep585annotation_path_new_up006_2_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep585annotation_path_new_up006_3_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep585annotation_path_new_up006_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep604annotationunion_path_new_up045_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep604isinstance_path_new_up038_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep604annotationunion_path_new_up007_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep695typealias_path_new_up040_pyi_expects ... ok
+test rules::pyupgrade::tests::rules::rule_openalias_path_new_up020_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_oserroralias_path_new_up024_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_fstring_path_new_up032_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_nonpep695typealias_path_new_up040_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_oserroralias_path_new_up024_3_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_oserroralias_path_new_up024_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_oserroralias_path_new_up024_4_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_oserroralias_path_new_up024_2_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_outdatedversionblock_path_new_up036_2_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_outdatedversionblock_path_new_up036_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_outdatedversionblock_path_new_up036_3_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_outdatedversionblock_path_new_up036_5_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_printfstringformatting_path_new_up031_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_outdatedversionblock_path_new_up036_4_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_quotedannotation_path_new_up037_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_quotedannotation_path_new_up037_2_pyi_expects ... ok
+test rules::pyupgrade::tests::rules::rule_redundantopenmodes_path_new_up015_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_quotedannotation_path_new_up037_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_outdatedversionblock_path_new_up036_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_replacestdoutstderr_path_new_up022_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_replaceuniversalnewlines_path_new_up021_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_redundantopenmodes_path_new_up015_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_replacestrenum_path_new_up042_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_supercallwithparameters_path_new_up008_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_printfstringformatting_path_new_up031_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_typeofprimitive_path_new_up003_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_timeouterroralias_path_new_up041_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_typingtextstralias_path_new_up019_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_unnecessaryclassparentheses_path_new_up039_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_unnecessarybuiltinimport_path_new_up029_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_unicodekindprefix_path_new_up025_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_unnecessarydefaulttypeargs_path_new_up043_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_uselessmetaclasstype_path_new_up001_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_0_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_10_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_unnecessaryencodeutf8_path_new_up012_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_2_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_1_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_3_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_unnecessaryfutureimport_path_new_up010_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_5_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_4_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_6_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_uselessobjectinheritance_path_new_up004_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_code_utf8_utf8_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_8_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_7_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_9_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_hashbang_utf8_other_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_other_other_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_many_empty_lines_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_other_utf8_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_utf8_code_other_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_utf8_other_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_utf8_utf8_other_py_expects ... ok
+test rules::pyupgrade::tests::rules::rule_utf8encodingdeclaration_path_new_up009_utf8_utf8_py_expects ... ok
+test rules::pyupgrade::tests::up007_preview ... ok
+test rules::pyupgrade::tests::rules::rule_yieldinforloop_path_new_up028_1_py_expects ... ok
+test rules::pyupgrade::tests::unpack_pep_646_py311 ... ok
+stored new snapshot /testbed/crates/ruff_linter/src/rules/pyupgrade/snapshots/ruff_linter__rules__pyupgrade__tests__UP028_0.py.snap.new
+test rules::pyupgrade::tests::rules::rule_yieldinforloop_path_new_up028_0_py_expects ... FAILED
+
+failures:
+
+---- rules::pyupgrade::tests::rules::rule_yieldinforloop_path_new_up028_0_py_expects stdout ----
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Snapshot file: crates/ruff_linter/src/rules/pyupgrade/snapshots/ruff_linter__rules__pyupgrade__tests__UP028_0.py.snap
+Snapshot: UP028_0.py
+Source: crates/ruff_linter/src/rules/pyupgrade/mod.rs:112
+────────────────────────────────────────────────────────────────────────────────
+-old snapshot
++new results
+────────────┬───────────────────────────────────────────────────────────────────
+   89    89 │ 20 20 | 
+   90    90 │ 21 21 | def j():
+   91    91 │ 22    |-    for x in (1, 2, 3):
+   92    92 │ 23    |-        yield x
+   93       │-   22 |+    yield from (1, 2, 3)
+         93 │+   22 |+    yield from ((1, 2, 3))
+   94    94 │ 24 23 | 
+   95    95 │ 25 24 | 
+   96    96 │ 26 25 | def k():
+   97    97 │ 
+┈┈┈┈┈┈┈┈┈┈┈┈┼┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  302   302 │ 95 95 | # UP028: The exception binding is not a reference to the loop variable
+  303   303 │ 96 96 | def f():
+  304   304 │ 97    |-    for x in (1, 2, 3):
+  305   305 │ 98    |-        yield x
+  306       │-   97 |+    yield from (1, 2, 3)
+        306 │+   97 |+    yield from ((1, 2, 3))
+  307   307 │ 99 98 |     # Shadowing with an `except`
+  308   308 │ 100 99 |     try:
+  309   309 │ 101 100 |         pass
+  310   310 │ 
+┈┈┈┈┈┈┈┈┈┈┈┈┼┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  325   325 │ 106 106 | # UP028: The context binding is not a reference to the loop variable
+  326   326 │ 107 107 | def f():
+  327   327 │ 108     |-    for x in (1, 2, 3):
+  328   328 │ 109     |-        yield x
+  329       │-    108 |+    yield from (1, 2, 3)
+        329 │+    108 |+    yield from ((1, 2, 3))
+  330   330 │ 110 109 |     # Shadowing with `with`
+  331   331 │ 111 110 |     with contextlib.nullcontext() as x:
+  332   332 │ 112 111 |         pass
+  333   333 │ 
+┈┈┈┈┈┈┈┈┈┈┈┈┼┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  348   348 │ 116 116 | # UP028: The type annotation binding is not a reference to the loop variable
+  349   349 │ 117 117 | def f():
+  350   350 │ 118     |-    for x in (1, 2, 3):
+  351   351 │ 119     |-        yield x
+  352       │-    118 |+    yield from (1, 2, 3)
+        352 │+    118 |+    yield from ((1, 2, 3))
+  353   353 │ 120 119 |     # Shadowing with a type annotation
+  354   354 │ 121 120 |     x: int
+  355   355 │ 122 121 | 
+  356   356 │ 
+┈┈┈┈┈┈┈┈┈┈┈┈┼┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  371   371 │ 132 132 | # UP028: The exception bindings are not a reference to the loop variable
+  372   372 │ 133 133 | def f():
+  373   373 │ 134     |-    for x in (1, 2, 3):
+  374   374 │ 135     |-        yield x
+  375       │-    134 |+    yield from (1, 2, 3)
+        375 │+    134 |+    yield from ((1, 2, 3))
+  376   376 │ 136 135 |     # Shadowing with multiple `except` blocks
+  377   377 │ 137 136 |     try:
+  378   378 │ 138 137 |         pass
+────────────┴───────────────────────────────────────────────────────────────────
+To update snapshots run `cargo insta review`
+Stopped on the first failure. Run `cargo insta test` to run all snapshots.
+thread 'rules::pyupgrade::tests::rules::rule_yieldinforloop_path_new_up028_0_py_expects' panicked at /usr/local/cargo/registry/src/index.crates.io-6f17d22bba15001f/insta-1.42.0/src/runtime.rs:679:13:
+snapshot assertion for 'UP028_0.py' failed in line 112
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    rules::pyupgrade::tests::rules::rule_yieldinforloop_path_new_up028_0_py_expects
+
+test result: FAILED. 124 passed; 1 failed; 0 ignored; 0 measured; 2117 filtered out; finished in 0.33s
+
+error: test failed, to rerun pass `-p ruff_linter --lib`
++ SWEBENCH_TEST_EXIT_CODE=101
++ : '>>>>> End Test Output'
++ echo '>>>>> Test Exit Code: 101'
++ git checkout 3950b00ee410754913122e8104cbc39353b62c0b crates/ruff_linter/resources/test/fixtures/pyupgrade/UP028_1.py crates/ruff_linter/src/rules/pyupgrade/snapshots/ruff_linter__rules__pyupgrade__tests__UP028_1.py.snap
+>>>>> Test Exit Code: 101
+Updated 2 paths from cc30611a3

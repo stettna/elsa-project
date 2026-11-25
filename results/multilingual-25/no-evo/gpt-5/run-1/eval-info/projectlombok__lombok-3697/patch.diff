@@ -1,0 +1,248 @@
+diff --git a/REFLECTION_PROMPT_PATH b/REFLECTION_PROMPT_PATH
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/REFLECTION_PROMPT_PATH
+@@ -0,0 +1 @@
++
+diff --git a/TASK_DESCRIPTION_PATH b/TASK_DESCRIPTION_PATH
+new file mode 100644
+index 00000000..da144b6c
+--- /dev/null
++++ b/TASK_DESCRIPTION_PATH
+@@ -0,0 +1,31 @@
++[BUG] SuperBuilder does not compile then binding generics to an array
++**Describe the bug**
++Using an array to bind a generic type in an abstract class with the SuperBuilder annotation results in a compile error.
++
++**To Reproduce**
++Create abstract class with generic type:
++java
++@SuperBuilder
++public abstract class AbstractGenericsClass<S extends Serializable> { }
++
++Extend the class with an array-type for the generic:
++java
++@SuperBuilder
++public class GenericsClass extends AbstractGenericsClass<Integer[]> { }
++
++The bug is not limited to Integer[] but occurs for arrays of any type.
++Run maven clean install to compile the classes, this results in:
++
++[ERROR] COMPILATION ERROR :
++[INFO] -------------------------------------------------------------
++[ERROR] /.../GenericsClass.java:[8,1] wrong number of type arguments; required 3
++
++
++**Expected behavior**
++The code should compile like with non-array-type generics.
++
++**Version info (please complete the following information):**
++ - Lombok 1.18.32
++ - javac 17.0.10
++
++
+diff --git a/buildScripts/tests.ant.xml b/buildScripts/tests.ant.xml
+index 60445518..d9b2f323 100644
+--- a/buildScripts/tests.ant.xml
++++ b/buildScripts/tests.ant.xml
+@@ -360,4 +360,16 @@ This buildfile is part of projectlombok.org. It takes care of compiling and runn
+ 	
+ 	<target name="test" depends="test.javacCurrent, test.eclipse-202212" description="runs the tests against the default JVM, javac, and eclipse" />
+ 	<target name="test.broad" depends="test.javac8, test.javac17, test.javac20, test.eclipse-oxygen, test.eclipse-202212, test.eclipse-202006-jdk8" description="runs the tests against the default JVM, javac, and eclipse" />
++<target name="test.instance" depends="test.compile, test.formatter.compile" description="Runs test cases for the swe-bench instance">
++      <junit printsummary="yes" fork="true" forkmode="once" haltonfailure="no">
++        <formatter classname="lombok.ant.SimpleTestFormatter" usefile="false" unless="tests.quiet" />
++        <classpath location="build/ant" />
++        <classpath refid="cp.test" />
++        <classpath refid="cp.stripe" />
++        <classpath refid="packing.basedirs.path" />
++        <classpath location="build/tests" />
++        <classpath location="build/teststubs" />
++        <test name="lombok.transform.TestWithDelombok" />
++      </junit>
++    </target>
+ </project>
+diff --git a/method_patch.txt b/method_patch.txt
+new file mode 100644
+index 00000000..46ce46b1
+--- /dev/null
++++ b/method_patch.txt
+@@ -0,0 +1,20 @@
++		private ListBuffer<JCExpression> getTypeParamExpressions(List<? extends JCTree> typeParams, JavacTreeMaker maker, JavacNode source) {
++			ListBuffer<JCExpression> typeParamsForBuilderParameter = new ListBuffer<JCExpression>();
++			for (JCTree typeParam : typeParams) {
++				if (typeParam instanceof JCTypeParameter) {
++					typeParamsForBuilderParameter.append(maker.Ident(((JCTypeParameter)typeParam).getName()));
++				} else if (typeParam instanceof JCIdent) {
++					typeParamsForBuilderParameter.append(maker.Ident(((JCIdent)typeParam).getName()));
++				} else if (typeParam instanceof JCFieldAccess) {
++					typeParamsForBuilderParameter.append(copySelect(maker, (JCFieldAccess) typeParam));
++				} else if (typeParam instanceof JCTypeApply) {
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCTypeApply)typeParam, source));
++				} else if (typeParam instanceof com.sun.tools.javac.tree.JCTree.JCArrayTypeTree) {
++					// Preserve array type arguments bound to generics (e.g., Integer[]).
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCExpression) typeParam, source));
++				} else if (JCAnnotatedTypeReflect.is(typeParam)) {
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCExpression)typeParam, source));
++				}
++			}
++			return typeParamsForBuilderParameter;
++		}
+diff --git a/patch.sed b/patch.sed
+new file mode 100644
+index 00000000..38cd19a0
+--- /dev/null
++++ b/patch.sed
+@@ -0,0 +1,7 @@
++/} else if (typeParam instanceof JCTypeApply) {/,/} else if (JCAnnotatedTypeReflect.is(typeParam)) {/c\
++\t\t\t\t} else if (typeParam instanceof JCTypeApply) {\
++\t\t\t\t\ttypeParamsForBuilderParameter.append(cloneType(maker, (JCTypeApply)typeParam, source));\
++\t\t\t\t} else if (typeParam instanceof com.sun.tools.javac.tree.JCTree.JCArrayTypeTree) {\
++\t\t\t\t\t// Preserve array type arguments bound to generics (e.g., Integer[]).\
++\t\t\t\t\ttypeParamsForBuilderParameter.append(cloneType(maker, (JCExpression) typeParam, source));\
++\t\t\t\t} else if (JCAnnotatedTypeReflect.is(typeParam)) {
+diff --git a/patch_find_inner_class.sh b/patch_find_inner_class.sh
+new file mode 100644
+index 00000000..96842c0e
+--- /dev/null
++++ b/patch_find_inner_class.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -euo pipefail
++file="/testbed/src/core/lombok/javac/handlers/HandleSuperBuilder.java"
++sig1='private JavacNode findInnerClass(JavacNode parent, String name) {'
++sig2='private ListBuffer<JCExpression> getTypeParamExpressions(List<? extends JCTree> typeParams, JavacTreeMaker maker, JavacNode source) {'
++start=$(grep -nF "$sig1" "$file" | head -n1 | cut -d: -f1 || true)
++next=$(grep -nF "$sig2" "$file" | head -n1 | cut -d: -f1 || true)
++if [ -z "${start:-}" ] || [ -z "${next:-}" ] || [ "$start" -ge "$next" ]; then
++  echo "Failed to locate method boundaries. Context around expected area:"
++  nl -ba "$file" | sed -n '1080,1140p'
++  exit 1
++fi
++head -n $((start-1)) "$file" > "$file.head"
++cat > "$file.mid" <<'EOF'
++		private JavacNode findInnerClass(JavacNode parent, String name) {
++			for (JavacNode child : parent.down()) {
++				if (child.getKind() != Kind.TYPE) continue;
++				JCClassDecl td = (JCClassDecl) child.get();
++				if (td.name.contentEquals(name)) return child;
++			}
++			return null;
++		}
++EOF
++tail -n +$next "$file" > "$file.tail"
++cat "$file.head" "$file.mid" "$file.tail" > "$file.new"
++mv "$file.new" "$file"
++rm -f "$file.head" "$file.mid" "$file.tail"
++nl -ba "$file" | sed -n '1088,1126p'
+diff --git a/patch_handle_superbuilder.sh b/patch_handle_superbuilder.sh
+new file mode 100644
+index 00000000..aceb37b1
+--- /dev/null
++++ b/patch_handle_superbuilder.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++set -euo pipefail
++file="/testbed/src/core/lombok/javac/handlers/HandleSuperBuilder.java"
++sig1='private ListBuffer<JCExpression> getTypeParamExpressions(List<? extends JCTree> typeParams, JavacTreeMaker maker, JavacNode source) {'
++sig2='private JCExpression copySelect(JavacTreeMaker maker, JCFieldAccess typeParam) {'
++start=$(grep -nF "$sig1" "$file" | head -n1 | cut -d: -f1 || true)
++end=$(grep -nF "$sig2" "$file" | head -n1 | cut -d: -f1 || true)
++if [ -z "${start:-}" ] || [ -z "${end:-}" ] || [ "$start" -ge "$end" ]; then
++  echo "Failed to locate method boundaries. Context around expected area:"
++  nl -ba "$file" | sed -n '1070,1160p'
++  exit 1
++fi
++head -n $((start-1)) "$file" > "$file.head"
++cat > "$file.mid" <<'EOF'
++		private ListBuffer<JCExpression> getTypeParamExpressions(List<? extends JCTree> typeParams, JavacTreeMaker maker, JavacNode source) {
++			ListBuffer<JCExpression> typeParamsForBuilderParameter = new ListBuffer<JCExpression>();
++			for (JCTree typeParam : typeParams) {
++				if (typeParam instanceof JCTypeParameter) {
++					typeParamsForBuilderParameter.append(maker.Ident(((JCTypeParameter)typeParam).getName()));
++				} else if (typeParam instanceof JCIdent) {
++					typeParamsForBuilderParameter.append(maker.Ident(((JCIdent)typeParam).getName()));
++				} else if (typeParam instanceof JCFieldAccess) {
++					typeParamsForBuilderParameter.append(copySelect(maker, (JCFieldAccess) typeParam));
++				} else if (typeParam instanceof JCTypeApply) {
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCTypeApply)typeParam, source));
++				} else if (typeParam instanceof com.sun.tools.javac.tree.JCTree.JCArrayTypeTree) {
++					// Preserve array type arguments bound to generics (e.g., Integer[]).
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCExpression) typeParam, source));
++				} else if (JCAnnotatedTypeReflect.is(typeParam)) {
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCExpression)typeParam, source));
++				}
++			}
++			return typeParamsForBuilderParameter;
++		}
++EOF
++tail -n +$end "$file" > "$file.tail"
++cat "$file.head" "$file.mid" "$file.tail" > "$file.new"
++mv "$file.new" "$file"
++rm -f "$file.head" "$file.mid" "$file.tail"
++s=$((start-2)); e=$((start+20))
++nl -ba "$file" | sed -n "${s},${e}p"
+diff --git a/src/core/lombok/javac/handlers/HandleSuperBuilder.java b/src/core/lombok/javac/handlers/HandleSuperBuilder.java
+index d64daf38..a273cf2c 100644
+--- a/src/core/lombok/javac/handlers/HandleSuperBuilder.java
++++ b/src/core/lombok/javac/handlers/HandleSuperBuilder.java
+@@ -1088,33 +1088,34 @@ public class HandleSuperBuilder extends JavacAnnotationHandler<SuperBuilder> {
+ 		return classGenericName + counter;
+ 	}
+ 	
+-	private JavacNode findInnerClass(JavacNode parent, String name) {
+-		for (JavacNode child : parent.down()) {
+-			if (child.getKind() != Kind.TYPE) continue;
+-			JCClassDecl td = (JCClassDecl) child.get();
+-			if (td.name.contentEquals(name)) return child;
++		private JavacNode findInnerClass(JavacNode parent, String name) {
++			for (JavacNode child : parent.down()) {
++				if (child.getKind() != Kind.TYPE) continue;
++				JCClassDecl td = (JCClassDecl) child.get();
++				if (td.name.contentEquals(name)) return child;
++			}
++			return null;
+ 		}
+-		return null;
+-	}
+-	
+-	private ListBuffer<JCExpression> getTypeParamExpressions(List<? extends JCTree> typeParams, JavacTreeMaker maker, JavacNode source) {
+-		ListBuffer<JCExpression> typeParamsForBuilderParameter = new ListBuffer<JCExpression>();
+-		for (JCTree typeParam : typeParams) {
+-			if (typeParam instanceof JCTypeParameter) {
+-				typeParamsForBuilderParameter.append(maker.Ident(((JCTypeParameter)typeParam).getName()));
+-			} else if (typeParam instanceof JCIdent) {
+-				typeParamsForBuilderParameter.append(maker.Ident(((JCIdent)typeParam).getName()));
+-			} else if (typeParam instanceof JCFieldAccess) {
+-				typeParamsForBuilderParameter.append(copySelect(maker, (JCFieldAccess) typeParam));
+-			} else if (typeParam instanceof JCTypeApply) {
+-				typeParamsForBuilderParameter.append(cloneType(maker, (JCTypeApply)typeParam, source));
+-			} else if (JCAnnotatedTypeReflect.is(typeParam)) {
+-				typeParamsForBuilderParameter.append(cloneType(maker, (JCExpression)typeParam, source));
++		private ListBuffer<JCExpression> getTypeParamExpressions(List<? extends JCTree> typeParams, JavacTreeMaker maker, JavacNode source) {
++			ListBuffer<JCExpression> typeParamsForBuilderParameter = new ListBuffer<JCExpression>();
++			for (JCTree typeParam : typeParams) {
++				if (typeParam instanceof JCTypeParameter) {
++					typeParamsForBuilderParameter.append(maker.Ident(((JCTypeParameter)typeParam).getName()));
++				} else if (typeParam instanceof JCIdent) {
++					typeParamsForBuilderParameter.append(maker.Ident(((JCIdent)typeParam).getName()));
++				} else if (typeParam instanceof JCFieldAccess) {
++					typeParamsForBuilderParameter.append(copySelect(maker, (JCFieldAccess) typeParam));
++				} else if (typeParam instanceof JCTypeApply) {
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCTypeApply)typeParam, source));
++				} else if (typeParam instanceof com.sun.tools.javac.tree.JCTree.JCArrayTypeTree) {
++					// Preserve array type arguments bound to generics (e.g., Integer[]).
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCExpression) typeParam, source));
++				} else if (JCAnnotatedTypeReflect.is(typeParam)) {
++					typeParamsForBuilderParameter.append(cloneType(maker, (JCExpression)typeParam, source));
++				}
+ 			}
++			return typeParamsForBuilderParameter;
+ 		}
+-		return typeParamsForBuilderParameter;
+-	}
+-
+ 	private JCExpression copySelect(JavacTreeMaker maker, JCFieldAccess typeParam) {
+ 		java.util.List<Name> chainNames = new ArrayList<Name>();
+ 		JCExpression expression = typeParam;

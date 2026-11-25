@@ -1,0 +1,254 @@
++ cd /testbed
++ git config --global --add safe.directory /testbed
++ git status
+On branch v1.x
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   lib/adapters/http.js
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	REFLECTION_PROMPT_PATH
+	TASK_DESCRIPTION_PATH
+
+no changes added to commit (use "git add" and/or "git commit -a")
++ git show
+commit 65e8d1e28ce829f47a837e45129730e541950d3c
+Author: ItsNotGoodName <gurnaindeol@gmail.com>
+Date:   Mon Jan 30 14:49:37 2023 -0800
+
+    fix(http): add zlib headers if missing (#5497)
+
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index dc833cc..2d9c5e1 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -19,6 +19,7 @@ import stream from 'stream';
+ import AxiosHeaders from '../core/AxiosHeaders.js';
+ import AxiosTransformStream from '../helpers/AxiosTransformStream.js';
+ import EventEmitter from 'events';
++import ZlibHeaderTransformStream from '../helpers/ZlibHeaderTransformStream.js';
+ 
+ const zlibOptions = {
+   flush: zlib.constants.Z_SYNC_FLUSH,
+@@ -425,7 +426,15 @@ export default isHttpAdapterSupported && function httpAdapter(config) {
+         case 'x-gzip':
+         case 'compress':
+         case 'x-compress':
++          // add the unzipper to the body stream processing pipeline
++          streams.push(zlib.createUnzip(zlibOptions));
++
++          // remove the content-encoding in order to not confuse downstream operations
++          delete res.headers['content-encoding'];
++          break;
+         case 'deflate':
++          streams.push(new ZlibHeaderTransformStream());
++
+           // add the unzipper to the body stream processing pipeline
+           streams.push(zlib.createUnzip(zlibOptions));
+ 
+diff --git a/lib/helpers/ZlibHeaderTransformStream.js b/lib/helpers/ZlibHeaderTransformStream.js
+new file mode 100644
+index 0000000..d1791f0
+--- /dev/null
++++ b/lib/helpers/ZlibHeaderTransformStream.js
+@@ -0,0 +1,28 @@
++"use strict";
++
++import stream from "stream";
++
++class ZlibHeaderTransformStream extends stream.Transform {
++  __transform(chunk, encoding, callback) {
++    this.push(chunk);
++    callback();
++  }
++
++  _transform(chunk, encoding, callback) {
++    if (chunk.length !== 0) {
++      this._transform = this.__transform;
++
++      // Add Default Compression headers if no zlib headers are present
++      if (chunk[0] !== 120) { // Hex: 78
++        const header = Buffer.alloc(2);
++        header[0] = 120; // Hex: 78
++        header[1] = 156; // Hex: 9C 
++        this.push(header, encoding);
++      }
++    }
++
++    this.__transform(chunk, encoding, callback);
++  }
++}
++
++export default ZlibHeaderTransformStream;
+diff --git a/test/unit/adapters/http.js b/test/unit/adapters/http.js
+index afa616a..9d44c48 100644
+--- a/test/unit/adapters/http.js
++++ b/test/unit/adapters/http.js
+@@ -35,6 +35,7 @@ const pipelineAsync = util.promisify(stream.pipeline);
+ const finishedAsync = util.promisify(stream.finished);
+ const gzip = util.promisify(zlib.gzip);
+ const deflate = util.promisify(zlib.deflate);
++const deflateRaw = util.promisify(zlib.deflateRaw);
+ const brotliCompress = util.promisify(zlib.brotliCompress);
+ 
+ function toleranceRange(positive, negative) {
+@@ -493,13 +494,16 @@ describe('supports http with nodejs', function () {
+     describe('algorithms', ()=> {
+       const responseBody ='str';
+ 
+-      for (const [type, zipped] of Object.entries({
++      for (const [typeName, zipped] of Object.entries({
+         gzip: gzip(responseBody),
+         compress: gzip(responseBody),
+         deflate: deflate(responseBody),
++        'deflate-raw': deflateRaw(responseBody),
+         br: brotliCompress(responseBody)
+       })) {
+-        describe(`${type} decompression`, async () => {
++        const type = typeName.split('-')[0];
++
++        describe(`${typeName} decompression`, async () => {
+           it(`should support decompression`, async () => {
+             server = await startHTTPServer(async (req, res) => {
+               res.setHeader('Content-Encoding', type);
++ git -c core.fileMode=false diff 65e8d1e28ce829f47a837e45129730e541950d3c
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index 2d9c5e1..163a9fc 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -20,6 +20,7 @@ import AxiosHeaders from '../core/AxiosHeaders.js';
+ import AxiosTransformStream from '../helpers/AxiosTransformStream.js';
+ import EventEmitter from 'events';
+ import ZlibHeaderTransformStream from '../helpers/ZlibHeaderTransformStream.js';
++import NodeFormData from '../env/classes/FormData.js';
+ 
+ const zlibOptions = {
+   flush: zlib.constants.Z_SYNC_FLUSH,
+@@ -242,38 +243,57 @@ export default isHttpAdapterSupported && function httpAdapter(config) {
+     const maxRate = config.maxRate;
+     let maxUploadRate = undefined;
+     let maxDownloadRate = undefined;
+-
+-    // support for https://www.npmjs.com/package/form-data api
+-    if (utils.isFormData(data) && utils.isFunction(data.getHeaders)) {
+-      headers.set(data.getHeaders());
++	            // support for FormData
++    // - Node "form-data" package: has getHeaders()
++    // - Node.js 18+ global (undici) FormData: spec-compliant, no getHeaders()
++    if (utils.isFormData(data)) {
++      if (utils.isFunction(data.getHeaders)) {
++        // "form-data" package instance
++        headers.set(data.getHeaders());
++      } else {
++        // Convert spec-compliant FormData (e.g., Node.js 18 global) to Node "form-data"
++        const _formData = new NodeFormData();
++        utils.forEachEntry(data, (name, value) => {
++          let options = undefined;
++          if (value && typeof value === "object") {
++            const filename = value.name || undefined;
++            const contentType = value.type || undefined;
++            if (filename || contentType) {
++              options = { filename, contentType };
++            }
++          }
++          _formData.append(name, value, options);
++        });
++        data = _formData;
++        headers.set(data.getHeaders());
++      }
+     } else if (data && !utils.isStream(data)) {
+       if (Buffer.isBuffer(data)) {
+         // Nothing to do...
+       } else if (utils.isArrayBuffer(data)) {
+         data = Buffer.from(new Uint8Array(data));
+       } else if (utils.isString(data)) {
+-        data = Buffer.from(data, 'utf-8');
++        data = Buffer.from(data, "utf-8");
+       } else {
+         return reject(new AxiosError(
+-          'Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream',
++          "Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream",
+           AxiosError.ERR_BAD_REQUEST,
+           config
+         ));
+       }
+ 
+       // Add Content-Length header if data exists
+-      headers.set('Content-Length', data.length, false);
++      headers.set("Content-Length", data.length, false);
+ 
+       if (config.maxBodyLength > -1 && data.length > config.maxBodyLength) {
+         return reject(new AxiosError(
+-          'Request body larger than maxBodyLength limit',
++          "Request body larger than maxBodyLength limit",
+           AxiosError.ERR_BAD_REQUEST,
+           config
+         ));
+       }
+     }
+-
+-    const contentLength = utils.toFiniteNumber(headers.getContentLength());
++const contentLength = utils.toFiniteNumber(headers.getContentLength());
+ 
+     if (utils.isArray(maxRate)) {
+       maxUploadRate = maxRate[0];
++ git checkout 65e8d1e28ce829f47a837e45129730e541950d3c test/unit/adapters/http.js
+Updated 0 paths from 86e7ea8
++ git apply -v -
+Checking patch test/unit/adapters/http.js...
+Applied patch test/unit/adapters/http.js cleanly.
++ npm install
+
+> axios@1.2.6 prepare
+> husky install && npm run prepare:hooks
+
+husky - Git hooks installed
+
+> axios@1.2.6 prepare:hooks
+> npx husky set .husky/commit-msg "npx commitlint --edit $1"
+
+husky - created .husky/commit-msg
+
+up to date, audited 2053 packages in 15s
+
+197 packages are looking for funding
+  run `npm fund` for details
+npm notice
+npm notice New major version of npm available! 10.8.2 -> 12.2.3
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.2.3
+npm notice To update run: npm install -g npm@12.2.3
+npm notice
+
+123 vulnerabilities (12 low, 28 moderate, 66 high, 17 critical)
+
+To address issues that do not require attention, run:
+  npm audit fix
+
+To address all issues possible (including breaking changes), run:
+  npm audit fix --force
+
+Some issues need review, and may require choosing
+a different dependency.
+
+Run `npm audit` for details.
++ : '>>>>> Start Test Output'
++ cat
++ npx mocha test/unit/adapters/http.js -R tap -g FormData
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'formdata-node' imported from /testbed/test/unit/adapters/http.js
+    at packageResolve (node:internal/modules/esm/resolve:873:9)
+    at moduleResolve (node:internal/modules/esm/resolve:946:18)
+    at defaultResolve (node:internal/modules/esm/resolve:1188:11)
+    at ModuleLoader.defaultResolve (node:internal/modules/esm/loader:708:12)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:657:25)
+    at ModuleLoader.resolve (node:internal/modules/esm/loader:640:38)
+    at ModuleLoader.getModuleJobForImport (node:internal/modules/esm/loader:264:38)
+    at ModuleJob._link (node:internal/modules/esm/module_job:168:49)
++ SWEBENCH_TEST_EXIT_CODE=1
++ : '>>>>> End Test Output'
++ echo '>>>>> Test Exit Code: 1'
+>>>>> Test Exit Code: 1
++ git checkout 65e8d1e28ce829f47a837e45129730e541950d3c test/unit/adapters/http.js
+Updated 1 path from 86e7ea8

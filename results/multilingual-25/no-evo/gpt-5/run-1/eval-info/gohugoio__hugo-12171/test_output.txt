@@ -1,0 +1,553 @@
++ cd /testbed
++ git config --global --add safe.directory /testbed
++ git status
+On branch master
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   hugolib/content_map_page.go
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	REFLECTION_PROMPT_PATH
+	TASK_DESCRIPTION_PATH
+	hugo
+	testsite/
+
+no changes added to commit (use "git add" and/or "git commit -a")
++ git show
+commit a322282e70c2935c79f9c0f5c593bfdd032eb964
+Author: bep <bjorn.erik.pedersen@gmail.com>
+Date:   Wed Feb 28 09:12:41 2024 +0100
+
+    Fix single mount rename panic
+    
+    Fixes #12141
+
+diff --git a/hugofs/fileinfo.go b/hugofs/fileinfo.go
+index 6d6122c0c..60d2a38df 100644
+--- a/hugofs/fileinfo.go
++++ b/hugofs/fileinfo.go
+@@ -73,7 +73,9 @@ type FileMeta struct {
+ 	InclusionFilter *glob.FilenameFilter
+ 
+ 	// Rename the name part of the file (not the directory).
+-	Rename func(name string, toFrom bool) string
++	// Returns the new name and a boolean indicating if the file
++	// should be included.
++	Rename func(name string, toFrom bool) (string, bool)
+ }
+ 
+ func (m *FileMeta) Copy() *FileMeta {
+diff --git a/hugofs/rootmapping_fs.go b/hugofs/rootmapping_fs.go
+index 9a89914be..04c5b4a72 100644
+--- a/hugofs/rootmapping_fs.go
++++ b/hugofs/rootmapping_fs.go
+@@ -1,4 +1,4 @@
+-// Copyright 2019 The Hugo Authors. All rights reserved.
++// Copyright 2024 The Hugo Authors. All rights reserved.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+@@ -80,42 +80,36 @@ func NewRootMappingFs(fs afero.Fs, rms ...RootMapping) (*RootMappingFs, error) {
+ 		if !fi.IsDir() {
+ 			// We do allow single file mounts.
+ 			// However, the file system logic will be much simpler with just directories.
+-			// So, convert this mount into a directory mount with a nameTo filter and renamer.
++			// So, convert this mount into a directory mount with a renamer,
++			// which will tell the caller if name should be included.
+ 			dirFrom, nameFrom := filepath.Split(rm.From)
+ 			dirTo, nameTo := filepath.Split(rm.To)
+ 			dirFrom, dirTo = strings.TrimSuffix(dirFrom, filepathSeparator), strings.TrimSuffix(dirTo, filepathSeparator)
+ 			rm.From = dirFrom
+-
+-			fi, err = fs.Stat(rm.To)
+-			if err != nil {
+-				if herrors.IsNotExist(err) {
+-					continue
+-				}
+-				return nil, err
+-			}
+-
+-			rm.fiSingleFile = NewFileMetaInfo(fi, rm.Meta.Copy())
++			singleFileMeta := rm.Meta.Copy()
++			singleFileMeta.Name = nameFrom
++			rm.fiSingleFile = NewFileMetaInfo(fi, singleFileMeta)
+ 			rm.To = dirTo
+ 
+-			rm.Meta.Rename = func(name string, toFrom bool) string {
++			rm.Meta.Rename = func(name string, toFrom bool) (string, bool) {
+ 				if toFrom {
+ 					if name == nameTo {
+-						return nameFrom
++						return nameFrom, true
+ 					}
+-					return name
++					return "", false
+ 				}
+ 
+ 				if name == nameFrom {
+-					return nameTo
++					return nameTo, true
+ 				}
+ 
+-				return name
++				return "", false
+ 			}
+ 			nameToFilename := filepathSeparator + nameTo
+ 
+ 			rm.Meta.InclusionFilter = rm.Meta.InclusionFilter.Append(glob.NewFilenameFilterForInclusionFunc(
+ 				func(filename string) bool {
+-					return strings.HasPrefix(nameToFilename, filename)
++					return nameToFilename == filename
+ 				},
+ 			))
+ 
+@@ -252,13 +246,11 @@ func (fs *RootMappingFs) Mounts(base string) ([]FileMetaInfo, error) {
+ 
+ 	fss := make([]FileMetaInfo, len(roots))
+ 	for i, r := range roots {
+-
+ 		if r.fiSingleFile != nil {
+ 			// A single file mount.
+ 			fss[i] = r.fiSingleFile
+ 			continue
+ 		}
+-
+ 		bfs := NewBasePathFs(fs.Fs, r.To)
+ 		fs := bfs
+ 		if r.Meta.InclusionFilter != nil {
+@@ -269,11 +261,6 @@ func (fs *RootMappingFs) Mounts(base string) ([]FileMetaInfo, error) {
+ 		if err != nil {
+ 			return nil, fmt.Errorf("RootMappingFs.Dirs: %w", err)
+ 		}
+-
+-		if !fi.IsDir() {
+-			fi.(FileMetaInfo).Meta().Merge(r.Meta)
+-		}
+-
+ 		fss[i] = fi.(FileMetaInfo)
+ 	}
+ 
+@@ -365,19 +352,26 @@ func (fs *RootMappingFs) ReverseLookupComponent(component, filename string, chec
+ 		if component != "" && first.FromBase != component {
+ 			continue
+ 		}
+-		if first.Meta.Rename != nil {
+-			name = first.Meta.Rename(name, true)
+-		}
+-
+-		// Now we know that this file _could_ be in this fs.
+-		filename := filepathSeparator + filepath.Join(first.path, dir, name)
+ 
+-		if checkExists {
+-			// Confirm that it exists.
+-			_, err := fs.Stat(first.FromBase + filename)
+-			if err != nil {
++		var filename string
++		if first.Meta.Rename != nil {
++			// Single file mount.
++			if newname, ok := first.Meta.Rename(name, true); ok {
++				filename = filepathSeparator + filepath.Join(first.path, dir, newname)
++			} else {
+ 				continue
+ 			}
++		} else {
++			// Now we know that this file _could_ be in this fs.
++			filename = filepathSeparator + filepath.Join(first.path, dir, name)
++
++			if checkExists {
++				// Confirm that it exists.
++				_, err := fs.Stat(first.FromBase + filename)
++				if err != nil {
++					continue
++				}
++			}
+ 		}
+ 
+ 		cps = append(cps, ComponentPath{
+@@ -570,9 +564,11 @@ func (rfs *RootMappingFs) collectDirEntries(prefix string) ([]iofs.DirEntry, err
+ 				}
+ 				fi = newDirNameOnlyFileInfo(name, meta, opener)
+ 			} else if rm.Meta.Rename != nil {
+-				if n := rm.Meta.Rename(fi.Name(), true); n != fi.Name() {
+-					fi.(MetaProvider).Meta().Name = n
++				n, ok := rm.Meta.Rename(fi.Name(), true)
++				if !ok {
++					continue
+ 				}
++				fi.(MetaProvider).Meta().Name = n
+ 			}
+ 			fis = append(fis, fi)
+ 		}
+@@ -617,25 +613,16 @@ func (rfs *RootMappingFs) collectDirEntries(prefix string) ([]iofs.DirEntry, err
+ 
+ 		rms := v.([]RootMapping)
+ 		for _, rm := range rms {
+-			if !rm.fi.IsDir() {
+-				// A single file mount
+-				fis = append(fis, rm.fi)
+-				continue
+-			}
+ 			name := filepath.Base(rm.From)
+ 			if seen[name] {
+ 				continue
+ 			}
+ 			seen[name] = true
+-
+ 			opener := func() (afero.File, error) {
+ 				return rfs.Open(rm.From)
+ 			}
+-
+ 			fi := newDirNameOnlyFileInfo(name, rm.Meta, opener)
+-
+ 			fis = append(fis, fi)
+-
+ 		}
+ 
+ 		return false
+@@ -701,48 +688,20 @@ func (fs *RootMappingFs) doStat(name string) ([]FileMetaInfo, error) {
+ 		return nil, err
+ 	}
+ 
+-	fileCount := 0
+-	var wasFiltered bool
+-	for _, root := range roots {
+-		meta := root.fi.Meta()
+-		if !meta.InclusionFilter.Match(strings.TrimPrefix(meta.Filename, meta.SourceRoot), root.fi.IsDir()) {
+-			wasFiltered = true
+-			continue
+-		}
+-
+-		if !root.fi.IsDir() {
+-			fileCount++
+-		}
+-		if fileCount > 1 {
+-			break
+-		}
+-	}
+-
+-	if fileCount == 0 {
+-		if wasFiltered {
+-			return nil, os.ErrNotExist
+-		}
+-		// Dir only.
+-		return []FileMetaInfo{newDirNameOnlyFileInfo(name, roots[0].Meta, fs.virtualDirOpener(name))}, nil
+-	}
+-
+-	if fileCount > 1 {
+-		// Not supported by this filesystem.
+-		return nil, fmt.Errorf("found multiple files with name %q, use .Readdir or the source filesystem directly", name)
+-	}
+-
+-	return []FileMetaInfo{roots[0].fi}, nil
++	return []FileMetaInfo{newDirNameOnlyFileInfo(name, roots[0].Meta, fs.virtualDirOpener(name))}, nil
+ }
+ 
+ func (fs *RootMappingFs) statRoot(root RootMapping, filename string) (FileMetaInfo, error) {
+ 	dir, name := filepath.Split(filename)
+ 	if root.Meta.Rename != nil {
+-		if n := root.Meta.Rename(name, false); n != name {
+-			filename = filepath.Join(dir, n)
++		n, ok := root.Meta.Rename(name, false)
++		if !ok {
++			return nil, os.ErrNotExist
+ 		}
++		filename = filepath.Join(dir, n)
+ 	}
+ 
+-	if !root.Meta.InclusionFilter.Match(root.trimFrom(filename), root.fi.IsDir()) {
++	if !root.Meta.InclusionFilter.Match(root.trimFrom(filename), true) {
+ 		return nil, os.ErrNotExist
+ 	}
+ 
+@@ -753,24 +712,27 @@ func (fs *RootMappingFs) statRoot(root RootMapping, filename string) (FileMetaIn
+ 	}
+ 
+ 	var opener func() (afero.File, error)
+-	if fi.IsDir() {
+-		// Make sure metadata gets applied in ReadDir.
+-		opener = fs.realDirOpener(filename, root.Meta)
+-	} else {
+-		if root.Meta.Rename != nil {
+-			if n := root.Meta.Rename(fi.Name(), true); n != fi.Name() {
+-				meta := fi.(MetaProvider).Meta()
+-
+-				meta.Name = n
+-
+-			}
++	if !fi.IsDir() {
++		// Open the file directly.
++		// Opens the real file directly.
++		opener = func() (afero.File, error) {
++			return fs.Fs.Open(filename)
+ 		}
+-
++	} else if root.Meta.Rename != nil {
++		// A single file mount where we have mounted the containing directory.
++		n, ok := root.Meta.Rename(fi.Name(), true)
++		if !ok {
++			return nil, os.ErrNotExist
++		}
++		meta := fi.(MetaProvider).Meta()
++		meta.Name = n
+ 		// Opens the real file directly.
+ 		opener = func() (afero.File, error) {
+ 			return fs.Fs.Open(filename)
+ 		}
+-
++	} else {
++		// Make sure metadata gets applied in ReadDir.
++		opener = fs.realDirOpener(filename, root.Meta)
+ 	}
+ 
+ 	fim := decorateFileInfo(fi, opener, "", root.Meta)
+diff --git a/hugofs/rootmapping_fs_test.go b/hugofs/rootmapping_fs_test.go
+index 982e6dfaf..b1ef102d3 100644
+--- a/hugofs/rootmapping_fs_test.go
++++ b/hugofs/rootmapping_fs_test.go
+@@ -280,6 +280,11 @@ func TestRootMappingFsMount(t *testing.T) {
+ 	c.Assert(err, qt.IsNil)
+ 	c.Assert(cps, qt.DeepEquals, []ComponentPath{
+ 		{Component: "content", Path: "singles/p1.md", Lang: "no"},
++	})
++
++	cps, err = rfs.ReverseLookup(filepath.FromSlash("singlefiles/sv.txt"), true)
++	c.Assert(err, qt.IsNil)
++	c.Assert(cps, qt.DeepEquals, []ComponentPath{
+ 		{Component: "content", Path: "singles/p1.md", Lang: "sv"},
+ 	})
+ 
+diff --git a/hugolib/filesystems/basefs.go b/hugolib/filesystems/basefs.go
+index 5479e2266..aa466e0eb 100644
+--- a/hugolib/filesystems/basefs.go
++++ b/hugolib/filesystems/basefs.go
+@@ -1,4 +1,4 @@
+-// Copyright 2018 The Hugo Authors. All rights reserved.
++// Copyright 2024 The Hugo Authors. All rights reserved.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+diff --git a/hugolib/filesystems/basefs_test.go b/hugolib/filesystems/basefs_test.go
+index f50bdb09f..4fdeba765 100644
+--- a/hugolib/filesystems/basefs_test.go
++++ b/hugolib/filesystems/basefs_test.go
+@@ -234,6 +234,7 @@ foo
+ 	b := hugolib.Test(t, files)
+ 	bfs := b.H.BaseFs
+ 	watchFilenames := bfs.WatchFilenames()
++	//   []string{"/hugo_stats.json", "/content", "/content2", "/themes/t1/layouts", "/themes/t1/layouts/_default", "/themes/t1/static"}
+ 	b.Assert(watchFilenames, qt.HasLen, 6)
+ }
+ 
+@@ -543,6 +544,30 @@ files/f2.txt false
+ `)
+ }
+ 
++func TestMountIssue12141(t *testing.T) {
++	files := `
++-- hugo.toml --
++disableKinds = ["taxonomy", "term"]
++[module]
++[[module.mounts]]
++source = "myfiles"
++target = "static"
++[[module.mounts]]
++source = "myfiles/f1.txt"
++target = "static/f2.txt"
++-- myfiles/f1.txt --
++f1
++`
++	b := hugolib.Test(t, files)
++	fs := b.H.BaseFs.StaticFs("")
++
++	b.AssertFs(fs, `
++. true
++f1.txt false
++f2.txt false
++`)
++}
++
+ func checkFileCount(fs afero.Fs, dirname string, c *qt.C, expected int) {
+ 	c.Helper()
+ 	count, names, err := countFilesAndGetFilenames(fs, dirname)
+diff --git a/hugolib/integrationtest_builder.go b/hugolib/integrationtest_builder.go
+index acbc093ba..642bac7ab 100644
+--- a/hugolib/integrationtest_builder.go
++++ b/hugolib/integrationtest_builder.go
+@@ -282,7 +282,7 @@ func (s *IntegrationTestBuilder) AssertPublishDir(matches ...string) {
+ func (s *IntegrationTestBuilder) AssertFs(fs afero.Fs, matches ...string) {
+ 	s.Helper()
+ 	var buff bytes.Buffer
+-	helpers.PrintFs(fs, "", &buff)
++	s.Assert(s.printAndCheckFs(fs, "", &buff), qt.IsNil)
+ 	printFsLines := strings.Split(buff.String(), "\n")
+ 	sort.Strings(printFsLines)
+ 	content := strings.TrimSpace((strings.Join(printFsLines, "\n")))
+@@ -305,6 +305,34 @@ func (s *IntegrationTestBuilder) AssertFs(fs afero.Fs, matches ...string) {
+ 	}
+ }
+ 
++func (s *IntegrationTestBuilder) printAndCheckFs(fs afero.Fs, path string, w io.Writer) error {
++	if fs == nil {
++		return nil
++	}
++
++	return afero.Walk(fs, path, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			return fmt.Errorf("error: path %q: %s", path, err)
++		}
++		path = filepath.ToSlash(path)
++		if path == "" {
++			path = "."
++		}
++		if !info.IsDir() {
++			f, err := fs.Open(path)
++			if err != nil {
++				return fmt.Errorf("error: path %q: %s", path, err)
++			}
++			defer f.Close()
++			// This will panic if the file is a directory.
++			var buf [1]byte
++			io.ReadFull(f, buf[:])
++		}
++		fmt.Fprintln(w, path, info.IsDir())
++		return nil
++	})
++}
++
+ func (s *IntegrationTestBuilder) AssertFileExists(filename string, b bool) {
+ 	checker := qt.IsNil
+ 	if !b {
++ git -c core.fileMode=false diff a322282e70c2935c79f9c0f5c593bfdd032eb964
+diff --git a/hugolib/content_map_page.go b/hugolib/content_map_page.go
+index 89df951e9..4d54d59d5 100644
+--- a/hugolib/content_map_page.go
++++ b/hugolib/content_map_page.go
+@@ -335,6 +335,8 @@ func (m *pageMap) getPagesInSection(q pageMapQueryPagesInSection) page.Pages {
+ 	pages, err := m.getOrCreatePagesFromCache(cacheKey, func(string) (page.Pages, error) {
+ 		prefix := paths.AddTrailingSlash(q.Path)
+ 
++		baseDepth := strings.Count(strings.TrimPrefix(q.Path, "/"), "/")
++
+ 		var (
+ 			pas         page.Pages
+ 			otherBranch string
+@@ -349,6 +351,18 @@ func (m *pageMap) getPagesInSection(q pageMapQueryPagesInSection) page.Pages {
+ 			Tree:   m.treePages,
+ 			Prefix: prefix,
+ 			Handle: func(key string, n contentNodeI, match doctree.DimensionFlag) (bool, error) {
++				if !q.Recursive {
++					curDepth := strings.Count(key, "/")
++					if curDepth != baseDepth+1 {
++						return false, nil
++					}
++				}
++				if !q.Recursive {
++					curDepth := strings.Count(key, "/")
++					if curDepth != baseDepth+1 {
++						return false, nil
++					}
++				}
+ 				if q.Recursive {
+ 					if p, ok := n.(*pageState); ok && include(p) {
+ 						pas = append(pas, p)
++ git checkout a322282e70c2935c79f9c0f5c593bfdd032eb964 hugolib/pagecollections_test.go
+Updated 0 paths from e70177f71
++ git apply -v -
+Checking patch hugolib/pagecollections_test.go...
+Applied patch hugolib/pagecollections_test.go cleanly.
++ : '>>>>> Start Test Output'
++ go test -v ./hugolib -run '^Test.*Pages'
++ cat
+=== RUN   TestMenusSectionPagesMenu
+=== PAUSE TestMenusSectionPagesMenu
+=== RUN   TestBundleDuplicatePagesAndResources
+    pagebundler_test.go:875: 
+        error:
+          no substring match found
+        comment:
+          File: public/mysection/index.html Match RegularPages: /mysection/foo/p2/|File LogicalName: p2.md|/mysection/mybundle/|File LogicalName: index.md|/mysection/p2/|File LogicalName: p2.md|$
+        container:
+          "List: |/mysection|File LogicalName: _index.md|/mysection/|section|Resources: sectiondata.json: Secion data JSON.|sectiondata.txt: Section data TXT.|$\nRegularPages: $"
+        want:
+          "RegularPages: /mysection/foo/p2/|File LogicalName: p2.md|/mysection/mybundle/|File LogicalName: index.md|/mysection/p2/|File LogicalName: p2.md|$"
+        stack:
+          /testbed/hugolib/integrationtest_builder.go:265
+            s.Assert(content, qt.Contains, match, cm)
+          /testbed/hugolib/pagebundler_test.go:875
+            b.AssertFileContent("public/mysection/index.html",
+                "List: |/mysection|File LogicalName: _index.md|/mysection/|section|Resources: sectiondata.json: Secion data JSON.|sectiondata.txt: Section data TXT.|$",
+                "RegularPages: /mysection/foo/p2/|File LogicalName: p2.md|/mysection/mybundle/|File LogicalName: index.md|/mysection/p2/|File LogicalName: p2.md|$")
+        
+--- FAIL: TestBundleDuplicatePagesAndResources (0.02s)
+=== RUN   TestRegularPagesRecursive
+WARN  found no layout file for "html" for kind "taxonomy": You should create a template file which matches Hugo Layouts Lookup Rules for this combination.
+WARN  found no layout file for "html" for kind "section": You should create a template file which matches Hugo Layouts Lookup Rules for this combination.
+WARN  found no layout file for "html" for kind "page": You should create a template file which matches Hugo Layouts Lookup Rules for this combination.
+--- PASS: TestRegularPagesRecursive (0.01s)
+=== RUN   TestRegularPagesRecursiveHome
+--- PASS: TestRegularPagesRecursiveHome (0.02s)
+=== RUN   TestPagesSimilarSectionNames
+    pagecollections_test.go:692: 
+        error:
+          no substring match found
+        comment:
+          File: public/s1/index.html Match /s1/: Pages: /s1/p1/|$
+        container:
+          "/s1/: Pages: $"
+        want:
+          "/s1/: Pages: /s1/p1/|$"
+        stack:
+          /testbed/hugolib/integrationtest_builder.go:265
+            s.Assert(content, qt.Contains, match, cm)
+          /testbed/hugolib/pagecollections_test.go:692
+            b.AssertFileContent("public/s1/index.html", "/s1/: Pages: /s1/p1/|$")
+        
+--- FAIL: TestPagesSimilarSectionNames (0.01s)
+=== RUN   TestPagesPrevNext
+--- PASS: TestPagesPrevNext (0.02s)
+=== RUN   TestPaginatorNodePagesOnly
+--- PASS: TestPaginatorNodePagesOnly (0.01s)
+=== RUN   TestRebuildAddPageListPagesInHome
+--- PASS: TestRebuildAddPageListPagesInHome (0.02s)
+=== RUN   TestRebuildAddPageWithSpaceListPagesInHome
+--- PASS: TestRebuildAddPageWithSpaceListPagesInHome (0.01s)
+=== RUN   TestOrderedPages
+=== PAUSE TestOrderedPages
+=== RUN   TestGroupedPages
+=== PAUSE TestGroupedPages
+=== RUN   TestTaxonomiesListPages
+WARN  found no layout file for "html" for kind "page": You should create a template file which matches Hugo Layouts Lookup Rules for this combination.
+--- PASS: TestTaxonomiesListPages (0.01s)
+=== RUN   TestTitleCaseStyleWithAutomaticSectionPages
+=== PAUSE TestTitleCaseStyleWithAutomaticSectionPages
+=== CONT  TestMenusSectionPagesMenu
+=== CONT  TestGroupedPages
+=== CONT  TestOrderedPages
+=== CONT  TestTitleCaseStyleWithAutomaticSectionPages
+--- FAIL: TestOrderedPages (0.02s)
+panic: runtime error: index out of range [1] with length 0 [recovered]
+	panic: runtime error: index out of range [1] with length 0
+
+goroutine 290 [running]:
+testing.tRunner.func1.2({0x1a6f200, 0xc000823e60})
+	/usr/local/go/src/testing/testing.go:1632 +0x230
+testing.tRunner.func1()
+	/usr/local/go/src/testing/testing.go:1635 +0x35e
+panic({0x1a6f200?, 0xc000823e60?})
+	/usr/local/go/src/runtime/panic.go:791 +0x132
+github.com/gohugoio/hugo/hugolib.TestOrderedPages(0xc000cfa000)
+	/testbed/hugolib/site_test.go:645 +0xb49
+testing.tRunner(0xc000cfa000, 0x1e35620)
+	/usr/local/go/src/testing/testing.go:1690 +0xf4
+created by testing.(*T).Run in goroutine 1
+	/usr/local/go/src/testing/testing.go:1743 +0x390
+FAIL	github.com/gohugoio/hugo/hugolib	0.212s
+FAIL
++ SWEBENCH_TEST_EXIT_CODE=1
++ : '>>>>> End Test Output'
++ echo '>>>>> Test Exit Code: 1'
++ git checkout a322282e70c2935c79f9c0f5c593bfdd032eb964 hugolib/pagecollections_test.go
+>>>>> Test Exit Code: 1
+Updated 1 path from e70177f71

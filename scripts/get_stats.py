@@ -24,18 +24,28 @@
 import argparse
 import csv
 import json
+import pandas as pd
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-CONFIG_NUM_OF_EVOL_TASKS = {
-    "task_and_reflection_and_tool": 3, #tool + task + reflection
-    "task_tool": 2,                    #tool + task
-    "reflection_tool": 2,              #tool + reflection
-    "reflection_task": 2,              #reflection + task
-    "task_only": 1,                    #task
-    "reflection_only": 1,              #reflection
-    "tool_only": 1,                    #tool
-    "no_evo" : 0,                      #none
+#Assign each model a unique integer value for easier processing
+MODELS = {
+    "gpt-5": 1,
+    "llama4-scout": 2,
+    "qwen3-coder-30b": 3,
+}
+
+#Gives binary representation the active evo tasks in the configuration.
+#Encoded as (task, reflection, tool)
+EVOL_TASKS = {
+    "task_and_reflection_and_tool": (1,1,1), #tool + task + reflection
+    "task_tool": (1,0,1),                    #tool + task
+    "reflection_tool": (0,1,1),              #tool + reflection
+    "reflection_task": (1,1,0),              #reflection + task
+    "task_only": (1,0,0),                    #task
+    "reflection_only": (0,1,0),              #reflection
+    "tool_only": (0,0,1),                    #tool
+    "no_evo" : (0,0,0),                      #none
 }
 
 PATH_TO_AG_CSV = "../results/aggregated_results.csv"   #Assumes script is run from within the scripts directory
@@ -43,6 +53,25 @@ PATH_TO_IN_CSV = "../results/per_instance_results.csv" #Assumes script is run fr
 
 AG_MODE = 'w'  # Start with write mode for the aggregated CSV
 IN_MODE = 'w'  # Start with write mode for the per-instance CSV
+
+def get_difficulty_from_instance_dict() -> Optional[Dict[str, int]]:
+
+    splits = {'test': 'data/test-00000-of-00001.parquet', 'dev': 'data/dev-00000-of-00001.parquet'}
+    df = pd.read_parquet("hf://datasets/SWE-bench/SWE-bench/" + splits["test"])
+
+    #read instance_id into list from csv file
+    instance_ids = pd.read_csv("../subsets/swe-bench-verified-50.csv")["instance_id"].tolist()
+
+    #select only rows with instance_id in the list and save difficulty field and instance_id to a new dataframe
+    df_filtered = df[df['instance_id'].isin(instance_ids)][['instance_id', 'difficulty']]
+
+    #encode difficulty as 0 for easy, 1 for medium, 2 for hard
+    df_filtered['difficulty'] = df_filtered['difficulty'].map({'<15 min fix': "easy", '15 min - 1 hour': "medium", '1-4 hours': "hard", '>4 hours': "hard"})
+
+    #use dictionary comprehension to create a dictionary from the filtered dataframe
+    difficulty_dict = {row['instance_id']: row['difficulty'] for _, row in df_filtered.iterrows()} 
+
+    return difficulty_dict
 
 def find_traj_files(root: Path):
     """Recursively find all files matching *.traj.json under root."""
@@ -221,6 +250,8 @@ def extract_stats(file_path: Path):
             "instance": file_path.name[:-len(".traj.json")],
             "api_calls": model_stats["api_calls"],
             "total_tokens": total_tokens,
+            "n_task_description_edits": 0,
+            "n_reflection_prompt_edits": 0,
         }
 
         if prompt_evo_info is not None:
@@ -244,7 +275,6 @@ def write_to_ag_csv(rows):
             f,
             fieldnames=[
                 "configuration",
-                "n_evo_tasks",
                 "model", 
                 "total_api_calls",
                 "total_total_tokens",
@@ -272,8 +302,11 @@ def write_to_in_csv(rows):
             f,
             fieldnames=[
                 "instance",
+                "difficulty",
                 "configuration",
-                "n_evo_tasks",
+                "task_evolution",
+                "reflection_evolution",
+                "tool_evolution",
                 "model", 
                 "api_calls",
                 "total_tokens",
@@ -288,11 +321,10 @@ def write_to_in_csv(rows):
             writer.writeheader()
         writer.writerows(rows)      
 
-def process_config_directory(config_dir: Path):
+def process_config_directory(config_dir: Path, difficulty_dict: Dict[str, int]):
     """Process a single configuration directory."""
 
     config = str(config_dir).split("/")[-1]
-    n_evo_tasks = CONFIG_NUM_OF_EVOL_TASKS[config]
 
     for model_dir in config_dir.iterdir():
 
@@ -349,11 +381,19 @@ def process_config_directory(config_dir: Path):
                     continue
 
                 resolved = int(stats["instance"] in resolved_ids)
+
+                difficulty = difficulty_dict.get(stats["instance"], None)
+
+                config_tuple = EVOL_TASKS.get(config, (0, 0, 0))
+
                 stats.update({
                                 "resolved": resolved,
-                                "model" : model,
                                 "configuration": config,
-                                "n_evo_tasks" : n_evo_tasks
+                                "model" : model,
+                                "task_evolution": config_tuple[0],
+                                "reflection_evolution": config_tuple[1],
+                                "tool_evolution": config_tuple[2],
+                                "difficulty": difficulty
                             })
 
                 write_to_in_csv([stats])
@@ -390,7 +430,6 @@ def process_config_directory(config_dir: Path):
         cummulative_stats = {
             "model" :  model,
             "configuration" : config,
-            "n_evo_tasks" : n_evo_tasks,
             "total_total_tokens" : round(total_total_tokens/NUMBER_OF_RUNS, 2),
             "total_api_calls" : round(total_api_calls/NUMBER_OF_RUNS, 2),
             "total_task_description_edits" : round(total_task_description_edits/NUMBER_OF_RUNS, 2),
@@ -431,12 +470,14 @@ def main():
         print(f"Error: '{root}' is not a valid directory.")
         return 1
 
+    difficulty_dict = get_difficulty_from_instance_dict()
+
     config_paths = list(root.iterdir())
     for path in config_paths:
         if not path.is_dir():
             print(f"Warning: '{path}' is not a directory; skipping.")
             continue
-        process_config_directory(path)
+        process_config_directory(path, difficulty_dict)
 
     return 0
 

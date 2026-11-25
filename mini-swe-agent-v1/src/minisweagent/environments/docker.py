@@ -92,7 +92,7 @@ class DockerEnvironment:
                 cmd.extend(["-e", f"{key}={value}"])
         for key, value in self.config.env.items():
             cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend([self.container_id, "bash", "-lc", command])
+        cmd.extend([self.container_id, "bash", "--noprofile", "-lc", command])
 
         result = subprocess.run(
             cmd,
